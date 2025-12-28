@@ -5,6 +5,27 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2025-12-27
+
+### Added
+- **Unified Autonomy Runner** (`autonomy/run.sh`) - Single script that does everything:
+  - Prerequisite checks (Claude CLI, Python, Git, curl, Node.js, jq)
+  - Skill installation verification
+  - `.loki/` directory initialization
+  - Autonomous execution with auto-resume
+  - ASCII art banner and colored logging
+  - Exponential backoff with jitter
+  - State persistence across restarts
+  - See `autonomy/README.md` for detailed docs
+
+### Changed
+- Moved autonomous execution to dedicated `autonomy/` folder (separate from skill)
+- Updated README with new Quick Start using `./autonomy/run.sh`
+- Release workflow now includes `autonomy/` folder
+
+### Deprecated
+- `scripts/loki-wrapper.sh` still works but `autonomy/run.sh` is now recommended
+
 ## [2.2.0] - 2025-12-27
 
 ### Added
@@ -171,6 +192,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `references/deployment.md` - Cloud deployment guides
   - `references/business-ops.md` - Business operation workflows
 
+[2.3.0]: https://github.com/asklokesh/claudeskill-loki-mode/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/asklokesh/claudeskill-loki-mode/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/asklokesh/claudeskill-loki-mode/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/asklokesh/claudeskill-loki-mode/compare/v2.0.2...v2.0.3

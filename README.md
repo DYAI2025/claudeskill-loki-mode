@@ -119,6 +119,30 @@ cat ~/.claude/skills/loki-mode/SKILL.md | head -5
 
 ## Usage
 
+### Quick Start (Recommended)
+
+Use the autonomous runner - it handles everything:
+
+```bash
+# Run with a PRD (fully autonomous with auto-resume)
+./autonomy/run.sh ./docs/requirements.md
+
+# Run interactively
+./autonomy/run.sh
+```
+
+The autonomous runner will:
+1. Check all prerequisites (Claude CLI, Python, Git, etc.)
+2. Verify skill installation
+3. Initialize the `.loki/` directory
+4. Start Claude Code with autonomous permissions
+5. Auto-resume on rate limits or interruptions
+6. Continue until completion or max retries
+
+### Manual Mode
+
+If you prefer manual control:
+
 ```bash
 # Launch Claude Code with autonomous permissions
 claude --dangerously-skip-permissions
@@ -130,37 +154,16 @@ claude --dangerously-skip-permissions
 > Loki Mode with PRD at ./docs/requirements.md
 ```
 
-## True Autonomy (Auto-Resume)
+## Autonomy Configuration
 
-By default, if Claude hits rate limits or the session ends unexpectedly, you need to manually restart. For true autonomy with automatic resume, use the wrapper script:
-
-```bash
-# Basic usage - interactive mode
-./scripts/loki-wrapper.sh
-
-# With a specific PRD
-./scripts/loki-wrapper.sh ./docs/requirements.md
-```
-
-### How the Wrapper Works
-
-1. **Launches Claude Code** with `--dangerously-skip-permissions` and your prompt
-2. **Monitors the process** - when Claude exits, checks the exit code
-3. **Detects rate limits** - any non-zero exit is treated as potential rate limit
-4. **Waits with exponential backoff** - starts at 60s, doubles each retry, caps at 1 hour
-5. **Resumes from checkpoint** - tells Claude to check `.loki/state/` and continue
-6. **Detects completion** - checks for `COMPLETED` phase in orchestrator state
-
-### Configuration
-
-Environment variables to customize behavior:
+Environment variables to customize the autonomous runner:
 
 ```bash
 # Example with custom settings
 LOKI_MAX_RETRIES=100 \
 LOKI_BASE_WAIT=120 \
 LOKI_MAX_WAIT=7200 \
-./scripts/loki-wrapper.sh ./docs/requirements.md
+./autonomy/run.sh ./docs/requirements.md
 ```
 
 | Variable | Default | Description |
@@ -168,24 +171,48 @@ LOKI_MAX_WAIT=7200 \
 | `LOKI_MAX_RETRIES` | 50 | Maximum retry attempts before giving up |
 | `LOKI_BASE_WAIT` | 60 | Base wait time in seconds |
 | `LOKI_MAX_WAIT` | 3600 | Maximum wait time (1 hour) |
-| `LOKI_LOG_FILE` | `.loki/wrapper.log` | Log file location |
+| `LOKI_SKIP_PREREQS` | false | Skip prerequisite checks |
 
-### Wrapper State
+### How Auto-Resume Works
 
-The wrapper saves state to `.loki/wrapper-state.json`:
-
-```json
-{
-  "retryCount": 3,
-  "status": "running",
-  "lastExitCode": 0,
-  "lastRun": "2025-01-15T10:30:00Z",
-  "prdPath": "./docs/requirements.md",
-  "pid": 12345
-}
+```
+./autonomy/run.sh prd.md
+         │
+         ▼
+┌─────────────────────┐
+│ Check Prerequisites │ ← Claude CLI, Python, Git, etc.
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│ Initialize .loki/   │ ← State, queues, logs
+└─────────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│ Run Claude Code     │◄─────────────────┐
+└─────────────────────┘                  │
+         │                               │
+    Exit code?                           │
+         │                               │
+    ┌────┴────┐                          │
+    ▼         ▼                          │
+ Success   Rate Limit                    │
+    │         │                          │
+    ▼         ▼                          │
+ DONE!    Wait (exponential backoff) ────┘
 ```
 
-This allows you to check progress and the wrapper to resume from the correct retry count if you restart it.
+### Resuming After Interruption
+
+If you stop the script (Ctrl+C) or it crashes:
+
+```bash
+# Just run it again - state is saved automatically
+./autonomy/run.sh ./docs/requirements.md
+```
+
+See [autonomy/README.md](autonomy/README.md) for detailed documentation.
 
 ## How It Works
 
