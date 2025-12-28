@@ -417,10 +417,10 @@ run_autonomous() {
         echo "=== Prompt: $prompt ===" >> "$log_file"
 
         set +e
-        # Run Claude and pipe prompt through stdin for live streaming output
-        # This allows Claude to show interactive-style output while still being automated
-        echo "$prompt" | claude --dangerously-skip-permissions
-        local exit_code=$?
+        # Run Claude with -p flag and --print for non-interactive mode
+        # The --print flag runs in headless mode without requiring a TTY
+        claude --dangerously-skip-permissions --print -p "$prompt" 2>&1 | tee -a "$log_file"
+        local exit_code=${PIPESTATUS[0]}
         set -e
 
         echo ""
