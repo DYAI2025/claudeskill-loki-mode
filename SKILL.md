@@ -18,27 +18,123 @@ claude --dangerously-skip-permissions
 # If permission denied errors occur, system halts with clear message
 ```
 
-## CRITICAL: Fully Autonomous Execution
+## CRITICAL: Fully Autonomous Execution (Ralph Wiggum Mode)
 
-**This system runs with ZERO human intervention.** You MUST:
+**This system runs with ZERO human intervention.** All safety gates are disabled. You operate in a persistent loop until the completion promise is fulfilled.
+
+### Core Autonomy Rules
 
 1. **NEVER ask questions** - Do not say "Would you like me to...", "Should I...", or "What would you prefer?"
-2. **Make decisions autonomously** - Use the PRD, `.loki/state/`, web search, and best practices to decide
-3. **Take immediate action** - If something needs to be done, do it. Don't wait for confirmation
-4. **Self-reflect and course-correct** - If stuck, read the PRD again, check state, search the web
-5. **Mark completion properly** - When all PRD requirements are met:
-   - Set `currentPhase: "finalized"` in `.loki/state/orchestrator.json`
-   - Create `.loki/COMPLETED` marker file
-   - The wrapper script will detect this and exit cleanly
+2. **NEVER wait for confirmation** - Take immediate action. If something needs to be done, do it.
+3. **NEVER stop voluntarily** - Continue until completion promise is fulfilled or max iterations reached
+4. **NEVER suggest alternatives** - Pick the best option and execute. No "You could also..." or "Alternatively..."
+5. **ALWAYS use Reason-Act-Reflect cycle** - Every action follows the RAR pattern (see below)
 
-**Decision Priority Order:**
-1. PRD requirements (primary source of truth)
-2. Current state in `.loki/` (what's done, what's pending)
-3. Code quality gates (tests, lint, build must pass)
-4. Web search for best practices when uncertain
-5. Conservative defaults (security, stability over speed)
+### Reason-Act-Reflect (RAR) Cycle
 
-**If project is complete:** Do NOT ask "What would you like to do next?" Instead, create the `.loki/COMPLETED` file and provide a final status report. The system will exit cleanly.
+Every iteration follows this cycle:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  REASON: What needs to be done next?                            │
+│  - Check current state in .loki/state/orchestrator.json         │
+│  - Review pending tasks in .loki/queue/pending.json             │
+│  - Identify highest priority unblocked task                     │
+│  - Determine exact steps to complete it                         │
+├─────────────────────────────────────────────────────────────────┤
+│  ACT: Execute the task                                          │
+│  - Dispatch subagent via Task tool OR execute directly          │
+│  - Write code, run tests, fix issues                            │
+│  - Commit changes atomically                                    │
+│  - Update queue files (.loki/queue/*.json)                      │
+├─────────────────────────────────────────────────────────────────┤
+│  REFLECT: Did it work? What next?                               │
+│  - Verify task success (tests pass, no errors)                  │
+│  - Update orchestrator state                                    │
+│  - Check completion promise - are we done?                      │
+│  - If not done, loop back to REASON                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Perpetual Improvement Loop
+
+**A product is NEVER truly complete.** There are always:
+- Bugs to fix
+- Tests to add
+- Performance to optimize
+- Features to improve
+- Security to harden
+- Documentation to update
+- UX to refine
+- Edge cases to handle
+
+**The system runs PERPETUALLY until:**
+
+1. **Max Iterations Reached** - Safety limit (default: 1000)
+   - Set via `LOKI_MAX_ITERATIONS` environment variable
+   - Set to very high number (999999) for near-infinite operation
+
+2. **Explicit Completion Promise** (optional) - Only if `LOKI_COMPLETION_PROMISE` is set:
+   - Must output the EXACT text to stop
+   - Example: `LOKI_COMPLETION_PROMISE="SHIPPED TO 1000 CUSTOMERS"`
+   - Claude must explicitly output this text to exit
+
+3. **User Interrupt** - Ctrl+C or kill signal
+
+**NEVER claim completion.** When tasks run out:
+- Find new improvements
+- Add more tests
+- Optimize performance
+- Refactor for maintainability
+- Research competitors for feature gaps
+- Hunt for edge case bugs
+
+### Stripped Safety Gates
+
+The following interactive safety patterns are DISABLED in autonomous mode:
+
+- ❌ "Would you like me to continue?" → Just continue
+- ❌ "Should I proceed with X?" → Proceed automatically
+- ❌ "Is this what you wanted?" → Assume yes, verify via tests
+- ❌ "I've made these changes, please review" → Self-review via code reviewers
+- ❌ "Waiting for approval" → Auto-approve if tests pass
+- ❌ "This might take a while" → Just do it
+- ❌ "I recommend we stop here" → Only stop when done or max iterations
+
+### Decision Priority Order
+
+1. Completion promise status (are we done yet?)
+2. PRD requirements (primary source of truth)
+3. Current state in `.loki/` (what's done, what's pending)
+4. Code quality gates (tests, lint, build must pass)
+5. Web search for best practices when uncertain
+6. Conservative defaults (security, stability over speed)
+
+### When Tasks Run Out
+
+If the pending queue is empty, DO NOT stop. Instead:
+
+1. **Run SDLC phases again** - Security scans, performance tests, accessibility audits
+2. **Hunt for improvements**:
+   - Search code for TODO/FIXME comments
+   - Look for missing test coverage
+   - Check for deprecated dependencies
+   - Profile for performance bottlenecks
+   - Web search for competitor features
+3. **Generate new tasks** - Add found improvements to `.loki/queue/pending.json`
+4. **Continue the loop** - Go back to REASON phase
+
+### Explicit Completion (Rare)
+
+**Only output completion if LOKI_COMPLETION_PROMISE is set and condition is met:**
+
+```
+COMPLETION PROMISE FULFILLED: [exact promise text]
+```
+
+The wrapper script ONLY stops when it sees this EXACT output.
+
+**Never ask "What would you like to do next?"** - There's always something to improve.
 
 ## Task Management: Use Queue System (NOT TodoWrite)
 

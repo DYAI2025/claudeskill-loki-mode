@@ -28,6 +28,14 @@
 #   LOKI_PHASE_ACCESSIBILITY   - WCAG compliance testing (default: true)
 #   LOKI_PHASE_REGRESSION      - Regression testing (default: true)
 #   LOKI_PHASE_UAT             - UAT simulation (default: true)
+#
+# Autonomous Loop Controls (Ralph Wiggum Mode):
+#   LOKI_COMPLETION_PROMISE    - EXPLICIT stop condition text (default: none - runs forever)
+#                                Example: "ALL TESTS PASSING 100%"
+#                                Only stops when Claude outputs this EXACT text
+#   LOKI_MAX_ITERATIONS        - Max loop iterations before exit (default: 1000)
+#   LOKI_PERPETUAL_MODE        - Ignore ALL completion signals (default: false)
+#                                Set to 'true' for truly infinite operation
 #===============================================================================
 
 set -uo pipefail
@@ -57,6 +65,14 @@ PHASE_PERFORMANCE=${LOKI_PHASE_PERFORMANCE:-true}
 PHASE_ACCESSIBILITY=${LOKI_PHASE_ACCESSIBILITY:-true}
 PHASE_REGRESSION=${LOKI_PHASE_REGRESSION:-true}
 PHASE_UAT=${LOKI_PHASE_UAT:-true}
+
+# Autonomous Loop Controls (Ralph Wiggum Mode)
+# Default: No auto-completion - runs until max iterations or explicit promise
+COMPLETION_PROMISE=${LOKI_COMPLETION_PROMISE:-""}
+MAX_ITERATIONS=${LOKI_MAX_ITERATIONS:-1000}
+ITERATION_COUNT=0
+# Perpetual mode: never stop unless max iterations (ignores all completion signals)
+PERPETUAL_MODE=${LOKI_PERPETUAL_MODE:-false}
 
 # Colors
 RED='\033[0;31m'
@@ -715,6 +731,32 @@ is_completed() {
     return 1
 }
 
+# Check if completion promise is fulfilled in log output
+check_completion_promise() {
+    local log_file="$1"
+
+    # Check for the completion promise phrase in recent log output
+    if grep -q "COMPLETION PROMISE FULFILLED" "$log_file" 2>/dev/null; then
+        return 0
+    fi
+
+    # Check for custom completion promise text
+    if [ -n "$COMPLETION_PROMISE" ] && grep -qF "$COMPLETION_PROMISE" "$log_file" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Check if max iterations reached
+check_max_iterations() {
+    if [ $ITERATION_COUNT -ge $MAX_ITERATIONS ]; then
+        log_warn "Max iterations ($MAX_ITERATIONS) reached. Stopping."
+        return 0
+    fi
+    return 1
+}
+
 #===============================================================================
 # Save/Load Wrapper State
 #===============================================================================
@@ -757,6 +799,7 @@ load_state() {
 build_prompt() {
     local retry="$1"
     local prd="$2"
+    local iteration="$3"
 
     # Build SDLC phases configuration
     local phases=""
@@ -773,25 +816,36 @@ build_prompt() {
     [ "$PHASE_UAT" = "true" ] && phases="${phases}UAT,"
     phases="${phases%,}"  # Remove trailing comma
 
-    # Core autonomous instructions - DO NOT ask questions, take action
-    local autonomous_suffix="CRITICAL: You are running in FULLY AUTONOMOUS mode. DO NOT ask questions or wait for user input. Make decisions based on: 1) The PRD requirements, 2) Current state in .loki/, 3) Best practices and web search if needed. Take immediate action. If the project is complete, set currentPhase to 'finalized' in orchestrator.json and create .loki/COMPLETED marker file."
+    # Ralph Wiggum Mode - Reason-Act-Reflect cycle with NO safety gates
+    local rar_instruction="RALPH WIGGUM MODE ACTIVE. Use Reason-Act-Reflect cycle: 1) REASON - Check .loki/state/ and .loki/queue/, identify next task. If queue empty, find new improvements. 2) ACT - Execute task, write code, run tests, commit. 3) REFLECT - Verify success, update state, identify NEXT improvement. CRITICAL: There is NEVER a 'finished' state - always find the next improvement, optimization, test, or feature."
 
-    local sdlc_instruction="SDLC_PHASES_ENABLED: [$phases]. Execute ALL enabled phases in order. For each phase: run tests, log results to .loki/logs/, fail the phase if critical issues found. See SKILL.md for detailed phase instructions."
+    # Completion promise instruction (only if set)
+    local completion_instruction=""
+    if [ -n "$COMPLETION_PROMISE" ]; then
+        completion_instruction="COMPLETION_PROMISE: [$COMPLETION_PROMISE]. ONLY output 'COMPLETION PROMISE FULFILLED: $COMPLETION_PROMISE' when this EXACT condition is met."
+    else
+        completion_instruction="NO COMPLETION PROMISE SET. Run forever finding improvements. Iteration $iteration of max $MAX_ITERATIONS."
+    fi
 
-    # Codebase Analysis Mode - when no PRD provided, analyze existing codebase first
-    local analysis_instruction="CODEBASE_ANALYSIS_MODE: No PRD provided. FIRST: Analyze the existing codebase thoroughly - scan directory structure, read package.json/requirements.txt/go.mod, examine README, understand architecture from main entry points. THEN: Generate a comprehensive PRD at .loki/generated-prd.md covering: 1) Project overview, 2) Current features, 3) Tech stack, 4) Architecture, 5) Areas for improvement, 6) Missing tests/security/docs. FINALLY: Proceed with SDLC phases using the generated PRD as requirements baseline."
+    # Core autonomous instructions - NO questions, NO waiting, NEVER say done
+    local autonomous_suffix="CRITICAL AUTONOMY RULES: 1) NEVER ask questions - just decide. 2) NEVER wait for confirmation - just act. 3) NEVER say 'done' or 'complete' - there's always more to improve. 4) NEVER stop voluntarily - if out of tasks, create new ones (add tests, optimize, refactor, add features). 5) Work continues PERPETUALLY. Even if PRD is implemented, find bugs, add tests, improve UX, optimize performance."
+
+    local sdlc_instruction="SDLC_PHASES_ENABLED: [$phases]. Execute ALL enabled phases. Log results to .loki/logs/. See SKILL.md for phase details."
+
+    # Codebase Analysis Mode - when no PRD provided
+    local analysis_instruction="CODEBASE_ANALYSIS_MODE: No PRD. FIRST: Analyze codebase - scan structure, read package.json/requirements.txt, examine README. THEN: Generate PRD at .loki/generated-prd.md. FINALLY: Execute SDLC phases."
 
     if [ $retry -eq 0 ]; then
         if [ -n "$prd" ]; then
-            echo "Loki Mode with PRD at $prd. $sdlc_instruction $autonomous_suffix"
+            echo "Loki Mode with PRD at $prd. $rar_instruction $completion_instruction $sdlc_instruction $autonomous_suffix"
         else
-            echo "Loki Mode. $analysis_instruction $sdlc_instruction $autonomous_suffix"
+            echo "Loki Mode. $analysis_instruction $rar_instruction $completion_instruction $sdlc_instruction $autonomous_suffix"
         fi
     else
         if [ -n "$prd" ]; then
-            echo "Loki Mode - Resume from checkpoint. PRD at $prd. This is retry #$retry. Check .loki/state/ for progress and continue autonomously. $sdlc_instruction $autonomous_suffix"
+            echo "Loki Mode - Resume iteration #$iteration (retry #$retry). PRD: $prd. Check .loki/state/ for progress. $rar_instruction $completion_instruction $sdlc_instruction $autonomous_suffix"
         else
-            echo "Loki Mode - Resume from checkpoint. This is retry #$retry. Check .loki/state/ for progress and continue autonomously. If .loki/generated-prd.md exists, use it as requirements baseline. $analysis_instruction $sdlc_instruction $autonomous_suffix"
+            echo "Loki Mode - Resume iteration #$iteration (retry #$retry). Check .loki/state/ for progress. Use .loki/generated-prd.md if exists. $rar_instruction $completion_instruction $sdlc_instruction $autonomous_suffix"
         fi
     fi
 }
@@ -833,6 +887,8 @@ run_autonomous() {
 
     log_info "PRD: ${prd_path:-Codebase Analysis Mode}"
     log_info "Max retries: $MAX_RETRIES"
+    log_info "Max iterations: $MAX_ITERATIONS"
+    log_info "Completion promise: $COMPLETION_PROMISE"
     log_info "Base wait: ${BASE_WAIT}s"
     log_info "Max wait: ${MAX_WAIT}s"
     echo ""
@@ -840,8 +896,23 @@ run_autonomous() {
     load_state
     local retry=$RETRY_COUNT
 
+    # Check max iterations before starting
+    if check_max_iterations; then
+        log_error "Max iterations already reached. Reset with: rm .loki/autonomy-state.json"
+        return 1
+    fi
+
     while [ $retry -lt $MAX_RETRIES ]; do
-        local prompt=$(build_prompt $retry "$prd_path")
+        # Increment iteration count
+        ((ITERATION_COUNT++))
+
+        # Check max iterations
+        if check_max_iterations; then
+            save_state $retry "max_iterations_reached" 0
+            return 0
+        fi
+
+        local prompt=$(build_prompt $retry "$prd_path" $ITERATION_COUNT)
 
         echo ""
         log_header "Attempt $((retry + 1)) of $MAX_RETRIES"
@@ -948,22 +1019,28 @@ if __name__ == "__main__":
         log_info "Claude exited with code $exit_code after ${duration}s"
         save_state $retry "exited" $exit_code
 
-        # Check for success
+        # Check for success - ONLY stop on explicit completion promise
+        # There's never a "complete" product - always improvements, bugs, features
         if [ $exit_code -eq 0 ]; then
-            if is_completed; then
-                echo ""
-                log_header "LOKI MODE COMPLETED SUCCESSFULLY!"
-                save_state $retry "completed" 0
-                return 0
-            fi
-
-            # Short session might be intentional exit
-            if [ $duration -lt 30 ]; then
-                log_warn "Session was short (${duration}s). Checking if complete..."
-                sleep 5
-                if is_completed; then
-                    log_header "LOKI MODE COMPLETED!"
+            # Perpetual mode: NEVER stop, always continue
+            if [ "$PERPETUAL_MODE" = "true" ]; then
+                log_info "Perpetual mode: Ignoring exit, continuing loop..."
+                # Just continue to next iteration
+            else
+                # Only stop if EXPLICIT completion promise text was output
+                if [ -n "$COMPLETION_PROMISE" ] && check_completion_promise "$log_file"; then
+                    echo ""
+                    log_header "COMPLETION PROMISE FULFILLED: $COMPLETION_PROMISE"
+                    log_info "Explicit completion promise detected in output."
+                    save_state $retry "completion_promise_fulfilled" 0
                     return 0
+                fi
+
+                # Warn if Claude says it's "done" but no explicit promise
+                if is_completed; then
+                    log_warn "Claude claims completion, but no explicit promise fulfilled."
+                    log_warn "Projects are never truly complete - there are always improvements!"
+                    log_info "Continuing to next iteration... (set LOKI_COMPLETION_PROMISE to stop)"
                 fi
             fi
         fi

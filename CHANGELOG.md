@@ -5,6 +5,35 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2025-12-31
+
+### Added
+- **Ralph Wiggum Mode** - True perpetual autonomous operation:
+  - Reason-Act-Reflect (RAR) cycle for every iteration
+  - Products are NEVER "complete" - always improvements to make
+  - Stripped all interactive safety gates
+  - Perpetual loop continues even when Claude claims completion
+
+- **Perpetual Improvement Loop** - New philosophy:
+  - Claude never declares "done" - there's always more to improve
+  - When queue empties: find new improvements, run SDLC phases again, hunt bugs
+  - Only stops on: max iterations, explicit completion promise, or user interrupt
+
+- **New Environment Variables**:
+  - `LOKI_COMPLETION_PROMISE` - EXPLICIT stop condition (must output exact text)
+  - `LOKI_MAX_ITERATIONS` - Safety limit (default: 1000)
+  - `LOKI_PERPETUAL_MODE` - Ignore ALL completion signals (default: false)
+
+- **Completion Promise Detection** - Only stops when Claude outputs the exact promise text
+  - Example: `LOKI_COMPLETION_PROMISE="ALL TESTS PASSING 100%"`
+  - Claude must explicitly output "COMPLETION PROMISE FULFILLED: ALL TESTS PASSING 100%"
+
+### Changed
+- Default behavior now runs perpetually until max iterations
+- Removed auto-completion based on "finalized" phase (was allowing hallucinated completion)
+- Prompts now emphasize never stopping, always finding improvements
+- SKILL.md completely rewritten for Ralph Wiggum Mode philosophy
+
 ## [2.8.1] - 2025-12-29
 
 ### Fixed
