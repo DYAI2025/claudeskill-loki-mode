@@ -5,6 +5,47 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.4] - 2026-01-04
+
+### Changed
+- **README.md Complete Restructure** - Transformed README to focus on value proposition and user experience:
+  - **New Hero Section:** Clear tagline "The First Truly Autonomous Multi-Agent Startup System" with compelling value prop
+  - **"Why Loki Mode?" Section:** Direct comparison table showing what others do vs. what Loki Mode does
+  - **Core Advantages List:** 5 key differentiators (truly autonomous, massively parallel, production-ready, self-improving, zero babysitting)
+  - **Dashboard & Real-Time Monitoring Section:** Dedicated section showcasing agent monitoring and task queue visualization with screenshot placeholders
+  - **Autonomous Capabilities Section:** Prominent explanation of RARV cycle, perpetual improvement mode, and auto-resume/self-healing
+  - **Simplified Quick Start:** 5-step getting started guide with clear "walk away" messaging
+  - **Cleaner Installation:** Moved detailed installation steps to separate INSTALLATION.md
+  - **Better Structure:** Logical flow from "what it is" → "why it's better" → "how to use it" → "how it works"
+
+### Added
+- **INSTALLATION.md** - Comprehensive installation guide with all platforms:
+  - Table of contents for easy navigation
+  - Quick install section (recommended approach)
+  - Three installation options for Claude Code (git clone, releases, minimal curl)
+  - Claude.ai web installation instructions
+  - Anthropic API Console installation instructions
+  - Verify installation section for all platforms
+  - Troubleshooting section with common issues and solutions
+  - Updating and uninstalling instructions
+
+- **docs/screenshots/** - Screenshot directory with detailed instructions:
+  - README.md explaining what screenshots to capture
+  - Specifications for dashboard-agents.png and dashboard-tasks.png
+  - Step-by-step instructions for creating screenshots
+  - Alternative methods using test fixtures
+  - Guidelines for professional, clean screenshots
+
+### Impact
+- **User Experience:** README now immediately conveys value and differentiators
+- **Clarity:** Installation details no longer clutter the main README
+- **Visual Appeal:** Dashboard screenshots section makes capabilities tangible
+- **Competitive Positioning:** Clear comparison shows why Loki Mode is better than alternatives
+- **Autonomous Focus:** RARV cycle and perpetual improvement are now prominent features
+- **Ease of Use:** Quick Start shows users can literally "walk away" after starting Loki Mode
+- **Professional Documentation:** Meets industry standards with proper structure, badges, and navigation
+- **User Request:** Directly addresses "focus on what it is, how it's better than anything out there, autonomous capabilities, usage for the user, dashboard screenshots and standard things"
+
 ## [2.18.3] - 2026-01-04
 
 ### Changed
