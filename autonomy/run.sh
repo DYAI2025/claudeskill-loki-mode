@@ -252,7 +252,8 @@ init_loki_dir() {
     mkdir -p .loki/queue
     mkdir -p .loki/state/checkpoints
     mkdir -p .loki/artifacts/{releases,reports,backups}
-    mkdir -p .loki/memory/{ledgers,handoffs,learnings}
+    mkdir -p .loki/memory/{ledgers,handoffs,learnings,episodic,semantic,skills}
+    mkdir -p .loki/metrics/{efficiency,rewards}
     mkdir -p .loki/rules
     mkdir -p .loki/signals
 

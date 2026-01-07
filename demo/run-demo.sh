@@ -126,7 +126,7 @@ pause
 banner "STEP 5: Loki State Directory"
 
 step "Creating sample .loki structure..."
-mkdir -p .loki/{queue,state,memory/{episodic,semantic,skills},specs}
+mkdir -p .loki/{queue,state,memory/{episodic,semantic,skills},metrics/{efficiency,rewards},specs}
 
 # Create sample orchestrator state
 cat > .loki/state/orchestrator.json << 'EOF'

@@ -35,7 +35,7 @@ echo ""
 
 # Test 1: Directory structure creation
 log_test "Directory structure creation"
-mkdir -p .loki/{state/{agents,checkpoints,locks},queue,messages/{inbox,outbox,broadcast},logs/{agents,decisions,archive},config,prompts,artifacts/{releases,reports,metrics,backups},scripts}
+mkdir -p .loki/{state/{agents,checkpoints,locks},queue,messages/{inbox,outbox,broadcast},logs/{agents,decisions,archive},config,prompts,artifacts/{releases,reports,backups},scripts,memory/{episodic,semantic,skills},metrics/{efficiency,rewards}}
 
 if [ -d ".loki/state/agents" ] && [ -d ".loki/queue" ] && [ -d ".loki/logs" ]; then
     log_pass "All directories created"
