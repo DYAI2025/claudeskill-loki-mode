@@ -144,6 +144,7 @@ log_header() {
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_warning() { log_warn "$@"; }  # Alias for backwards compatibility
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $*"; }
 
@@ -835,8 +836,9 @@ check_system_resources() {
     # Get CPU usage (average across all cores)
     local cpu_usage=0
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS: use top to get CPU idle, then calculate usage
-        cpu_usage=$(top -l 2 -n 0 -stats pid,cpu | tail -n +13 | awk '{sum+=$2} END {print int(sum)}')
+        # macOS: get CPU idle from top header, calculate usage = 100 - idle
+        local idle=$(top -l 2 -n 0 | grep "CPU usage" | tail -1 | awk -F'[:,]' '{for(i=1;i<=NF;i++) if($i ~ /idle/) print $(i)}' | awk '{print int($1)}')
+        cpu_usage=$((100 - ${idle:-0}))
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         # Linux: use top or mpstat
         cpu_usage=$(top -bn2 | grep "Cpu(s)" | tail -1 | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print int(100 - $1)}')
@@ -909,7 +911,7 @@ EOF
 
     # Log warning if resources are high
     if [ "$overall_status" = "warning" ]; then
-        log_warning "RESOURCE WARNING: $warning_message"
+        log_warn "RESOURCE WARNING: $warning_message"
     fi
 }
 
