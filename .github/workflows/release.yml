@@ -110,21 +110,17 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.check_tag.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Loki Mode v${{ steps.version.outputs.version }}
-          body_path: changelog_body.txt
-          files: |
-            release/loki-mode-${{ steps.version.outputs.version }}.zip
-            release/loki-mode-${{ steps.version.outputs.version }}.skill
-            release/loki-mode-api-${{ steps.version.outputs.version }}.zip
-            release/loki-mode-claude-code-${{ steps.version.outputs.version }}.zip
-            release/loki-mode-claude-code-${{ steps.version.outputs.version }}.tar.gz
-          draft: false
-          prerelease: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            release/loki-mode-${{ steps.version.outputs.version }}.zip \
+            release/loki-mode-${{ steps.version.outputs.version }}.skill \
+            release/loki-mode-api-${{ steps.version.outputs.version }}.zip \
+            release/loki-mode-claude-code-${{ steps.version.outputs.version }}.zip \
+            release/loki-mode-claude-code-${{ steps.version.outputs.version }}.tar.gz \
+            --title "Loki Mode v${{ steps.version.outputs.version }}" \
+            --notes-file changelog_body.txt
 
       - name: Skip message
         if: steps.check_tag.outputs.exists == 'true'
