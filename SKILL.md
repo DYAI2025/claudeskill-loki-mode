@@ -5,8 +5,8 @@ description: Multi-agent autonomous startup system for Claude Code. Triggers on 
 
 # Loki Mode - Multi-Agent Autonomous Startup System
 
-> **Version 2.29.0** | PRD to Production | Zero Human Intervention
-> Research-enhanced with 2025 patterns: Anti-Sycophancy, Episodic Memory, Hierarchical Planning, ToolOrchestra Efficiency
+> **Version 2.30.0** | PRD to Production | Zero Human Intervention
+> Research-enhanced with 2025 patterns: OpenAI Agents SDK, Guardrails/Tripwires, Multi-Tiered Fallbacks, ToolOrchestra Efficiency
 
 ---
 
@@ -71,12 +71,15 @@ Development <- QA <- Deployment <- Business Ops <- Growth Loop
 
 **Spec-First:** `OpenAPI -> Tests -> Code -> Validate`
 **Code Review:** `Blind Review (parallel) -> Debate (if disagree) -> Devil's Advocate -> Merge`
-**Quality Gates:** `Pre-Hook (BLOCK) -> Write -> Post-Hook (FIX)`
+**Guardrails:** `Input Guard (BLOCK) -> Execute -> Output Guard (VALIDATE)` (OpenAI SDK)
+**Tripwires:** `Validation fails -> Halt execution -> Escalate or retry`
+**Fallbacks:** `Try primary -> Model fallback -> Workflow fallback -> Human escalation`
 **Problem Solving:** `Analyze -> Plan (NO CODE) -> Implement`
 **Self-Verification:** `Code -> Test -> Fail -> Learn -> Update CONTINUITY.md -> Retry`
 **Memory Consolidation:** `Episodic (trace) -> Pattern Extraction -> Semantic (knowledge)`
 **Hierarchical Planning:** `Global Goal -> High-Level Skills -> Local Execution`
 **Tool Orchestration:** `Classify Complexity -> Select Agents -> Track Efficiency -> Reward Learning`
+**Handoff Callbacks:** `on_handoff -> Pre-fetch context -> Transfer with data` (OpenAI SDK)
 
 ---
 
@@ -268,15 +271,22 @@ Report back with: WHY, WHAT, TRADE-OFFS, RISKS
 
 **Never ship code without passing all quality gates:**
 
-1. **Static Analysis** - CodeQL, ESLint/Pylint, type checking
-2. **Blind Review System** - 3 reviewers in parallel, no visibility of each other's findings
-3. **Anti-Sycophancy Check** - If unanimous approval, run Devil's Advocate reviewer
-4. **Severity-Based Blocking** - Critical/High/Medium = BLOCK; Low/Cosmetic = TODO comment
-5. **Test Coverage Gates** - Unit: 100% pass, >80% coverage; Integration: 100% pass
+1. **Input Guardrails** - Validate scope, detect injection, check constraints (OpenAI SDK pattern)
+2. **Static Analysis** - CodeQL, ESLint/Pylint, type checking
+3. **Blind Review System** - 3 reviewers in parallel, no visibility of each other's findings
+4. **Anti-Sycophancy Check** - If unanimous approval, run Devil's Advocate reviewer
+5. **Output Guardrails** - Validate code quality, spec compliance, no secrets (tripwire on fail)
+6. **Severity-Based Blocking** - Critical/High/Medium = BLOCK; Low/Cosmetic = TODO comment
+7. **Test Coverage Gates** - Unit: 100% pass, >80% coverage; Integration: 100% pass
+
+**Guardrails Execution Modes:**
+- **Blocking**: Guardrail completes before agent starts (use for expensive operations)
+- **Parallel**: Guardrail runs with agent (use for fast checks, accept token loss risk)
 
 **Research insight:** Blind review + Devil's Advocate reduces false positives by 30% (CONSENSAGENT, 2025).
+**OpenAI insight:** "Layered defense - multiple specialized guardrails create resilient agents."
 
-See `references/quality-control.md` for full details.
+See `references/quality-control.md` and `references/openai-patterns.md` for details.
 
 ---
 
@@ -340,6 +350,49 @@ See `references/agent-types.md` for complete definitions and capabilities.
 - **ALWAYS** fix Critical/High/Medium immediately
 - **ALWAYS** re-run ALL 3 reviewers after fixes
 - **ALWAYS** checkpoint state before spawning subagents
+
+---
+
+## Multi-Tiered Fallback System
+
+**Based on OpenAI Agent Safety Patterns:**
+
+### Model-Level Fallbacks
+```
+opus -> sonnet -> haiku (if rate limited or unavailable)
+```
+
+### Workflow-Level Fallbacks
+```
+Full workflow fails -> Simplified workflow -> Decompose to subtasks -> Human escalation
+```
+
+### Human Escalation Triggers
+
+| Trigger | Action |
+|---------|--------|
+| retry_count > 3 | Pause and escalate |
+| domain in [payments, auth, pii] | Require approval |
+| confidence_score < 0.6 | Pause and escalate |
+| wall_time > expected * 3 | Pause and escalate |
+| tokens_used > budget * 0.8 | Pause and escalate |
+
+See `references/openai-patterns.md` for full fallback implementation.
+
+---
+
+## AGENTS.md Integration
+
+**Read target project's AGENTS.md if exists** (OpenAI/AAIF standard):
+
+```
+Context Priority:
+1. AGENTS.md (closest to current file)
+2. CLAUDE.md (Claude-specific)
+3. .loki/CONTINUITY.md (session state)
+4. Package docs
+5. README.md
+```
 
 ---
 
@@ -413,6 +466,7 @@ Detailed documentation is split into reference files for progressive loading:
 |-----------|---------|
 | `references/core-workflow.md` | Full RARV cycle, CONTINUITY.md template, autonomy rules |
 | `references/quality-control.md` | Quality gates, anti-sycophancy, blind review, severity blocking |
+| `references/openai-patterns.md` | OpenAI Agents SDK: guardrails, tripwires, handoffs, fallbacks |
 | `references/advanced-patterns.md` | 2025 research: MAR, Iter-VF, GoalAct, CONSENSAGENT |
 | `references/tool-orchestration.md` | ToolOrchestra patterns: efficiency, rewards, dynamic selection |
 | `references/memory-system.md` | Episodic/semantic memory, consolidation, Zettelkasten linking |
@@ -428,4 +482,4 @@ Detailed documentation is split into reference files for progressive loading:
 
 ---
 
-**Version:** 2.29.0 | **Lines:** ~415 | **Research-Enhanced for Claude Code Agent Skills**
+**Version:** 2.30.0 | **Lines:** ~470 | **Research-Enhanced with OpenAI Agent Patterns**

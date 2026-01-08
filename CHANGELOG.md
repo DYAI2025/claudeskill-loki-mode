@@ -5,6 +5,72 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.30.0] - 2026-01-07
+
+### Added - OpenAI Agent Patterns
+
+**Research sources analyzed:**
+- [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) - Core primitives
+- [Practical Guide to Building Agents](https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf)
+- [Building Agents Track](https://developers.openai.com/tracks/building-agents/)
+- [AGENTS.md Specification](https://agents.md/)
+- [Deep Research System Card](https://cdn.openai.com/deep-research-system-card.pdf)
+- [Chain of Thought Monitoring](https://openai.com/index/chain-of-thought-monitoring/)
+- [Agentic AI Foundation](https://openai.com/index/agentic-ai-foundation/)
+
+**New Reference File: `references/openai-patterns.md`**
+Comprehensive guide covering:
+- **Tracing Spans Architecture**: Hierarchical event tracking with span types (agent_span, generation_span, function_span, guardrail_span, handoff_span)
+- **Guardrails & Tripwires**: Input/output validation with early termination
+- **Handoff Callbacks**: on_handoff for data preparation during agent transfers
+- **Multi-Tiered Fallbacks**: Model-level and workflow-level failure recovery
+- **Confidence-Based Human Escalation**: Threshold-based intervention triggers
+- **AGENTS.md Integration**: Read target project context using AAIF standard
+- **Session State Management**: Automatic state persistence
+
+**New Patterns in SKILL.md:**
+- **Guardrails**: `Input Guard (BLOCK) -> Execute -> Output Guard (VALIDATE)`
+- **Tripwires**: `Validation fails -> Halt execution -> Escalate or retry`
+- **Fallbacks**: `Try primary -> Model fallback -> Workflow fallback -> Human escalation`
+- **Handoff Callbacks**: `on_handoff -> Pre-fetch context -> Transfer with data`
+
+**Enhanced Quality Gates:**
+- Added Input Guardrails (validate scope, detect injection, check constraints)
+- Added Output Guardrails (validate code quality, spec compliance, no secrets)
+- Guardrails execution modes: Blocking vs Parallel
+- Tripwire handling with exception hierarchy
+
+**Human Escalation Triggers:**
+| Trigger | Action |
+|---------|--------|
+| retry_count > 3 | Pause and escalate |
+| domain in [payments, auth, pii] | Require approval |
+| confidence_score < 0.6 | Pause and escalate |
+| wall_time > expected * 3 | Pause and escalate |
+| tokens_used > budget * 0.8 | Pause and escalate |
+
+### Changed
+- SKILL.md: Updated version to 2.30.0, ~470 lines
+- SKILL.md: Added 4 new patterns to Essential Patterns section
+- SKILL.md: Added Multi-Tiered Fallback System section
+- SKILL.md: Added AGENTS.md Integration section
+- SKILL.md: Enhanced Quality Gates with guardrails and tripwires
+- quality-control.md: Added Guardrails & Tripwires System section with layered defense
+- tool-orchestration.md: Added Tracing Spans Architecture section
+- tool-orchestration.md: Added OpenAI sources to references
+
+### OpenAI Key Insights Applied
+| Insight | Implementation |
+|---------|----------------|
+| "Layered defense with multiple guardrails" | 4-layer guardrail system |
+| "Tripwires halt execution immediately" | Exception hierarchy for validation failures |
+| "on_handoff for data preparation" | Pre-fetch context during agent transfers |
+| "Model fallback chains" | opus -> sonnet -> haiku on failure |
+| "Confidence-based escalation" | Threshold-triggered human review |
+| "AGENTS.md for agent instructions" | Read target project's AGENTS.md |
+
+---
+
 ## [2.29.0] - 2026-01-07
 
 ### Added - Research-Backed Multi-Agent Best Practices

@@ -1,15 +1,83 @@
 # Tool Orchestration Patterns Reference
 
-Research-backed patterns inspired by NVIDIA ToolOrchestra and multi-agent coordination research.
+Research-backed patterns inspired by NVIDIA ToolOrchestra, OpenAI Agents SDK, and multi-agent coordination research.
 
 ---
 
 ## Overview
 
-Effective tool orchestration requires three key innovations:
-1. **Efficiency Metrics** - Track computational cost per task
-2. **Reward Signals** - Outcome, efficiency, and preference rewards for learning
-3. **Dynamic Selection** - Adapt agent count and types based on task complexity
+Effective tool orchestration requires four key innovations:
+1. **Tracing Spans** - Hierarchical event tracking (OpenAI SDK pattern)
+2. **Efficiency Metrics** - Track computational cost per task
+3. **Reward Signals** - Outcome, efficiency, and preference rewards for learning
+4. **Dynamic Selection** - Adapt agent count and types based on task complexity
+
+---
+
+## Tracing Spans Architecture (OpenAI SDK Pattern)
+
+### Span Types
+
+Every operation is wrapped in a typed span for observability:
+
+```yaml
+span_types:
+  agent_span:     # Wraps entire agent execution
+  generation_span: # Wraps LLM API calls
+  function_span:  # Wraps tool/function calls
+  guardrail_span: # Wraps validation checks
+  handoff_span:   # Wraps agent-to-agent transfers
+  custom_span:    # User-defined operations
+```
+
+### Hierarchical Trace Structure
+
+```json
+{
+  "trace_id": "trace_abc123def456",
+  "workflow_name": "implement_feature",
+  "group_id": "session_xyz789",
+  "spans": [
+    {
+      "span_id": "span_001",
+      "parent_id": null,
+      "type": "agent_span",
+      "agent_name": "orchestrator",
+      "started_at": "2026-01-07T10:00:00Z",
+      "ended_at": "2026-01-07T10:05:00Z",
+      "children": ["span_002", "span_003"]
+    },
+    {
+      "span_id": "span_002",
+      "parent_id": "span_001",
+      "type": "guardrail_span",
+      "guardrail_name": "input_validation",
+      "triggered": false,
+      "blocking": true
+    },
+    {
+      "span_id": "span_003",
+      "parent_id": "span_001",
+      "type": "handoff_span",
+      "from_agent": "orchestrator",
+      "to_agent": "backend-dev"
+    }
+  ]
+}
+```
+
+### Storage Location
+
+```
+.loki/traces/
+├── active/
+│   └── {trace_id}.json     # Currently running traces
+└── completed/
+    └── {date}/
+        └── {trace_id}.json # Archived traces
+```
+
+See `references/openai-patterns.md` for full tracing implementation.
 
 ---
 
@@ -595,6 +663,13 @@ Based on [Measurement Imbalance research (arXiv 2506.02064)](https://arxiv.org/a
 
 ## Sources
 
+**OpenAI Agents SDK:**
+- [Agents SDK Documentation](https://openai.github.io/openai-agents-python/) - Core primitives: agents, handoffs, guardrails, tracing
+- [Practical Guide to Building Agents](https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf) - Orchestration patterns
+- [Building Agents Track](https://developers.openai.com/tracks/building-agents/) - Official developer guide
+- [AGENTS.md Specification](https://agents.md/) - Standard for agent instructions
+- [Tracing Documentation](https://openai.github.io/openai-agents-python/tracing/) - Span types and observability
+
 **Efficiency & Orchestration:**
 - [NVIDIA ToolOrchestra](https://github.com/NVlabs/ToolOrchestra) - Multi-turn tool orchestration with RL
 - [ToolScale Dataset](https://huggingface.co/datasets/nvidia/ToolScale) - Training data synthesis
@@ -609,3 +684,8 @@ Based on [Measurement Imbalance research (arXiv 2506.02064)](https://arxiv.org/a
 - [Maxim AI: Production Multi-Agent Systems](https://www.getmaxim.ai/articles/best-practices-for-building-production-ready-multi-agent-systems/) - Orchestration patterns, distributed tracing
 - [UiPath: Agent Builder Best Practices](https://www.uipath.com/blog/ai/agent-builder-best-practices) - Single-responsibility, evaluations
 - [Stanford/Harvard: Demo-to-Deployment Gap](https://www.marktechpost.com/2025/12/24/this-ai-paper-from-stanford-and-harvard-explains-why-most-agentic-ai-systems-feel-impressive-in-demos-and-then-completely-fall-apart-in-real-use/) - Tool reliability as key failure mode
+
+**Safety & Reasoning:**
+- [Chain of Thought Monitoring](https://openai.com/index/chain-of-thought-monitoring/) - CoT monitorability for safety
+- [Agent Builder Safety](https://platform.openai.com/docs/guides/agent-builder-safety) - Human-in-loop patterns
+- [Agentic AI Foundation](https://openai.com/index/agentic-ai-foundation/) - Industry standards (MCP, AGENTS.md, goose)

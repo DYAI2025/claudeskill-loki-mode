@@ -17,10 +17,11 @@ claude --dangerously-skip-permissions
 ```
 SKILL.md                    # Main skill definition (read this first)
 references/                 # Detailed documentation (loaded progressively)
+  openai-patterns.md        # OpenAI Agents SDK: guardrails, tripwires, handoffs
   advanced-patterns.md      # 2025 research patterns (MAR, Iter-VF, GoalAct)
   tool-orchestration.md     # ToolOrchestra-inspired efficiency & rewards
   memory-system.md          # Episodic/semantic memory architecture
-  quality-control.md        # Code review, anti-sycophancy protocol
+  quality-control.md        # Code review, anti-sycophancy, guardrails
   agent-types.md            # 37 specialized agent definitions
   sdlc-phases.md            # Full SDLC workflow
   task-queue.md             # Queue system, circuit breakers
@@ -71,7 +72,7 @@ Every iteration follows: **R**eason -> **A**ct -> **R**eflect -> **V**erify
 
 ### Version Numbering
 Follows semantic versioning: MAJOR.MINOR.PATCH
-- Current: v2.29.0
+- Current: v2.30.0
 - MINOR bump for new features
 - PATCH bump for fixes
 
@@ -91,10 +92,13 @@ Follows semantic versioning: MAJOR.MINOR.PATCH
 ## Research Foundation
 
 Built on 2025 research:
+- OpenAI Agents SDK (guardrails, tripwires, handoffs, tracing)
+- AGENTS.md / Agentic AI Foundation (AAIF) standards
 - CONSENSAGENT (anti-sycophancy)
 - GoalAct (hierarchical planning)
 - A-Mem/MIRIX (memory systems)
 - Multi-Agent Reflexion (MAR)
 - Iter-VF (verification patterns)
+- NVIDIA ToolOrchestra (efficiency metrics)
 
-See `references/advanced-patterns.md` for details.
+See `references/openai-patterns.md` and `references/advanced-patterns.md` for details.
