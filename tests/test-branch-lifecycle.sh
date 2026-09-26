@@ -639,8 +639,8 @@ outefc="$(
     setup_agent_branch >/dev/null 2>&1
     before="$(git rev-list --count HEAD)"
     printf 'agent\n' > work.js
-    # Leading '(' on the case pattern: bash 3.2 misparses a bare pattern ')'
-    # inside $( ... ).
+    # Leading open paren on the case pattern: bash 3.2 misparses a bare
+    # pattern close paren inside $( ... ).
     git() {
         case " $* " in (*" --pathspec-from-file="*) return 129 ;; esac
         command git "$@"
@@ -677,8 +677,8 @@ outog="$(
     source "$PREAMBLE"
     base="$(command git rev-parse --abbrev-ref HEAD)"
     printf 'my private notes\n' > usernotes.txt
-    # Model git 2.17 for the whole session (leading '(' on case patterns for
-    # bash 3.2 inside $( ... )).
+    # Model git 2.17 for the whole session (leading open paren on case
+    # patterns for bash 3.2 inside $( ... )).
     git() {
         case " $* " in
             (*" status "*"--no-renames"*|*" status "*"--ignored=matching"*) return 129 ;;
@@ -1014,8 +1014,8 @@ outsa="$(
     before="$(git rev-list --count HEAD)"
     # A normal source change (must be preserved).
     echo "function feat(){return 1}" > feature.js
-    # A secret in a file the path-globs do NOT match. Tier-1 'sk-' pattern (no
-    # deny filter), >=20 [A-Za-z0-9], so it is a definite scanner finding.
+    # A secret in a file the path-globs do NOT match. Tier-1 sk- prefix pattern
+    # (no deny filter), >=20 [A-Za-z0-9], so it is a definite scanner finding.
     printf '%s\n' 'const KEY="sk-AbCdEf0123456789AbCdEfGh"' > config.js
     ITERATION_COUNT=1
     result=0
@@ -1913,7 +1913,7 @@ out68m="$(
     _loki_record_session_created >/dev/null 2>&1
     anchor_after_t1="$(cat .loki/state/tracked-since.sha 2>/dev/null)"
     # Turn 2: begins (marker set again), agent commits the pre-existing file,
-    # then killed before this turn's own record call.
+    # then killed before the record call for this turn.
     : > .loki/state/turn-in-flight
     git add notes.txt && git commit -qm "agent turn 2 (includes pre-existing notes.txt)"
     git checkout -q develop
@@ -1977,7 +1977,7 @@ else
         git add work1.js && git commit -qm "agent turn 1"
         _loki_record_session_created >/dev/null 2>&1
         # Turn 2: begins (marker set again), agent commits the pre-existing
-        # file, then killed before this turn's own record call.
+        # file, then killed before the record call for this turn.
         : > .loki/state/turn-in-flight
         git add notes.txt && git commit -qm "agent turn 2 (includes pre-existing notes.txt)"
         git checkout -q develop
