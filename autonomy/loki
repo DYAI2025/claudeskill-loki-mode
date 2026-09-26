@@ -33785,11 +33785,19 @@ except Exception:
     # --- Test suggestions ---
     local test_suggestions=""
     if [ "$ci_test_suggest" = true ] && [ -n "$changed_files" ]; then
-        export LOKI_CI_CHANGED_FILES="$changed_files"
-        test_suggestions=$(python3 << 'TEST_SUGGEST_PY'
+        # Changed-file list goes through a temp file, read as sys.argv[1], not
+        # through an exported env var: an exported string counts toward the
+        # same execve() size ceiling as argv (plus, on Linux, its own 128 KiB
+        # per-string cap), so a PR touching enough files can crash this
+        # heredoc invocation with "Argument list too long" (exit 126) exactly
+        # like an oversized argv element would.
+        local _ci_changed_tmp
+        _ci_changed_tmp=$(mktemp "${TMPDIR:-/tmp}/loki-ci-changed-XXXXXX")
+        printf '%s' "$changed_files" >"$_ci_changed_tmp"
+        test_suggestions=$(python3 - "$_ci_changed_tmp" << 'TEST_SUGGEST_PY'
 import sys, os
 
-changed = os.environ.get("LOKI_CI_CHANGED_FILES", "").strip().split("\n")
+changed = open(sys.argv[1]).read().strip().split("\n")
 suggestions = []
 
 for f in changed:
@@ -33848,6 +33856,7 @@ import json
 print(json.dumps(suggestions))
 TEST_SUGGEST_PY
         )
+        rm -f "$_ci_changed_tmp"
     fi
 
     # --- Tally findings ---
@@ -33886,22 +33895,34 @@ TEST_SUGGEST_PY
     file_count=$(echo "$changed_files" | grep -c '.' 2>/dev/null || echo 0)
 
     if [ "$ci_format" = "json" ]; then
-        # JSON output via python for proper escaping
-        export LOKI_CI_JSON_FINDINGS=""
+        # JSON output via python for proper escaping.
+        #
+        # Findings and test suggestions go through temp files, read as
+        # sys.argv[1]/[2], not through exported env vars: an exported string
+        # counts toward the same execve() size ceiling as argv (plus, on
+        # Linux, its own 128 KiB per-string cap), so a large enough diff --
+        # meaning enough findings, not necessarily a byte-huge diff -- crashed
+        # this exact heredoc with "Argument list too long" (exit 126) before
+        # this fix (BACKLOG 25). META and COUNTS stay as env vars: both are a
+        # handful of fixed-width fields, bounded regardless of diff size.
+        local _ci_findings_tmp _ci_tests_tmp
+        _ci_findings_tmp=$(mktemp "${TMPDIR:-/tmp}/loki-ci-findings-XXXXXX")
+        _ci_tests_tmp=$(mktemp "${TMPDIR:-/tmp}/loki-ci-tests-XXXXXX")
+        : >"$_ci_findings_tmp"
         for f in "${findings[@]+"${findings[@]}"}"; do
-            LOKI_CI_JSON_FINDINGS+="${f}"$'\n'
+            printf '%s\n' "$f" >>"$_ci_findings_tmp"
         done
+        printf '%s' "${test_suggestions:-[]}" >"$_ci_tests_tmp"
         export LOKI_CI_JSON_META="ci_env=${ci_env}|pr=${ci_pr_number}|ts=${report_timestamp}|files=${file_count}|exit=${exit_code}"
         export LOKI_CI_JSON_COUNTS="critical=${count_critical}|high=${count_high}|medium=${count_medium}|low=${count_low}|info=${count_info}|total=${count_total}"
-        export LOKI_CI_JSON_TESTS="${test_suggestions:-[]}"
 
-        python3 << 'CI_JSON_OUT'
-import json, os
+        python3 - "$_ci_findings_tmp" "$_ci_tests_tmp" << 'CI_JSON_OUT'
+import json, os, sys
 
-findings_raw = os.environ.get("LOKI_CI_JSON_FINDINGS", "").strip().split("\n")
+findings_raw = open(sys.argv[1]).read().strip().split("\n")
 meta_raw = os.environ.get("LOKI_CI_JSON_META", "")
 counts_raw = os.environ.get("LOKI_CI_JSON_COUNTS", "")
-tests_raw = os.environ.get("LOKI_CI_JSON_TESTS", "[]")
+tests_raw = open(sys.argv[2]).read().strip() or "[]"
 
 meta = dict(item.split("=", 1) for item in meta_raw.split("|") if "=" in item)
 counts = dict(item.split("=", 1) for item in counts_raw.split("|") if "=" in item)
@@ -33948,7 +33969,8 @@ if tests:
 
 print(json.dumps(report, indent=2))
 CI_JSON_OUT
-        unset LOKI_CI_JSON_FINDINGS LOKI_CI_JSON_META LOKI_CI_JSON_COUNTS LOKI_CI_JSON_TESTS
+        rm -f "$_ci_findings_tmp" "$_ci_tests_tmp"
+        unset LOKI_CI_JSON_META LOKI_CI_JSON_COUNTS
 
     elif [ "$ci_format" = "github" ]; then
         # GitHub-flavored markdown for PR comments
@@ -33997,10 +34019,11 @@ CI_JSON_OUT
         if [ -n "${test_suggestions:-}" ] && [ "$test_suggestions" != "[]" ]; then
             echo "### Test Suggestions"
             echo ""
-            export LOKI_CI_TEST_SUGG="${test_suggestions}"
-            python3 -c "
-import json, os
-tests = json.loads(os.environ.get('LOKI_CI_TEST_SUGG', '[]'))
+            # Piped on stdin, not through an exported env var (BACKLOG 25):
+            # an exported string shares argv's execve() size ceiling.
+            printf '%s' "$test_suggestions" | python3 -c "
+import json, sys
+tests = json.loads(sys.stdin.read() or '[]')
 for t in tests:
     print(f\"- **{t['file']}**: {t['hint']} ({t['framework']})\")
     print(f\"  - Suggested: \`{t['test_file']}\`\")
@@ -34066,15 +34089,15 @@ for t in tests:
         if [ "$ci_test_suggest" = true ] && [ -n "${test_suggestions:-}" ] && [ "$test_suggestions" != "[]" ]; then
             echo ""
             echo -e "${BOLD}Test Suggestions${NC}"
-            export LOKI_CI_TEST_SUGG="${test_suggestions}"
-            python3 -c "
-import json, os
-tests = json.loads(os.environ.get('LOKI_CI_TEST_SUGG', '[]'))
+            # Piped on stdin, not through an exported env var (BACKLOG 25):
+            # an exported string shares argv's execve() size ceiling.
+            printf '%s' "$test_suggestions" | python3 -c "
+import json, sys
+tests = json.loads(sys.stdin.read() or '[]')
 for t in tests:
     print(f\"  {t['file']} -> {t['test_file']} ({t['framework']})\")
     print(f\"    {t['hint']}\")
 " 2>/dev/null || true
-            unset LOKI_CI_TEST_SUGG
         fi
 
         if [ "$exit_code" -eq 0 ]; then
