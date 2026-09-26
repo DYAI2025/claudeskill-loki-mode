@@ -252,7 +252,7 @@ function CostDonutChart({ data }: { data: CostBreakdown[] }) {
           Total
         </text>
         <text x={center} y={center + 12} textAnchor="middle" className="text-sm fill-[#36342E] dark:fill-[#E8E6E3] font-semibold">
-          ${total.toFixed(0)}
+          ${total.toFixed(2)}
         </text>
       </svg>
 

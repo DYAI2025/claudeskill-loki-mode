@@ -295,6 +295,7 @@ run_test "head-to-head corpus honesty" "$SCRIPT_DIR/test-headtohead-honesty.sh"
 run_test "receipt metrics exposed to monitoring" "$SCRIPT_DIR/test-receipt-metrics.sh"
 run_test "A/B analysis honesty (tiny-n statistics)" "$SCRIPT_DIR/test-ab-analysis-honesty.sh"
 run_test "webapp receipt panel renders (real browser)" "$SCRIPT_DIR/../scripts/run-webapp-receipt-panel.sh"
+run_test "webapp admin, templates and teams render honestly (real browser)" "$SCRIPT_DIR/../scripts/run-webapp-admin-honesty.sh"
 run_test "local receipt attestation" "$SCRIPT_DIR/test-local-receipt-attestation.sh"
 run_test "Pytest Gate Timeout (Dev6)" "$SCRIPT_DIR/test-pytest-gate-timeout.sh"
 run_test "Go/Cargo Gate Timeout" "$SCRIPT_DIR/test-go-cargo-gate-timeout.sh"
@@ -521,6 +522,7 @@ run_test "audit subsystem Node suites (witness, manifest, crosslink)" "$SCRIPT_D
 # required, not skipped (as in the audit suites above): no runtime means the
 # suite did not run, which is unmeasured, not clean.
 run_test "dashboard unmeasured cost never renders as zero (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-unmeasured-cost-never-zero.node.test.mjs"
+run_test "dashboard panels render unmeasured as unknown (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-unmeasured-panels-honesty.node.test.mjs"
 run_test "shipped agent roles reach the review pool" "$SCRIPT_DIR/test-agent-types-loaded.sh"
 run_test "policy present but unevaluable refuses fail-closed" "$SCRIPT_DIR/test-policy-node-failclosed.sh"
 run_test "audit entries attribute an actor honestly" "$SCRIPT_DIR/test-audit-actor-attribution.sh"

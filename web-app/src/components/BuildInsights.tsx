@@ -15,8 +15,8 @@ interface PhaseBreakdown {
 // Every metric below that the caller cannot measure is null, and renders as
 // "Not recorded". A 0 here would be a reading nobody took.
 interface BuildInsightsProps {
-  /** Number of files created */
-  filesCreated: number;
+  /** Number of files created; null when not recorded */
+  filesCreated: number | null;
   /** Number of files modified; null when not recorded */
   filesModified: number | null;
   /** Total lines of code generated; null when not recorded */
@@ -29,14 +29,14 @@ interface BuildInsightsProps {
   totalTokens: number | null;
   /** Token breakdown by phase */
   phaseBreakdown: PhaseBreakdown[];
-  /** Total build time in seconds */
-  totalTimeSecs: number;
+  /** Total build time in seconds; null when not recorded */
+  totalTimeSecs: number | null;
   /** Quality gate score (0-100); null when not recorded */
   qualityScore: number | null;
   /** Total cost in dollars; null when no cost was recorded */
   totalCost: number | null;
-  /** Number of iterations */
-  iterations: number;
+  /** Number of iterations; null when not recorded */
+  iterations: number | null;
   /** Provider used */
   provider: string;
   /** Callback for sharing insights */
@@ -156,12 +156,12 @@ export function BuildInsights({
       'Build Insights Summary',
       '=====================',
       `Provider: ${provider}`,
-      `Total Time: ${formatTime(totalTimeSecs)}`,
-      `Iterations: ${iterations}`,
+      `Total Time: ${orNotRecorded(totalTimeSecs, formatTime)}`,
+      `Iterations: ${orNotRecorded(iterations, String)}`,
       `Cost: ${costLabel}`,
       '',
       'Output:',
-      `  Files Created: ${filesCreated}`,
+      `  Files Created: ${orNotRecorded(filesCreated, String)}`,
       `  Files Modified: ${orNotRecorded(filesModified, String)}`,
       `  Lines Generated: ${orNotRecorded(linesGenerated, String)}`,
       `  Tests Generated: ${orNotRecorded(testsGenerated, String)}`,
@@ -211,10 +211,14 @@ export function BuildInsights({
             <StatCard
               icon={FileCode2}
               label="Files"
-              value={String(filesModified === null ? filesCreated : filesCreated + filesModified)}
-              subtext={filesModified === null
-                ? `${filesCreated} new, modified not recorded`
-                : `${filesCreated} new, ${filesModified} modified`}
+              value={filesCreated === null
+                ? NOT_RECORDED
+                : String(filesModified === null ? filesCreated : filesCreated + filesModified)}
+              subtext={filesCreated === null
+                ? undefined
+                : filesModified === null
+                  ? `${filesCreated} new, modified not recorded`
+                  : `${filesCreated} new, ${filesModified} modified`}
               iconColor="text-primary"
             />
             <StatCard
@@ -242,8 +246,8 @@ export function BuildInsights({
             <StatCard
               icon={Clock}
               label="Build Time"
-              value={formatTime(totalTimeSecs)}
-              subtext={`${iterations} iterations`}
+              value={orNotRecorded(totalTimeSecs, formatTime)}
+              subtext={iterations === null ? 'iterations not recorded' : `${iterations} iterations`}
               iconColor="text-muted"
             />
             <StatCard

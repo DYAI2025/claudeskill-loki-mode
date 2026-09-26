@@ -194,8 +194,9 @@ function CategoryPattern({ category }: { category: string }) {
   }
 }
 
-function DifficultyIndicator({ level }: { level: string }) {
-  const style = DIFFICULTY_STYLES[level] || DIFFICULTY_STYLES.intermediate;
+function DifficultyIndicator({ level }: { level: string | null }) {
+  const style = level ? DIFFICULTY_STYLES[level] : undefined;
+  if (!style) return null;
   return (
     <div className="flex items-center gap-1.5">
       <BarChart3 size={12} className={style.color} />
@@ -376,8 +377,8 @@ export default function TemplatesPage() {
             const category = t.category || 'Other';
             const gradient = CATEGORY_GRADIENTS[category] || CATEGORY_GRADIENTS.Other;
             const techStack = t.tech_stack || [];
-            const difficulty = t.difficulty || 'intermediate';
-            const buildTime = t.build_time || '5-10 min';
+            const difficulty = t.difficulty;
+            const buildTime = t.build_time;
 
             return (
               <div
@@ -445,10 +446,12 @@ export default function TemplatesPage() {
                   <div className="flex items-center justify-between pt-3 border-t border-[#ECEAE3]">
                     <div className="flex items-center gap-3">
                       <DifficultyIndicator level={difficulty} />
-                      <div className="flex items-center gap-1 text-[10px] text-[#6B6960]">
-                        <Clock size={11} />
-                        <span>{buildTime}</span>
-                      </div>
+                      {buildTime && (
+                        <div className="flex items-center gap-1 text-[10px] text-[#6B6960]" title="Hand-written estimate, not a measured build">
+                          <Clock size={11} />
+                          <span>Est. {buildTime}</span>
+                        </div>
+                      )}
                     </div>
                     <Button
                       size="sm"

@@ -20,7 +20,13 @@
 #                                     (null/undefined) cost into 0 or "$0.00",
 #                                     and the budget, cost-timeline and fleet
 #                                     endpoints send null (not 0) for spend
-#                                     nobody measured, per run and in totals
+#                                     nobody measured, per run and in totals,
+#                                     flag a partly measured run as partial,
+#                                     and the context, token-economics,
+#                                     learning and gate readers (and the
+#                                     web-app session status and memory
+#                                     readers) send null or [] until something
+#                                     was measured
 #
 # Contract (tests/moat): one "CASE <ID> PASS|FAIL <text>" stdout line per case,
 # diagnostics on stderr, exit 0 whenever the script ran to completion. A missing
@@ -561,8 +567,32 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 #      not data sources. Like rule 3 it applies to every web-app source file,
 #      reachable or not: a hook or helper returning demo rows is not a JSX tag,
 #      so the mount graph cannot see it.
+# Rules 6-9 read the WHOLE file with a bracket matcher, never one line at a
+# time: every fabrication they target spans lines. Like rules 3 and 5 they apply
+# to every web-app source file and every dashboard-ui file, reachable or not.
+#   6. No array of literal rows is passed to a set*() setter or useState(), or
+#      appears anywhere in a catch body (`catch {`, `.catch(() => {...})`). A row
+#      is literal when every value is a string, number, boolean, null, a
+#      `new Date(...)`/`Date.now()` expression, `as const`, or a nested literal
+#      array/object. The Teams page seeded every team's Activity tab with four
+#      invented rows in a fetch-less effect, and swapped in a sample team and
+#      sample audit rows whenever a request failed; this is that shape.
+#      `setStats([{ label: 'Stars', value: stars }])` reads a variable and is
+#      not literal.
+#   7. No binding NAMED sample, mock, demo, fake, dummy or placeholder (bare,
+#      camelCase or SAMPLE_-style) is bound to an array or object literal. A
+#      string placeholder is input-hint copy and is not flagged.
+#   8. No invented stats: a `||`/`??` fallback to an object literal whose
+#      metric-named key (uses, rating, stars, downloads, count, total, score,
+#      ...) holds a number (`TEMPLATE_STATS[f] || { uses: 500, rating: 4.5 }`),
+#      and no lookup table of two or more entries whose values are objects made
+#      only of metric-named numeric literals (the TEMPLATE_STATS table itself).
+#   9. No zero fallback is fed straight into a number formatter:
+#      `(x ?? 0).toLocaleString()`, `(x || 0).toFixed(1)`,
+#      `x?.toLocaleString() || 0`, `formatPercent(x || 0)`. That renders an
+#      unmeasured value as a measured 0; the fix renders "--" for null.
 # dashboard-ui web components are all shipped in the bundle, so rules 1, 3 and
-# 5 apply to every dashboard-ui component file directly.
+# 5-9 apply to every dashboard-ui component file directly.
 cat > "$MOAT_TMP/sample-panels.py" <<'PY'
 import os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -588,6 +618,174 @@ def demo_lines(s):
             if not FLAG.search(name) and (DEMO.search(name) or (gen and GEN.search(name))):
                 hits.add(s.count('\n', 0, m.start(1)) + 1)
     return sorted(hits)
+
+# --- rules 6-9: whole-file, bracket-matched --------------------------------
+OPEN = {'(': ')', '[': ']', '{': '}'}
+def skip_quoted(s, i):
+    """s[i] is a quote or backtick; return the index of its closing quote."""
+    q, j = s[i], i + 1
+    while j < len(s):
+        c = s[j]
+        if c == '\\':
+            j += 2; continue
+        if c == q:
+            return j
+        if q == '`' and s.startswith('${', j):
+            k = close_of(s, j + 1)
+            if k < 0:
+                return len(s)
+            j = k
+        j += 1
+    return len(s)
+def close_of(s, i):
+    """s[i] opens ( [ or {; return the index of its closer, or -1."""
+    stack, j = [OPEN[s[i]]], i + 1
+    while j < len(s):
+        c = s[j]
+        if c in '\'"`':
+            j = skip_quoted(s, j)
+        elif c in OPEN:
+            stack.append(OPEN[c])
+        elif c in ')]}':
+            if stack.pop() != c:
+                return -1
+            if not stack:
+                return j
+        j += 1
+    return -1
+def split_top(s):
+    """Split on commas that are not inside brackets or strings."""
+    parts, depth, cur, j = [], 0, 0, 0
+    while j < len(s):
+        c = s[j]
+        if c in '\'"`':
+            j = skip_quoted(s, j)
+        elif c in OPEN:
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(s[cur:j]); cur = j + 1
+        j += 1
+    parts.append(s[cur:])
+    return [p.strip() for p in parts if p.strip()]
+def top_colon(s):
+    j = 0
+    while j < len(s):
+        c = s[j]
+        if c in '\'"`':
+            j = skip_quoted(s, j)
+        elif c in OPEN:
+            k = close_of(s, j)
+            if k < 0:
+                return -1
+            j = k
+        elif c == ':':
+            return j
+        j += 1
+    return -1
+LIT_WORDS = {'new', 'Date', 'now', 'toISOString', 'toString', 'getTime', 'toLocaleString',
+             'toLocaleDateString', 'toLocaleTimeString', 'true', 'false', 'null', 'undefined'}
+STR = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"|`(?:\\.|[^`\\$])*`")
+NUMLIT = re.compile(r'(?<![\w$])\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?')
+def is_literal(v):
+    """True when v is data typed in by hand: no variable, call or spread in it."""
+    v = re.sub(r'\s+as\s+const\s*$', '', v.strip())
+    if not v or v.startswith('...'):
+        return False
+    if v[0] in '[{' and close_of(v, 0) == len(v) - 1:
+        parts = split_top(v[1:-1])
+        if v[0] == '[':
+            return all(is_literal(p) for p in parts)
+        for p in parts:
+            k = top_colon(p)
+            if p.startswith('...') or k < 0 or not is_literal(p[k + 1:]):
+                return False
+        return True
+    t = NUMLIT.sub('0', STR.sub('0', v))
+    if re.search(r'[`\[\]{}]|=>', t):
+        return False
+    return all(w in LIT_WORDS for w in re.findall(r'[A-Za-z_$][\w$]*', t))
+def literal_rows(arr):
+    """arr is an array literal's text; True when it holds object rows, all literal."""
+    parts = split_top(arr[1:-1])
+    return any(p.startswith('{') for p in parts) and all(is_literal(p) for p in parts)
+line_of = lambda s, i: s.count('\n', 0, i) + 1
+SETTER = re.compile(r'\b(set[A-Z]\w*|useState)\s*(?=[(<])')
+CATCH = re.compile(r'\bcatch\s*(?:\([^()]*\))?\s*\{|\.catch\s*\(')
+ARRAY_CTX = re.compile(r'(?:[=(,:?\[|&]|\breturn)\s*$')
+DEMO_NAME = re.compile(r'(?:\b(?:const|let|var)\s+|\bthis\.)([A-Za-z_$][\w$]*)\s*(?::[^=;]*?)?=(?![=>])\s*([\[{])')
+BARE = re.compile(r'^_*(?:sample|mock|demo|fake|dummy|placeholder)s?$|^_*placeholder(?=[A-Z_\d])|^_*PLACEHOLDER_', re.I)
+STAT_KEY = re.compile(r'^["\']?(?:uses|usage|rating|ratings|stars|forks|downloads|installs|views|users|builds|runs|count|total|score|percent|tokens|cost|spend|revenue|reviews|likes|confidence|coverage)["\']?$', re.I)
+NUMVAL = re.compile(r'^-?\d[\d_]*(?:\.\d+)?$')
+ZERO_FMT = re.compile(r'(?:\|\||\?\?)\s*0\s*\)\s*\.\s*(?:toLocaleString|toFixed)\s*\('
+                      r'|\.\s*(?:toLocaleString|toFixed)\s*\([^()]*\)\s*\|\|\s*0(?![\w.])'
+                      r'|\b_?format\w*\s*\([^(),]*(?:\|\||\?\?)\s*0\s*[,)]')
+def obj_pairs(o):
+    out = []
+    for p in split_top(o[1:-1]):
+        k = top_colon(p)
+        if k < 0:
+            return None
+        out.append((p[:k].strip(), p[k + 1:].strip()))
+    return out
+def whole_file_findings(s):
+    """(line, message) for rules 6-9; nested arrays inside a hit are not re-reported."""
+    out, spans = [], []
+    def add_rows(i, msg):
+        j = close_of(s, i)
+        if j < 0 or any(a <= i <= b for a, b in spans):
+            return
+        if literal_rows(s[i:j + 1]):
+            spans.append((i, j)); out.append((line_of(s, i), msg))
+    for m in SETTER.finditer(s):
+        i = m.end()
+        if s[i] == '<':
+            depth = 0
+            while i < len(s):
+                depth += {'<': 1, '>': -1}.get(s[i], 0) if s[i - 1:i + 1] != '=>' else 0
+                i += 1
+                if depth == 0:
+                    break
+        i = len(s) - len(s[i:].lstrip())
+        if i >= len(s) or s[i] != '(':
+            continue
+        arg = s[i + 1:]
+        lazy = re.match(r'\s*\(\s*\)\s*=>\s*', arg)
+        k = i + 1 + (lazy.end() if lazy else len(arg) - len(arg.lstrip()))
+        if k < len(s) and s[k] == '[':
+            add_rows(k, f'literal sample rows passed to {m.group(1)}()')
+    for m in CATCH.finditer(s):
+        b = m.end() - 1
+        e = close_of(s, b)
+        if e < 0:
+            continue
+        for k in range(b + 1, e):
+            if s[k] == '[' and ARRAY_CTX.search(s[max(b, k - 40):k]):
+                add_rows(k, 'literal sample rows assigned in a catch block')
+    for m in DEMO_NAME.finditer(s):
+        name = m.group(1)
+        if FLAG.search(name) or not (BARE.search(name) or DEMO.search(name)):
+            continue
+        out.append((line_of(s, m.start(1)), f"'{name}' binds sample/mock/demo/fake/placeholder literal data"))
+    for m in re.finditer(r'(?:\|\||\?\?)\s*\{', s):
+        i = m.end() - 1
+        j = close_of(s, i)
+        pairs = obj_pairs(s[i:j + 1]) if j > 0 else None
+        if pairs and any(STAT_KEY.match(k) and NUMVAL.match(v) for k, v in pairs):
+            out.append((line_of(s, i), 'invented stats: constant metric fallback'))
+    for m in re.finditer(r'=\s*\{', s):
+        i = m.end() - 1
+        j = close_of(s, i)
+        pairs = obj_pairs(s[i:j + 1]) if j > 0 else None
+        if not pairs or len(pairs) < 2:
+            continue
+        rows = [obj_pairs(v) if v.startswith('{') and close_of(v, 0) == len(v) - 1 else None for _, v in pairs]
+        if all(r and all(STAT_KEY.match(k) and NUMVAL.match(v) for k, v in r) for r in rows):
+            out.append((line_of(s, i), 'invented stats lookup table'))
+    for m in ZERO_FMT.finditer(s):
+        out.append((line_of(s, m.start()), 'unmeasured value rendered as zero (zero fallback fed to a formatter)'))
+    return sorted(set(out))
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
 findings = []
@@ -621,22 +819,33 @@ for f in sorted(reach):
         findings.append(f'{rel(f)}:{ln} sample-data fallback reachable via {" > ".join(reach[f])}')
     for ln in lines_matching(src[f], PROP):
         findings.append(f'{rel(f)}:{ln} JSX prop fed sample data, reachable via {" > ".join(reach[f])}')
-    for ln in lines_matching(src[f], HARDPROP):
+    # Whole file, so a ternary split across lines is still one prop (BACKLOG 107).
+    for ln in sorted({line_of(src[f], m.start()) for m in HARDPROP.finditer(src[f])}):
         findings.append(f'{rel(f)}:{ln} hardcoded number presented as a measured metric, reachable via {" > ".join(reach[f])}')
 for f in files:
     for ln in lines_matching(src[f], METRIC):
         findings.append(f'{rel(f)}:{ln} Math.random() feeds a rendered metric')
     for ln in demo_lines(src[f]):
         findings.append(f'{rel(f)}:{ln} demo/sample data assigned or used as state')
+    for ln, msg in whole_file_findings(src[f]):
+        findings.append(f'{rel(f)}:{ln} {msg}')
 for d in dash_dirs:
-    for f in moatlib.walk(d, ('.js',)):
-        s = moatlib.strip_comments(moatlib.read(f))
+    # A file root (build-standalone.js) is named from the repo root like a dir root.
+    base = d.rstrip('/') if os.path.isdir(d) else os.path.dirname(d)
+    drel = lambda f: os.path.relpath(f, os.path.dirname(os.path.dirname(base)))
+    for f in moatlib.walk(d, ('.js', '.html')):
+        # The built bundle is never evidence about source.
+        if f.endswith(os.sep + 'static' + os.sep + 'index.html') or (os.sep + 'assets' + os.sep) in f:
+            continue
+        s = moatlib.strip_comments(moatlib.read(f), html=f.endswith('.html'))
         for ln in lines_matching(s, FALLBACK):
-            findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} sample-data fallback in a shipped web component')
+            findings.append(f'{drel(f)}:{ln} sample-data fallback in a shipped web component')
         for ln in lines_matching(s, METRIC):
-            findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} Math.random() feeds a rendered metric')
+            findings.append(f'{drel(f)}:{ln} Math.random() feeds a rendered metric')
         for ln in demo_lines(s):
-            findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} demo/sample data assigned in a shipped web component')
+            findings.append(f'{drel(f)}:{ln} demo/sample data assigned in a shipped web component')
+        for ln, msg in whole_file_findings(s):
+            findings.append(f'{drel(f)}:{ln} {msg} in a shipped web component')
 print(f'SCANNED pages={len(pages)} reachable={len(reach)} files={len(files)}')
 for f in sorted(reach):
     print('REACH ' + rel(f))
@@ -645,9 +854,200 @@ for x in findings:
 sys.exit(1 if findings else 0)
 PY
 
+# Rules 6-9 control. The positives are the shipped fabrications VERBATIM (the
+# Teams page and RBAC panel at 61af5915, the TEMPLATE_STATS table and fallback
+# deleted in f63fae61, the zero-into-formatter lines from the learning and
+# memory dashboards), each asserted at its exact line with an exact per-file
+# finding count; the look-alikes must stay clean. Prints the reason and
+# returns 1 on failure.
+sample_rules_6_9_control() {
+    local d="$1" out rc f want got
+    mkdir -p "$d/src/pages" "$d/src/components" "$d/dash/components"
+    printf '%s\n' 'export function P() { return <div />; }' > "$d/src/pages/P.tsx"
+    # web-app/src/pages/TeamsPage.tsx:41-81 at 61af5915.
+    cat > "$d/src/components/TeamsVerbatim.tsx" <<'TSX'
+  // Load teams
+  useEffect(() => {
+    setLoading(true);
+    api.getTeams()
+      .then(data => {
+        setTeams(data);
+        if (data.length > 0 && !selectedTeam) {
+          setSelectedTeam(data[0]);
+        }
+      })
+      .catch(() => {
+        // Use sample data when endpoint is not available
+        const sample: TeamInfo[] = [
+          {
+            id: 'team-1',
+            name: 'Engineering',
+            created_at: new Date().toISOString(),
+            members: [
+              { id: 'm1', email: 'admin@example.com', name: 'Team Admin', role: 'admin' as const, joined_at: new Date().toISOString() },
+              { id: 'm2', email: 'dev@example.com', name: 'Developer', role: 'editor' as const, joined_at: new Date().toISOString() },
+              { id: 'm3', email: 'viewer@example.com', name: 'Viewer', role: 'viewer' as const, joined_at: new Date().toISOString() },
+            ],
+          },
+        ];
+        setTeams(sample);
+        if (!selectedTeam) setSelectedTeam(sample[0]);
+      })
+      .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load activities
+  useEffect(() => {
+    if (!selectedTeam) return;
+    setActivities([
+      { id: 'a1', action: 'Created project "my-app"', user: 'Developer', timestamp: '2 hours ago' },
+      { id: 'a2', action: 'Deployed to production', user: 'Team Admin', timestamp: '5 hours ago' },
+      { id: 'a3', action: 'Invited viewer@example.com', user: 'Team Admin', timestamp: '1 day ago' },
+      { id: 'a4', action: 'Updated RBAC settings', user: 'Team Admin', timestamp: '2 days ago' },
+    ]);
+  }, [selectedTeam]);
+TSX
+    # web-app/src/components/RBACPanel.tsx:302-317 at 61af5915.
+    cat > "$d/src/components/RbacVerbatim.tsx" <<'TSX'
+  // Load audit log
+  useEffect(() => {
+    if (activeSection !== 'audit') return;
+    setAuditLoading(true);
+    api.getAuditLog()
+      .then(entries => setAuditEntries(entries))
+      .catch(() => {
+        // Use sample data when endpoint is not yet available
+        setAuditEntries([
+          { id: '1', action: 'member.invited', user: 'admin@example.com', target: 'dev@example.com', timestamp: new Date().toISOString(), details: 'Invited as editor' },
+          { id: '2', action: 'role.created', user: 'admin@example.com', target: 'Deployer', timestamp: new Date(Date.now() - 3600000).toISOString() },
+          { id: '3', action: 'project.created', user: 'editor@example.com', target: 'my-app', timestamp: new Date(Date.now() - 7200000).toISOString() },
+        ]);
+      })
+      .finally(() => setAuditLoading(false));
+  }, [activeSection, teamId]);
+TSX
+    # The TEMPLATE_STATS table and its fallback (TemplatesPage.tsx:77-98 and
+    # :407 before f63fae61), then the same lookup with a constant fallback.
+    cat > "$d/src/components/TemplateStats.tsx" <<'TSX'
+const TEMPLATE_STATS: Record<string, { uses: number; rating: number }> = {
+  'saas-starter.md': { uses: 2847, rating: 4.9 },
+  'rest-api-auth.md': { uses: 1923, rating: 4.8 },
+  'discord-bot.md': { uses: 1654, rating: 4.7 },
+  'full-stack-demo.md': { uses: 1432, rating: 4.8 },
+  'data-pipeline.md': { uses: 1198, rating: 4.6 },
+  'cli-tool.md': { uses: 987, rating: 4.7 },
+  'e-commerce.md': { uses: 2156, rating: 4.8 },
+  'blog-platform.md': { uses: 1345, rating: 4.5 },
+  'rest-api.md': { uses: 1567, rating: 4.6 },
+  'slack-bot.md': { uses: 876, rating: 4.4 },
+  'dashboard.md': { uses: 1789, rating: 4.7 },
+  'web-scraper.md': { uses: 654, rating: 4.3 },
+  'chrome-extension.md': { uses: 543, rating: 4.5 },
+  'microservice.md': { uses: 1123, rating: 4.6 },
+  'mobile-app.md': { uses: 932, rating: 4.4 },
+  'game.md': { uses: 765, rating: 4.5 },
+  'npm-library.md': { uses: 445, rating: 4.3 },
+  'static-landing-page.md': { uses: 1876, rating: 4.6 },
+  'simple-todo-app.md': { uses: 2345, rating: 4.7 },
+  'ai-chatbot.md': { uses: 1234, rating: 4.8 },
+};
+            const stats = TEMPLATE_STATS[t.filename] || { uses: Math.floor(Math.random() * 800) + 100, rating: (Math.random() * 0.7 + 4.0).toFixed(1) };
+            const stats = TEMPLATE_STATS[t.filename] || { uses: 500, rating: 4.5 };
+TSX
+    # Rule 9, one line each: web-app MetricsPanel.tsx:43 and the learning and
+    # memory dashboards' token/confidence lines, plus a toFixed form.
+    cat > "$d/src/components/ZeroFmt.tsx" <<'TSX'
+export function Z({ metrics, e }) {
+              {(metrics.tokens_used ?? 0).toLocaleString()}
+                <span class="econ-value">${this._tokenEconomics.discoveryTokens?.toLocaleString() || 0}</span>
+              ${this._formatPercent(this._metrics.avgConfidence || 0)}
+  const d = (e.rate || 0).toFixed(1);
+  return null; }
+TSX
+    # Rule 7: a binding NAMED sample/mock/demo/fake/placeholder holding literal data.
+    cat > "$d/src/components/Named.tsx" <<'TSX'
+export function N() {
+  const sample = [{ id: 1, name: 'Engineering' }];
+  const mockRows = { a: 1 };
+  this._demoData = [];
+  const PLACEHOLDER_USERS = [{ email: 'viewer@example.com' }];
+  let fakeStats: Stats = { uses: 1 };
+  return null; }
+TSX
+    # Honest look-alikes: a row reading a variable, an append, idle initial
+    # state, an empty reset, a config fallback, a string placeholder, an error
+    # path that renders no rows, a mapped response, a price table carrying a
+    # label, a null-aware formatter, and a user message built from input.
+    cat > "$d/src/components/HonestRows.tsx" <<'TSX'
+export function H({ stars, x, opts, data }) {
+  setStats([{ label: 'GitHub Stars', value: stars }]);
+  setItems(prev => [...prev, x]);
+  const [deploy] = useState({ vercel: { status: 'idle' }, netlify: { status: 'idle' } });
+  setRows([]);
+  const o = opts || { retries: 3, timeout: 30 };
+  const placeholder = 'Search teams';
+  try { load(); } catch { setRows([]); setError('Could not load teams'); }
+  api.get().catch(() => { setError('failed'); setRows(data.map((r) => ({ id: r.id }))); });
+  const RATES = { sonnet: { input: 3, output: 15, label: 'Sonnet' }, haiku: { input: 1, output: 5, label: 'Haiku' } };
+  const t = x == null ? '--' : x.toLocaleString();
+  const u = (x ?? null);
+  setMessages(prev => [...prev, { role: 'user', content: x, at: new Date().toISOString() }]);
+  return null; }
+TSX
+    # A shipped web component that fills its table with literal rows when the
+    # read fails; flagged at the assignment (line 6).
+    cat > "$d/dash/components/loki-audit-fallback.js" <<'JS'
+export class LokiAuditFallback extends LokiElement {
+  async _load() {
+    try {
+      this._entries = await this._api._get('/api/audit');
+    } catch (err) {
+      this._entries = [
+        { user: 'admin@example.com', action: 'role.created', timestamp: new Date().toISOString() },
+      ];
+    }
+  }
+}
+JS
+    rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
+    [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
+    while IFS='|' read -r f want; do
+        grep -q "^FINDING [a-z/]*$f $want" <<<"$out" \
+            || { echo "missed $f $want: $(grep "^FINDING.*${f%%:*}" <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    done <<'EOF'
+TeamsVerbatim.tsx:13|'sample' binds sample/mock/demo/fake/placeholder literal data
+TeamsVerbatim.tsx:13|literal sample rows assigned in a catch block
+TeamsVerbatim.tsx:35|literal sample rows passed to setActivities()
+RbacVerbatim.tsx:9|literal sample rows passed to setAuditEntries()
+TemplateStats.tsx:1|invented stats lookup table
+TemplateStats.tsx:23|Math.random() feeds a rendered metric
+TemplateStats.tsx:24|invented stats: constant metric fallback
+ZeroFmt.tsx:2|unmeasured value rendered as zero
+ZeroFmt.tsx:3|unmeasured value rendered as zero
+ZeroFmt.tsx:4|unmeasured value rendered as zero
+ZeroFmt.tsx:5|unmeasured value rendered as zero
+Named.tsx:2|'sample' binds
+Named.tsx:3|'mockRows' binds
+Named.tsx:4|'_demoData' binds
+Named.tsx:5|'PLACEHOLDER_USERS' binds
+Named.tsx:6|'fakeStats' binds
+loki-audit-fallback.js:6|literal sample rows assigned in a catch block
+EOF
+    # Exact per-file counts: no extra finding anywhere, none on a look-alike.
+    for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
+        loki-audit-fallback.js:1 HonestRows.tsx:0 P.tsx:0; do
+        f="${want%%:*}"
+        got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
+        [ "$got" = "${want##*:}" ] \
+            || { echo "$f has $got finding(s), want ${want##*:}: $(grep "^FINDING.*$f:" <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    done
+    return 0
+}
+
 case_sample_panels() {
     command -v python3 >/dev/null 2>&1 || { echo "FAIL|prerequisite missing: python3"; return 0; }
-    local ctl="$MOAT_TMP/sample-ctl" rc out
+    local ctl="$MOAT_TMP/sample-ctl" rc out why
     # Positive control: a page reaching a sample-fallback panel and a random
     # metric must both be flagged; confetti randomness must not be.
     mkdir -p "$ctl/src/pages" "$ctl/src/components" "$ctl/fixed/src/pages" "$ctl/fixed/src/components" "$ctl/dash/components"
@@ -673,9 +1073,11 @@ case_sample_panels() {
         '  try { phases = load(); } catch { phases = this._getDemoData(); }' \
         '  const t = demoTotals;' \
         '  return <T rows={mockRows} />; }' > "$ctl/src/components/Forms.tsx"
+    # `sample` here is a parameter (a measured sample), never a literal: a
+    # binding NAMED sample that holds literal data is rule 7's positive below.
     printf '%s\n' 'export function Honest() {' \
         '  const on = isDemoMode(); const [n] = useState(0); const m = InputMockup();' \
-        "  const id = generateId(); const s = sample; const k = 'mock_integrity';" \
+        "  const id = generateId(); const pick = (sample) => { const s = sample; return s; }; const k = 'mock_integrity';" \
         '  const [x] = useState(() => load()); const y = this._showMockBanner;' \
         '  return <T rows={rows} />; }' > "$ctl/src/components/Honest.tsx"
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/src" 2>&1)" || rc=$?
@@ -690,6 +1092,7 @@ case_sample_panels() {
         grep -q "components/Forms.tsx:$n demo/sample data assigned" <<<"$out" \
             || { echo "FAIL|positive control: rule 5 missed Forms.tsx line $n: $(sed -n "${n}p" "$ctl/src/components/Forms.tsx")"; return 0; }
     done
+    why="$(sample_rules_6_9_control "$ctl/r69")" || { echo "FAIL|positive control: $why"; return 0; }
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/fixed/src" 2>&1)" || rc=$?
     [ "$rc" = 0 ] || { echo "FAIL|control: a panel without a sample fallback was flagged: $(grep -v '^REACH ' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0; }
     # The cost waterfall's old failure path, verbatim: on a failed read it drew
@@ -727,8 +1130,11 @@ JS
         || { echo "FAIL|positive control: the old waterfall catch-block demo fallback was not flagged exactly once (rc=$rc): $(grep '^FINDING' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0; }
 
     rc=0
+    # The shell of the shipped dashboard (its inline script lives in
+    # build-standalone.js) and the standalone cost/proofs/trust pages ship too.
     python3 "$MOAT_TMP/sample-panels.py" "$REPO_ROOT/web-app/src" \
-        "$REPO_ROOT/dashboard-ui/components" "$REPO_ROOT/dashboard-ui/core" > "$MOAT_TMP/sample.txt" 2>&1 || rc=$?
+        "$REPO_ROOT/dashboard-ui/components" "$REPO_ROOT/dashboard-ui/core" \
+        "$REPO_ROOT/dashboard-ui/scripts/build-standalone.js" "$REPO_ROOT/dashboard/static" > "$MOAT_TMP/sample.txt" 2>&1 || rc=$?
     grep -v '^REACH ' "$MOAT_TMP/sample.txt" | sed 's/^/  /' >&2
     # The workspace is where rule 4's defect lived; a scan that never reached it
     # would pass without looking.
@@ -801,6 +1207,14 @@ PY
 #                  second fleet project         null, fleet total 2.5 partial
 # measured, measured-zero and mixed are the controls: a fix that nulls every
 # zero, or that drops the measured runs from a mixed total, is as wrong.
+# mixed also carries a second iteration that recorded nothing, so the current
+# run total, the budget spend and /api/budget must each say partial there and
+# nowhere else, and that iteration's tokens and model must read null.
+# The same app is asked for four non-cost readings that used to be seeded as
+# 0 / 0.0% / eight "pending" gate rows: /api/context, /api/memory/economics,
+# /api/learning/metrics avgConfidence and /api/council/gate gates. They are
+# null (or []) in every scenario except measured, which writes real readings
+# and must read them back.
 cat > "$MOAT_TMP/budget-null.py" <<'PY'
 import json, numbers, os, sys
 repo, loki, scenario = sys.argv[1:4]
@@ -821,6 +1235,27 @@ def write(path, obj):
 rec = dict({'iteration': 1, 'model': 'sonnet', 'phase': 'build'}, **extra)
 write(os.path.join(loki, 'metrics', 'efficiency', 'iteration-1.json'), rec)
 write(os.path.join(loki, 'metrics', 'budget.json'), {'limit': 10})
+if scenario == 'mixed':
+    # A second iteration that recorded nothing (no tokens, cost or model): the
+    # run's total and the budget spend become lower bounds.
+    write(os.path.join(loki, 'metrics', 'efficiency', 'iteration-2.json'), {'iteration': 2, 'phase': 'build'})
+if scenario == 'measured':
+    # Readings for the non-cost unknowns, so their null assertions below have a
+    # control that reads real numbers back through the same endpoints.
+    write(os.path.join(loki, 'context', 'tracking.json'), {
+        'session_id': 's1', 'updated_at': '2026-09-01T00:00:00Z',
+        'current': {'input_tokens': 1000, 'output_tokens': 500, 'cache_read_tokens': 0,
+                    'cache_creation_tokens': 0, 'total_tokens': 1500, 'context_window_pct': 42.5,
+                    'estimated_cost_usd': 0.12},
+        'compactions': [], 'per_iteration': [],
+        'totals': {'total_input': 1000, 'total_output': 500, 'total_cost_usd': 0.12,
+                   'compaction_count': 0, 'iterations_tracked': 1}})
+    write(os.path.join(loki, 'memory', 'token_economics.json'), {
+        'session_id': 's1', 'metrics': {'discovery_tokens': 1200, 'read_tokens': 800,
+                                        'cache_hits': 7, 'cache_misses': 3}, 'savings_percent': 62.5})
+    write(os.path.join(loki, 'learning', 'signals', 's1.json'), {'id': 's1', 'type': 'success', 'confidence': 0.8})
+    write(os.path.join(loki, 'council', 'gate-block.json'),
+          {'blocked': False, 'gates': [{'name': 'Test Suite', 'status': 'pass'}]})
 # (proof run costs, want project_total_usd, want partial, fleet: want per-run
 # costs sorted with None first, want fleet total, want fleet partial)
 NULL = {'usd': None, 'available': False}
@@ -846,7 +1281,8 @@ if scenario == 'mixed':
     registry.register_project(other, name='moat-p7-unmeasured')
 client = TestClient(server.app, raise_server_exceptions=False)
 got = {}
-for path in ('/api/cost', '/api/budget', '/api/cost/timeline', '/api/fleet/runs', '/api/fleet/summary'):
+for path in ('/api/cost', '/api/budget', '/api/cost/timeline', '/api/fleet/runs', '/api/fleet/summary',
+             '/api/context', '/api/memory/economics', '/api/learning/metrics', '/api/council/gate'):
     r = client.get(path)
     if r.status_code != 200:
         print(f'FATAL GET {path} -> HTTP {r.status_code}')
@@ -919,7 +1355,109 @@ fleet = sorted((r.get('cost_usd', MISSING) for r in runs if isinstance(r, dict))
                key=lambda v: (v is not None, v if isnum(v) else 0))
 if len(fleet) != len(want_runs) or not all(same(v, w) for v, w in zip(fleet, want_runs)):
     bad.append(f'/api/fleet/runs cost_usd = {fleet!r}, want {want_runs!r}')
-print(f'CHECKED {len(FIELDS) + len(TOTALS) + 2} fields ({scenario})')
+# Partial flags: some iterations recorded a cost and some did not (mixed only).
+# A sum over them is a lower bound and must say so; a fully measured, a
+# measured-zero and an unmeasured run are never partial.
+want_part = scenario == 'mixed'
+PARTS = [
+    ('/api/cost/timeline current_run.partial', dig(got['/api/cost/timeline'], ['current_run', 'partial'])),
+    ('/api/cost/timeline budget.partial', dig(got['/api/cost/timeline'], ['budget', 'partial'])),
+    ('/api/budget partial', dig(got['/api/budget'], ['partial'])),
+]
+for label, v in PARTS:
+    if v is MISSING:
+        bad.append(f'{label} missing')
+    elif v is not want_part:
+        bad.append(f'{label} = {v!r}, want {want_part!r}')
+# An iteration that recorded nothing has null tokens and no model, not 0 and
+# not the pricing default "sonnet"; a measured iteration keeps its numbers.
+its = dig(got['/api/cost/timeline'], ['current_run', 'iterations'])
+its = its if isinstance(its, list) else []
+blank = [it for it in its if isinstance(it, dict) and it.get('cost_usd') is None]
+read = [it for it in its if isinstance(it, dict) and it.get('cost_usd') is not None]
+for it in blank:
+    for k in ('input_tokens', 'output_tokens'):
+        if it.get(k) is not None:
+            bad.append(f"/api/cost/timeline unmeasured iteration {it.get('iteration')} {k} = {it.get(k)!r}, want null")
+    if it.get('iteration') == 2 and it.get('model') is not None:
+        bad.append(f"/api/cost/timeline iteration 2 model = {it.get('model')!r}, want null (none recorded)")
+if kind == 'measured' and not all(isnum(it.get('input_tokens')) and it['input_tokens'] > 0 for it in read):
+    bad.append(f'/api/cost/timeline measured iteration tokens = {[it.get("input_tokens") for it in read]!r}, want positive')
+if (scenario == 'mixed') != bool(blank) and kind != 'unmeasured':
+    bad.append(f'/api/cost/timeline has {len(blank)} unmeasured iteration(s) in {scenario}')
+# Non-cost unknowns on the same app: the context tracker, token economics,
+# learning confidence and per-gate results. Only 'measured' wrote readings.
+real = scenario == 'measured'
+UNKNOWNS = [
+    ('/api/context current.context_window_pct', ['current', 'context_window_pct'], 42.5),
+    ('/api/context current.total_tokens', ['current', 'total_tokens'], 1500),
+    ('/api/context current.estimated_cost_usd', ['current', 'estimated_cost_usd'], 0.12),
+    ('/api/context totals.iterations_tracked', ['totals', 'iterations_tracked'], 1),
+    ('/api/memory/economics total_tokens', ['total_tokens'], 2000),
+    ('/api/memory/economics hit_rate', ['hit_rate'], 0.7),
+    ('/api/memory/economics savings_percent', ['savings_percent'], 62.5),
+    ('/api/learning/metrics avgConfidence', ['avgConfidence'], 0.8),
+]
+for label, keys, want in UNKNOWNS:
+    v = dig(got[label.split(' ')[0]], keys)
+    if v is MISSING:
+        bad.append(f'{label} missing')
+    elif not same(v, want if real else None):
+        bad.append(f'{label} = {v!r}, want {want if real else "null"}')
+gates = dig(got['/api/council/gate'], ['gates'])
+if not isinstance(gates, list) or len(gates) != (1 if real else 0):
+    bad.append(f'/api/council/gate gates = {gates!r}, want {"the one recorded gate" if real else "[] (no constant pending rows)"}')
+print(f'CHECKED {len(FIELDS) + len(TOTALS) + len(PARTS) + len(UNKNOWNS) + 4} fields ({scenario})')
+for b in bad:
+    print('BAD ' + b)
+sys.exit(1 if bad else 0)
+PY
+
+# WEB-APP LEG. The web-app's own status readers (GET /api/session/status, which
+# the workspace and home cost/iteration tiles read, and /api/session/memory)
+# seeded cost 0.0, iteration 0, complexity "standard", a 10-iteration cap and
+# running_agents 0 before anything was recorded. Separate process: the web-app
+# module is also named `server`. measured writes the state files the CLI writes
+# and must read them back; unmeasured has none and must read null.
+cat > "$MOAT_TMP/webapp-status.py" <<'PY'
+import json, os, sys
+repo, home, scenario = sys.argv[1:4]
+os.environ.pop('LOKI_MAX_ITERATIONS', None)
+sys.path.insert(0, os.path.join(repo, 'web-app'))
+import server
+from fastapi.testclient import TestClient
+server.session.project_dir = home
+loki = os.path.join(home, '.loki')
+os.makedirs(loki, exist_ok=True)
+if scenario == 'measured':
+    with open(os.path.join(loki, 'dashboard-state.json'), 'w') as fh:
+        json.dump({'phase': 'act', 'iteration': 3, 'complexity': 'simple',
+                   'tasks': {'pending': 2, 'inProgress': 0},
+                   'tokens': {'input': 1000, 'output': 500, 'cost_usd': 2.5}}, fh)
+    with open(os.path.join(loki, 'autonomy-state.json'), 'w') as fh:
+        json.dump({'maxIterations': 8}, fh)
+client = TestClient(server.app, raise_server_exceptions=False)
+got = {}
+for path in ('/api/session/status', '/api/session/memory'):
+    r = client.get(path)
+    if r.status_code != 200:
+        print(f'FATAL GET {path} -> HTTP {r.status_code}')
+        sys.exit(2)
+    got[path] = r.json()
+st, mem = got['/api/session/status'], got['/api/session/memory']
+real = {'iteration': 3, 'complexity': 'simple', 'pending_tasks': 2, 'max_iterations': 8, 'cost': 2.5}
+bad = []
+for k, want in real.items():
+    v = st.get(k, 'MISSING')
+    exp = want if scenario == 'measured' else None
+    if v != exp or isinstance(v, bool):
+        bad.append(f'/api/session/status {k} = {v!r}, want {exp!r}')
+# Tracked by nothing in this server: unknown in every scenario.
+if st.get('running_agents', 'MISSING') is not None:
+    bad.append(f"/api/session/status running_agents = {st.get('running_agents', 'MISSING')!r}, want null")
+if mem.get('total_tokens', 'MISSING') is not None:
+    bad.append(f"/api/session/memory total_tokens = {mem.get('total_tokens', 'MISSING')!r}, want null")
+print(f'CHECKED {len(real) + 2} web-app fields ({scenario})')
 for b in bad:
     print('BAD ' + b)
 sys.exit(1 if bad else 0)
@@ -942,6 +1480,17 @@ cost_server_leg() {
             || { echo "server leg ($sc) did not run (rc=$rc): $(tail -c 200 "$d/err" | tr '\n' ' ') $(tr '\n' ' ' <<<"$out")"; return 1; }
         [ "$rc" = 0 ] \
             || { echo "server leg ($sc): $(grep '^BAD ' <<<"$out" | head -4 | sed 's/^BAD //' | tr '\n' ';')"; return 1; }
+    done
+    for sc in measured unmeasured; do
+        d="$MOAT_TMP/webapp-$sc"
+        mkdir -p "$d/proj"
+        rc=0
+        out="$(cd "$d" && py_server "$MOAT_TMP/webapp-status.py" "$REPO_ROOT" "$d/proj" "$sc" 2> "$d/err")" || rc=$?
+        printf '%s\n' "$out" | sed "s/^/  webapp[$sc] /" >&2
+        grep -q '^CHECKED ' <<<"$out" \
+            || { echo "web-app leg ($sc) did not run (rc=$rc): $(tail -c 200 "$d/err" | tr '\n' ' ') $(tr '\n' ' ' <<<"$out")"; return 1; }
+        [ "$rc" = 0 ] \
+            || { echo "web-app leg ($sc): $(grep '^BAD ' <<<"$out" | head -4 | sed 's/^BAD //' | tr '\n' ';')"; return 1; }
     done
     return 0
 }
@@ -1015,7 +1564,7 @@ EOF
     sed "s#$REPO_ROOT/##; s/^/  /" "$MOAT_TMP/cost.txt" >&2
     case "$rc" in
         0) if [ -n "$srv_fail" ]; then echo "FAIL|$srv_fail"
-           else echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass; /api/cost, /api/budget, /api/cost/timeline (budget and project total) and /api/fleet/runs + /api/fleet/summary send null for unmeasured spend, numbers for measured and measured-zero, a partial total for mixed"; fi ;;
+           else echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass; /api/cost, /api/budget, /api/cost/timeline (budget and project total) and /api/fleet/runs + /api/fleet/summary send null for unmeasured spend, numbers for measured and measured-zero, a partial total and partial current run/budget for mixed; context, token economics, learning confidence, gate rows and web-app session status are null or empty until measured"; fi ;;
         1) echo "FAIL|$(grep -c '^HIT' "$MOAT_TMP/cost.txt") unmeasured-cost-as-zero site(s): $(grep '^HIT' "$MOAT_TMP/cost.txt" | sed "s#^HIT $REPO_ROOT/##; s/: .*//" | tr '\n' ' ')${srv_fail:+; $srv_fail}" ;;
         *) echo "FAIL|scanner refused (rc=$rc)${srv_fail:+; $srv_fail}" ;;
     esac

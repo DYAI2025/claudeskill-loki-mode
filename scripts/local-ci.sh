@@ -300,6 +300,14 @@ declare -a _FAST_KEEP=(
   # running build. Neither was reachable by a type check or a stubbed unit
   # test. Measured 25s (boots a server and a browser).
   "webapp receipt panel renders honestly"
+  # Same reasoning again, for the web-app Admin console, Templates page and
+  # Teams page (BACKLOG 97). Each shipped invented rows the moat scanner could
+  # not see until the scanner was widened, and three council rounds in a row
+  # found one more; only a browser against a seeded server proves the real
+  # endpoints reach the pixel and an aborted request renders an error instead
+  # of sample rows. Pinned by hand: a .mjs driven by a runner script is
+  # invisible to the trust-core scan. Boots a server and a browser.
+  "webapp admin console renders honestly"
   "tests/test-verify.sh"
   "tests/test-verify-scope-record.sh"
   "tests/test-verify-setup-recipe.sh"
@@ -440,6 +448,11 @@ declare -a _FAST_KEEP=(
   # moat's P7 static scan cannot see a rendering regression; this can.
   # Measured 0.1s (node --test, no install, no network).
   "dashboard unmeasured cost never renders as zero"
+  # Same, for every other shipped panel the P7 sweep fixed: the scanner cannot
+  # see a zero built in one statement and formatted in another (the context
+  # tracker's "0.0% Context Used"), so only rendering the real component pins
+  # it. 26 of 27 cases fail at 61af5915. Measured under 1s (node --test).
+  "dashboard panels render unmeasured as unknown"
   # CLAUDE.md cleanup mandate: sub-second, and the whole point is that it runs
   # on every invocation, not only the slow one.
   "no leftovers from this run"
@@ -1844,6 +1857,11 @@ fi
 # an unmeasured result, never a pass. Needs no npm install (relative imports).
 run_check "dashboard unmeasured cost never renders as zero (node --test)" \
   'command -v node >/dev/null 2>&1 || { echo "node not installed: the suite did not run (unmeasured, not clean)"; exit 1; }; node --test dashboard-ui/tests/loki-unmeasured-cost-never-zero.node.test.mjs 2>&1 | tail -12'
+# The rest of the shipped panels (context tracker, learning, memory, analytics,
+# overview, fleet, council, gates, notifications ...): unmeasured renders as
+# unknown, a failed read as an error, a measured zero as 0.
+run_check "dashboard panels render unmeasured as unknown (node --test)" \
+  'command -v node >/dev/null 2>&1 || { echo "node not installed: the suite did not run (unmeasured, not clean)"; exit 1; }; node --test dashboard-ui/tests/loki-unmeasured-panels-honesty.node.test.mjs 2>&1 | tail -12'
 
 # ---------------------------------------------------------------------------
 # 10d. Dashboard fresh-repo integrated UX harness (v7.18.0)
@@ -1866,9 +1884,12 @@ if [ -n "$_DASH_PY" ] && command -v node >/dev/null 2>&1 \
   # asserts they reach the pixel WITHOUT fabricating an unmeasured cost.
   run_check "dashboard evidence panels render honestly" 'bash scripts/run-dashboard-evidence-panels-harness.sh'
   run_check "webapp receipt panel renders honestly" 'bash scripts/run-webapp-receipt-panel.sh'
+  run_check "webapp admin console renders honestly" 'bash scripts/run-webapp-admin-honesty.sh'
 else
   skip_check "dashboard fresh-repo integrated UX harness" "needs python3.12 + dashboard-ui playwright + chromium"
   skip_check "dashboard evidence panels render honestly" "needs python3.12 + dashboard-ui playwright + chromium"
+  skip_check "webapp receipt panel renders honestly" "needs python3.12 + dashboard-ui playwright + chromium"
+  skip_check "webapp admin console renders honestly" "needs python3.12 + dashboard-ui playwright + chromium"
 fi
 
 # ---------------------------------------------------------------------------

@@ -223,8 +223,14 @@ export function MetricsPage() {
         />
         <KPICard
           label="Runs with cost"
-          value={String(timeline?.runs_count ?? 0)}
-          detail="Runs that wrote a receipt"
+          // Runs whose receipt RECORDED a cost, not every receipt: a run that
+          // wrote a receipt with an unmeasured cost is not a run with cost.
+          value={typeof timeline?.runs_count === 'number'
+            ? String(timeline.runs.filter(r => r.cost_usd != null).length)
+            : 'Not recorded'}
+          detail={typeof timeline?.runs_count === 'number'
+            ? `of ${timeline.runs_count} run${timeline.runs_count === 1 ? '' : 's'} with a receipt`
+            : undefined}
           icon={Layers}
           color={BLUE}
         />

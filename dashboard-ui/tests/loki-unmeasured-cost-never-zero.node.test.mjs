@@ -174,7 +174,7 @@ describe('dashboard/static/cost.html', () => {
   };
   const fns = new Function(
     `${pick('esc')}\n${pick('fmtUsd')}\n${pick('statusText')}\n${pick('renderBudget')}\n${pick('renderCurrentRun')}\n` +
-    `${pick('projectTotal')}\n` +
+    `${pick('projectTotal')}\n${pick('partialUsd')}\n${pick('orNotRecorded')}\n` +
     'return { renderBudget, renderCurrentRun, statusText, projectTotal };')();
   const points = (out) => {
     const m = /points="([^"]*)"/.exec(out);
@@ -204,6 +204,36 @@ describe('dashboard/static/cost.html', () => {
     assert.equal(fns.projectTotal({ project_total_usd: 2.5, project_total_partial: true }), '$2.50 (partial)');
     assert.equal(fns.projectTotal({ project_total_usd: 0, project_total_partial: false }), '$0.00');
     assert.equal(fns.projectTotal({ project_total_usd: 2.5, project_total_partial: false }), '$2.50');
+  });
+
+  it('a current run with an unmeasured iteration says partial, and its unknowns are not 0', () => {
+    // The server marks current_run.partial when some iterations recorded a
+    // cost and some did not; that iteration carries null tokens and model.
+    const out = fns.renderCurrentRun({
+      cost_recorded: true, total_usd: 2.5, partial: true,
+      iterations: [
+        { iteration: 1, model: 'sonnet', phase: 'build', input_tokens: 1000, output_tokens: 500, cost_usd: 2.5, cumulative_usd: 2.5 },
+        { iteration: 2, model: null, phase: 'build', input_tokens: null, output_tokens: null, cost_usd: null, cumulative_usd: null },
+      ],
+    });
+    assert.ok(out.includes('$2.50 (partial)'), 'a partial run total was shown as complete');
+    const row2 = out.slice(out.lastIndexOf('<tr>'));
+    assert.ok(!/>0</.test(row2), 'an unmeasured iteration showed 0 tokens');
+    assert.ok(row2.includes('not recorded'), 'an unmeasured iteration did not say not recorded');
+    const whole = fns.renderCurrentRun({
+      cost_recorded: true, total_usd: 2.5, partial: false,
+      iterations: [{ iteration: 1, model: 'sonnet', phase: 'build', input_tokens: 1000, output_tokens: 500, cost_usd: 2.5, cumulative_usd: 2.5 }],
+    });
+    assert.ok(!whole.includes('(partial)'), 'a fully measured run was marked partial');
+  });
+
+  it('a partial budget says partial, bounds remaining, and never claims within budget', () => {
+    const out = fns.renderBudget({ limit: 10, used: 2.5, remaining: 7.5, percent_used: 25, status: 'ok', warn_threshold_percent: 80, partial: true });
+    assert.ok(out.includes('$2.50 (partial)') && out.includes('25.0% (partial)'), 'partial spend shown as complete');
+    assert.ok(out.includes('at most $7.50'), 'remaining over a lower-bound spend was not marked as an upper bound');
+    assert.ok(!out.includes('Within budget.'), 'a partial spend claimed "Within budget."');
+    const whole = fns.renderBudget({ limit: 10, used: 2.5, remaining: 7.5, percent_used: 25, status: 'ok', warn_threshold_percent: 80, partial: false });
+    assert.ok(whole.includes('Within budget.') && !whole.includes('(partial)'), 'a fully measured budget lost its reading');
   });
 
   it('a budget with an unknown percent is not 0.0%', () => {

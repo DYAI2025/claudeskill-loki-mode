@@ -1457,14 +1457,16 @@ function generateStandaloneHTML(bundleCode) {
             <script>
               (function(){
                 function loadEconomics(){
-                  fetch('/api/memory/economics').then(function(r){ return r.json(); }).then(function(j){
+                  fetch('/api/memory/economics').then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function(j){
                     var hr = document.getElementById('econ-hit-rate');
                     var tt = document.getElementById('econ-total-tokens');
                     var sv = document.getElementById('econ-savings');
                     var top = document.getElementById('memory-economics-top');
-                    if (hr) hr.textContent = ((j.hit_rate || 0) * 100).toFixed(1) + '%';
-                    if (tt) tt.textContent = (j.total_tokens || 0).toLocaleString();
-                    if (sv) sv.textContent = (j.savings_percent || 0).toFixed(1) + '%';
+                    // null means nothing was recorded: the tile keeps "--".
+                    function isNum(v){ return typeof v === 'number' && isFinite(v); }
+                    if (hr) hr.textContent = isNum(j.hit_rate) ? (j.hit_rate * 100).toFixed(1) + '%' : '--';
+                    if (tt) tt.textContent = isNum(j.total_tokens) ? j.total_tokens.toLocaleString() : '--';
+                    if (sv) sv.textContent = isNum(j.savings_percent) ? j.savings_percent.toFixed(1) + '%' : '--';
                     if (top) {
                       var patterns = j.top_patterns || [];
                       // v7.7.21 council fix (Opus 1): build DOM with
@@ -1481,7 +1483,7 @@ function generateStandaloneHTML(bundleCode) {
                         patterns.slice(0, 5).forEach(function(p){
                           var row = document.createElement('div');
                           // textContent escapes everything; no markup injection.
-                          row.textContent = (p.access_count || 0) + 'x · ' +
+                          row.textContent = p.access_count + 'x · ' +
                             (p.summary || p.id || '');
                           top.appendChild(row);
                         });
@@ -2423,7 +2425,7 @@ document.addEventListener('DOMContentLoaded', function() {
           var lim = d.budget_limit;
           var cur = d.current_cost;
           var curTxt = (cur === null || cur === undefined) ? 'not measured'
-                     : ('$' + Number(cur).toFixed(2));
+                     : ('$' + Number(cur).toFixed(2) + (d.partial ? ' (partial)' : ''));
           if (lim === null || lim === undefined) {
             el.style.borderColor = 'var(--loki-warning)';
             el.innerHTML = '<strong>No spend cap set.</strong> This run will not stop on cost. '
@@ -2435,7 +2437,7 @@ document.addEventListener('DOMContentLoaded', function() {
               + ', spent ' + curTxt + '.';
           } else {
             var rem = (d.remaining === null || d.remaining === undefined)
-              ? 'not measured' : ('$' + Number(d.remaining).toFixed(2));
+              ? 'not measured' : ((d.partial ? 'at most ' : '') + '$' + Number(d.remaining).toFixed(2));
             el.style.borderColor = 'var(--loki-border)';
             el.innerHTML = 'Spend cap $' + Number(lim).toFixed(2)
               + '. Spent ' + curTxt + ', remaining ' + rem + '.';

@@ -688,13 +688,13 @@ def _read_project_run_snapshot(path: str) -> dict:
         .loki/context/tracking.json fallback (totals.total_cost_usd)
 
     Returns a dict with phase, iteration, cost_usd, started_at, and ended_at
-    (best-effort; missing values default to None/0). cost_usd is None, never
-    0.0, when nothing was measured. Never raises: any file problem degrades the
+    (best-effort; missing values default to None). iteration and cost_usd are
+    None, never 0 / 0.0, when nothing recorded them. Never raises: any file problem degrades the
     affected field to its default.
     """
     snap = {
         "phase": "",
-        "iteration": 0,
+        "iteration": None,
         "cost_usd": None,
         "started_at": None,
         "ended_at": None,
@@ -711,8 +711,8 @@ def _read_project_run_snapshot(path: str) -> dict:
             if isinstance(state, dict):
                 _p = state.get("phase", "")
                 snap["phase"] = _p if isinstance(_p, str) else ""
-                _i = state.get("iteration", 0)
-                snap["iteration"] = _i if isinstance(_i, int) else 0
+                _i = state.get("iteration")
+                snap["iteration"] = _i if isinstance(_i, int) and not isinstance(_i, bool) else None
         except (json.JSONDecodeError, OSError, ValueError):
             pass
 

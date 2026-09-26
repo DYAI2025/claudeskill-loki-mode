@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Boot a seeded web-app server, drive the Admin console and Templates page in a
-# real browser (tests/e2e/webapp-admin-honesty.mjs), tear everything down.
+# Boot a seeded web-app server, drive the Admin console, Templates page and
+# Teams page in a real browser (tests/e2e/webapp-admin-honesty.mjs), tear
+# everything down. The Teams steps create a team through the UI, so the seed
+# directory also receives teams.json and a second audit entry.
 #
 # The seed fixes each honesty assertion's answer in advance:
 #   - .loki/audit-log.json has one team.created entry for harness-team
 #   - no efficiency records, so /api/cost reports cost_recorded=false
+#   - one receipt with an unrecorded cost and a $10 cap (Metrics page)
 #
 # HOME points into the seed: with no active session, web-app/server.py resolves
 # .loki (audit log, teams) and the sessions-history directories under HOME, so a
@@ -44,6 +47,14 @@ cat > "$SEED/.loki/audit-log.json" <<'JSON'
    "timestamp": "2026-01-01T00:00:00", "details": ""}
 ]
 JSON
+# One receipt whose cost was never recorded, and a $10 cap with no measured
+# spend: "Runs with cost" must read 0 of 1 and the budget "Not recorded".
+mkdir -p "$SEED/.loki/proofs/harness-run-1" "$SEED/.loki/metrics" || exit 2
+cat > "$SEED/.loki/proofs/harness-run-1/proof.json" <<'JSON'
+{"run_id": "harness-run-1", "generated_at": "2026-01-01T00:00:00Z",
+ "cost": {"usd": null, "available": false}}
+JSON
+printf '%s\n' '{"limit": 10}' > "$SEED/.loki/metrics/budget.json"
 
 cd "$SEED" || exit 2
 HOME="$SEED" PYTHONUSERBASE="$USERBASE" LOKI_DIR="$SEED/.loki" \

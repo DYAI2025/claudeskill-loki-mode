@@ -194,12 +194,12 @@ export function FeaturedTemplates({ templates, onSelect, onPreview }: FeaturedTe
                   {t.description || t.filename}
                 </p>
 
-                {/* Template's own estimated build time, when it declares one */}
+                {/* Hand-written server estimate (not a measured build), when one exists */}
                 {t.build_time && (
                   <div className="flex items-center gap-3 mb-3 text-[10px] text-[#6B6960]">
-                    <span className="flex items-center gap-1">
+                    <span className="flex items-center gap-1" title="Hand-written estimate, not a measured build">
                       <Clock size={11} />
-                      {t.build_time}
+                      Est. {t.build_time}
                     </span>
                   </div>
                 )}
@@ -207,16 +207,20 @@ export function FeaturedTemplates({ templates, onSelect, onPreview }: FeaturedTe
                 {/* Action row */}
                 <div className="flex items-center justify-between pt-3 border-t border-[#ECEAE3]">
                   <div className="flex items-center gap-1.5">
-                    <BarChart3 size={12} className={
-                      t.difficulty === 'beginner' ? 'text-green-500' :
-                      t.difficulty === 'advanced' ? 'text-red-400' : 'text-yellow-500'
-                    } />
-                    <span className={`text-[10px] font-medium capitalize ${
-                      t.difficulty === 'beginner' ? 'text-green-500' :
-                      t.difficulty === 'advanced' ? 'text-red-400' : 'text-yellow-500'
-                    }`}>
-                      {t.difficulty || 'Intermediate'}
-                    </span>
+                    {t.difficulty && (
+                      <>
+                        <BarChart3 size={12} className={
+                          t.difficulty === 'beginner' ? 'text-green-500' :
+                          t.difficulty === 'advanced' ? 'text-red-400' : 'text-yellow-500'
+                        } />
+                        <span className={`text-[10px] font-medium capitalize ${
+                          t.difficulty === 'beginner' ? 'text-green-500' :
+                          t.difficulty === 'advanced' ? 'text-red-400' : 'text-yellow-500'
+                        }`}>
+                          {t.difficulty}
+                        </span>
+                      </>
+                    )}
                   </div>
                   <Button
                     size="sm"

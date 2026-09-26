@@ -453,7 +453,7 @@ export class LokiFleet extends LokiElement {
         const cfg = FLEET_STATUS_CONFIG[status] || FLEET_STATUS_CONFIG.unknown;
         const canCancel = run.running === true;
         const duration = formatFleetDuration(run.duration_seconds);
-        const iter = (run.iteration != null) ? run.iteration : 0;
+        const iter = (run.iteration != null) ? this._escapeHtml(String(run.iteration)) : '--';
         const phase = run.phase ? this._escapeHtml(run.phase) : '--';
 
         return `

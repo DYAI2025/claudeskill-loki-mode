@@ -140,6 +140,13 @@
   function projectTotal(d) {
     return fmtUsd(d.project_total_usd) + (d.project_total_partial && d.project_total_usd != null ? " (partial)" : "");
   }
+  // Same rule for a sum over iterations where only some recorded a cost.
+  function partialUsd(n, partial) {
+    return fmtUsd(n) + (partial && n !== null && n !== undefined ? " (partial)" : "");
+  }
+  function orNotRecorded(v) {
+    return (v === null || v === undefined) ? "not recorded" : esc(v);
+  }
   function badgeClass(v) {
     v = String(v || "").toUpperCase();
     if (v.indexOf("APPROVE") === 0 || v === "PASS" || v === "PASSED") return "b-approve";
@@ -147,7 +154,8 @@
     if (v.indexOf("CONCERN") === 0) return "b-concern";
     return "";
   }
-  function statusText(st) {
+  function statusText(st, partial) {
+    if (st === "ok" && partial) return "Within budget so far, but some iterations recorded no cost, so true spend may be higher.";
     if (st === "exceeded") return "Budget cap reached. The run is paused to prevent a surprise bill.";
     if (st === "warn") return "Approaching budget cap (80% or more used). Warning only, the run continues.";
     if (st === "ok") return "Within budget.";
@@ -169,13 +177,14 @@
     var known = isFinite(pct);
     var fillPct = known ? Math.max(0, Math.min(100, pct)) : 0;
     var st = esc(b.status || "unknown");
+    var part = b.partial === true;
     html += '<div class="gauge">' +
-      '<div class="top"><span class="muted">' + fmtUsd(b.used) + ' of ' + fmtUsd(b.limit) + ' used</span>' +
-      '<span class="pct">' + (known ? pct.toFixed(1) + '%' : 'not recorded') + '</span></div>' +
+      '<div class="top"><span class="muted">' + partialUsd(b.used, part) + ' of ' + fmtUsd(b.limit) + ' used</span>' +
+      '<span class="pct">' + (known ? pct.toFixed(1) + '%' + (part ? ' (partial)' : '') : 'not recorded') + '</span></div>' +
       '<div class="bar"><div class="fill ' + st + '" style="width:' + fillPct + '%"></div>' +
       '<div class="warnline" title="80% warn threshold"></div></div>' +
-      '<div class="status ' + st + '">' + statusText(b.status) + '</div>' +
-      '<div class="cap-note">Remaining: ' + fmtUsd(b.remaining) +
+      '<div class="status ' + st + '">' + statusText(b.status, part) + '</div>' +
+      '<div class="cap-note">Remaining: ' + (part && b.remaining != null ? 'at most ' : '') + fmtUsd(b.remaining) +
       '. Warns at ' + esc(b.warn_threshold_percent) + '%, hard-stops at 100%.</div>' +
       '</div>';
     return html;
@@ -245,19 +254,22 @@
         '<polyline fill="none" stroke="#6f7bf7" stroke-width="2" points="' + pts.join(" ") + '"/>' +
         '</svg>';
     html += '<div class="panel"><div class="muted" style="font-size:13px;margin-bottom:6px;">' +
-      'Cumulative spend this run: <span class="mono">' + fmtUsd(cr.total_usd) + '</span></div>' +
+      'Cumulative spend this run: <span class="mono">' + partialUsd(cr.total_usd, cr.partial) + '</span></div>' +
       poly + '</div>';
     // Per-iteration table.
     var rows = "";
+    // Once an iteration went unmeasured, every later running total skips it.
+    var gap = false;
     for (var r = 0; r < its.length; r++) {
       var it = its[r];
+      if (it.cost_usd === null || it.cost_usd === undefined) gap = true;
       rows += '<tr><td class="num mono">' + esc(it.iteration) + '</td>' +
-        '<td class="mono">' + esc(it.model) + '</td>' +
+        '<td class="mono">' + orNotRecorded(it.model) + '</td>' +
         '<td>' + esc(it.phase) + '</td>' +
-        '<td class="num">' + esc(it.input_tokens) + '</td>' +
-        '<td class="num">' + esc(it.output_tokens) + '</td>' +
+        '<td class="num">' + orNotRecorded(it.input_tokens) + '</td>' +
+        '<td class="num">' + orNotRecorded(it.output_tokens) + '</td>' +
         '<td class="num mono">' + fmtUsd(it.cost_usd) + '</td>' +
-        '<td class="num mono">' + fmtUsd(it.cumulative_usd) + '</td></tr>';
+        '<td class="num mono">' + partialUsd(it.cumulative_usd, gap) + '</td></tr>';
     }
     html += '<table style="margin-top:14px;"><thead><tr>' +
       '<th class="num">Iter</th><th>Model</th><th>Phase</th>' +
@@ -301,11 +313,11 @@
         '<div class="val">' + projectTotal(d) + '</div>' +
         '<div class="note">' + esc(d.runs_count) + ' run(s) recorded</div></div>' +
       '<div class="card"><div class="label">Current run</div>' +
-        '<div class="val">' + fmtUsd(d.current_run ? d.current_run.total_usd : null) + '</div>' +
+        '<div class="val">' + (d.current_run ? partialUsd(d.current_run.total_usd, d.current_run.partial) : fmtUsd(null)) + '</div>' +
         '<div class="note">' + (d.current_run && d.current_run.iterations ? d.current_run.iterations.length : 0) + ' iteration(s)</div></div>' +
       '<div class="card"><div class="label">Budget status</div>' +
-        '<div class="val ' + esc(b.status || "none") + '" style="font-size:20px;text-transform:capitalize;">' + esc(b.status || "none") + '</div>' +
-        '<div class="note">' + (b.limit ? fmtUsd(b.used) + ' / ' + fmtUsd(b.limit) : "no cap set") + '</div></div>' +
+        '<div class="val ' + esc(b.status || "none") + '" style="font-size:20px;text-transform:capitalize;">' + esc(b.status || "none") + (b.partial ? ' (partial)' : '') + '</div>' +
+        '<div class="note">' + (b.limit ? partialUsd(b.used, b.partial) + ' / ' + fmtUsd(b.limit) : "no cap set") + '</div></div>' +
       '</div>';
     c.innerHTML = cards +
       renderBudget(d.budget) +

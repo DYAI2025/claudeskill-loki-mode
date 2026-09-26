@@ -329,12 +329,15 @@ export class LokiAnalytics extends LokiElement {
   _computeVelocity() {
     const ctx = this._context || {};
     const iterations = ctx.per_iteration || ctx.iterations || [];
+    // null, not 0: no response, or the server's no-tracking stub (updated_at
+    // ""), means nobody counted. Fewer than 2 timestamps gives no rate.
+    const measured = !!ctx.updated_at;
     const totalIterations = Array.isArray(iterations) && iterations.length > 0
       ? iterations.length
-      : ((ctx.totals && ctx.totals.iterations_tracked) || ctx.total_iterations || 0);
+      : (measured ? (ctx.totals?.iterations_tracked ?? ctx.total_iterations ?? null) : null);
 
     // Calculate iterations/hour from timestamps
-    let iterPerHour = 0;
+    let iterPerHour = null;
     if (Array.isArray(iterations) && iterations.length >= 2) {
       const timestamps = iterations
         .map(it => new Date(it.timestamp || it.started_at || it.ts).getTime())
@@ -401,11 +404,11 @@ export class LokiAnalytics extends LokiElement {
       <div class="velocity-cards">
         <div class="velocity-card">
           <div class="velocity-label">Iterations / Hour</div>
-          <div class="velocity-value">${iterPerHour.toFixed(1)}</div>
+          <div class="velocity-value">${iterPerHour == null ? '--' : iterPerHour.toFixed(1)}</div>
         </div>
         <div class="velocity-card">
           <div class="velocity-label">Total Iterations</div>
-          <div class="velocity-value">${totalIterations}</div>
+          <div class="velocity-value">${totalIterations ?? '--'}</div>
         </div>
       </div>
       <div class="sparkline-container">
@@ -486,11 +489,11 @@ export class LokiAnalytics extends LokiElement {
                   <span class="provider-stat-value">${formatUSD(data.cost)}${partial}</span>
                 </div>
                 <div class="provider-stat">
-                  <span class="provider-stat-label">Cost / Iteration</span>
+                  <span class="provider-stat-label">Cost / Iteration (est.)</span>
                   <span class="provider-stat-value">${costPerIter !== '--' ? '$' + costPerIter : costPerIter}</span>
                 </div>
                 <div class="provider-stat">
-                  <span class="provider-stat-label">Tokens / Iteration</span>
+                  <span class="provider-stat-label">Tokens / Iteration (est.)</span>
                   <span class="provider-stat-value">${tokensPerIter}</span>
                 </div>
                 <div class="provider-stat">
