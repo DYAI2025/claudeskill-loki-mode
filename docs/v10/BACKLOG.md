@@ -139,6 +139,17 @@ Status values: todo, in progress, shipped (version), parked (reason).
 97. **Register `scripts/run-webapp-admin-honesty.sh`** in `scripts/local-ci.sh` (~1850) and `tests/run-all-tests.sh` (~295) next to its sibling harnesses.
 98. **Headline vs gate listing:** the stale-results fix (82) changes the unit_tests gate listing only; the headline comes from `facts.tests`, which should get the same freshness rule. The council member vote and `_council_convergence_evidence_green` still read `pass: true` as green whatever `failed_count` says, and the Bun npm fallback still reads an exit-0 run printing "Tests: 1 failed" as passed.
 
+99. **The commit-hygiene prompt line does not reach the main build loop for codex, cline or aider:** the bash loop calls `codex exec ... "$prompt"` directly and uses run.sh's own `invoke_cline`/`invoke_aider`; the Bun providers push the raw prompt. Only opencode gets it. The untrack commit is the real guarantee; the cycle-4 commit message overstated the wiring.
+100. **Interrupted self-commit loses user files:** the untrack step runs only at the normal end of a session (`commit_session_changes`); an agent self-commit followed by an interrupt and a base checkout still deletes the user's files. Run the untrack check in the interrupt path and on resume.
+101. **Nested repo gitlink stays on the tip:** an untracked `vendor/lib/` with its own `.git` that the agent's `git add -A` records as a gitlink is not matched (`vendor/lib` vs snapshot entry `vendor/lib/`); nothing is lost (checkout keeps the directory).
+102. **`.loki/state/agent-committed-user-files.z` has no reader** outside the lifecycle test and is never cleared by a later session with no hits.
+103. **Bash failure-count gaps:** jest "Test Suites: 1 failed" with "Tests: 2 passed" (a suite that failed to compile), and vitest "Test Files 1 failed", still read as passed (`run.sh` ~12697-12707).
+104. **Pre-existing failing node test:** `dashboard-ui/tests/loki-overview-issue-journey.node.test.mjs` fails 5/5 at v9.54.0 and before; not registered in any runner.
+
+105. **User-committed files on the session branch are misattributed (council S4c):** a file the user deliberately commits on the session branch between sessions is taken off the tip by the next session's untrack step and reported as "the agent committed". It stays on disk. Needs a session-end marker written at every clean session end to tell user commits from an interrupted agent's.
+106. **Unmeasured spend in the CLI and the budget breaker:** `loki cost` (autonomy/loki) reports `budget_used = 0.0` when unmeasured (ok/0%); `check_budget_limit` writes `0.0` to `budget.json` for a run it measured nothing for; the bash and Bun breakers treat unmeasured cost as $0 and never warn. Proposed default: warn (never pause) when a cap is set and spend is unmeasured, and show unknown in the CLI.
+107. **Test coverage for two honesty surfaces:** the web-app MetricsPage "Not recorded" budget label has no committed rendering test, and P7 rule 4 (hardcoded metric props) scans one line at a time (misses multi-line ternaries and metric names outside its list).
+
 ## Later milestones
 
 M1 one command, M2 Seal and Wall, M3 assign like a teammate, M4 system map, M5 the line, M6 ship and operate, M7 one screen, M8 legacy lane, M9 enterprise readiness, M10 simplify and ship v10.0.0. Items get broken out here when their milestone comes up.
