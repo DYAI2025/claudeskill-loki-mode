@@ -107,3 +107,12 @@ the user-facing account.
 Also merged in this release: S-06 (docs pointing at a rejected
 `doctor --airgap` on the default route, cherry-picked as `c83732b2`, LOW
 tier, single-reviewer APPROVE).
+
+## v9.54.1 superseded by v9.54.2 (2026-09-26)
+
+v9.54.1 (`779c50e5`) never published: required-ci failed on Security
+Audit's gitleaks step, flagging a synthetic test fixture in
+`tests/test-branch-lifecycle.sh` (pre-existing, from cycle 4, missing its
+`.gitleaksignore` entry). Fixed (`217cb715`), plus S-01 and S-12 (approved,
+merged) and their sibling docs/test updates. Re-cut as v9.54.2 (`9afc216c`)
+per the v9.51.0/v9.51.1 precedent for a failed-before-publish release.
