@@ -5,6 +5,20 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.54.2
+
+Re-cut after v9.54.1 failed the release gate's Security Audit step before
+any publish job ran: a gitleaks secret scan flagged a synthetic,
+API-key-shaped test fixture in `tests/test-branch-lifecycle.sh` (used to
+prove the session-commit secret-scan-abort path actually aborts on a real
+secret) as a possible leak. Not a real credential; the fixture predates
+this fix and simply lacked its `.gitleaksignore` entry. v9.54.1 was never
+published to any channel. This release carries the same fix described
+below plus two additional, independently reviewed and approved slices:
+BACKLOG 22 (an orphaned `sleep 300` from the resource monitor after `loki
+start` exits, now reaped by its own recorded PID on shutdown) and a moat
+test-control correction (BACKLOG 46).
+
 ## v9.54.1
 
 **A loki-mode session ending could terminate other, unrelated Claude Code
