@@ -37,6 +37,14 @@ PY=$(command -v python3.12 || command -v python3)
 
 FN_BODY="$(awk '/^_verify_runtime_teardown\(\) \{/,/^\}/' "$VERIFY_SH")"
 [ -n "$FN_BODY" ] || { echo "FAIL: could not extract _verify_runtime_teardown() from $VERIFY_SH"; exit 1; }
+# The fourth ownership arm (round 4) calls a second helper,
+# _verify_runtime_pid_has_token(); it must be extracted and sourced alongside
+# _verify_runtime_teardown or every call to it fails with "command not found"
+# in this test's isolated harness -- which would silently make the fourth arm
+# untestable here without ever failing the harness itself (bash treats the
+# missing-command error as just another false condition in the || chain).
+TOKEN_FN_BODY="$(awk '/^_verify_runtime_pid_has_token\(\) \{/,/^\}/' "$VERIFY_SH")"
+[ -n "$TOKEN_FN_BODY" ] || { echo "FAIL: could not extract _verify_runtime_pid_has_token() from $VERIFY_SH"; exit 1; }
 
 # --- T1: static checks ------------------------------------------------------
 if echo "$FN_BODY" | grep -qE 'lsof -ti tcp:"\$_rp" -sTCP:LISTEN'; then
@@ -57,7 +65,10 @@ fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/loki-teardowntest-XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 FN_FILE="$WORK/teardown_fn.sh"
-printf '%s\n' "$FN_BODY" > "$FN_FILE"
+{
+    printf '%s\n' "$TOKEN_FN_BODY"
+    printf '%s\n' "$FN_BODY"
+} > "$FN_FILE"
 # shellcheck disable=SC1090
 source "$FN_FILE"
 
@@ -275,6 +286,122 @@ else:
     fi
     kill -9 "$DAEMON_LISTENER_PID" 2>/dev/null || true
     kill -9 "$DAEMON_APP_PID" 2>/dev/null || true
+fi
+
+# --- T4: the round-4 regression. Case I's real fixture (test-runtime-gate.sh)
+# uses Node's child_process.spawn({detached:true}), which calls setsid(): the
+# daemon becomes its OWN session/process group leader (pgid == its own pid,
+# ppid == 1), which T3's GNU-timeout fixture does NOT reproduce (there the
+# daemon's pgid is still timeout's exited pid -- a DIFFERENT shape). None of
+# the three pgid/ppid arms can ever match a genuinely setsid'd process, so
+# T3's pass does not prove this case is covered, and indeed it was not: this
+# was reported as a real, reproduced regression (case I red on every run)
+# even after T3's fix landed and this file went green. The fourth arm closes
+# it via LOKI_VERIFY_RUN_TOKEN, an env-var ownership proof that survives
+# setsid() (env vars are inherited across fork/exec/setsid regardless of
+# process-group changes). `setsid` (util-linux) does not exist on macOS, so
+# each of the own-daemon and the decoy is given a genuine session via perl's
+# POSIX::setsid() inside a subshell that exits immediately -- same technique
+# used elsewhere in this file and in tests/test-kill-provider-child-scoping.sh.
+PERL="$(command -v perl || true)"
+if [ -z "$PERL" ]; then
+    echo "SKIPPED: no perl (T1/T2/T3 above still count)"
+else
+    TOK_OWN="tok-own-$$-${RANDOM}-${RANDOM}"
+    TOK_DECOY="tok-decoy-$$-${RANDOM}-${RANDOM}"
+    OWN_PORT=$((60000 + (RANDOM % 3000)))
+    DECOY_TOK_PORT=$((63000 + (RANDOM % 3000)))
+
+    # Own daemon: genuinely setsid'd (own session+pgid, ppid=1), carries
+    # TOK_OWN in its environment -- exactly what _verify_runtime_teardown's
+    # launch site now exports as LOKI_VERIFY_RUN_TOKEN for a real run.
+    OWN_PIDFILE="$WORK/setsid_own.pid"
+    ( LOKI_VERIFY_RUN_TOKEN="$TOK_OWN" perl -e '
+        use POSIX qw(setsid);
+        setsid();
+        open(my $f, ">", $ARGV[0]) or die $!;
+        print $f $$;
+        close $f;
+        exec($ARGV[1], "-c", "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"127.0.0.1\", '"$OWN_PORT"'))
+s.listen(5)
+time.sleep(30)
+");
+    ' "$OWN_PIDFILE" "$PY" >/dev/null 2>&1 & )
+    i=0
+    # Wider budget (80x0.1s=8s vs the 4s used elsewhere in this file): this
+    # fixture does an extra exec() inside perl after setsid(), one step more
+    # than the other decoys, and was observed to occasionally need slightly
+    # longer under a loaded machine (confirmed as a timing flake, not a logic
+    # bug, by an immediate re-run passing cleanly).
+    while [ $i -lt 80 ]; do [ -s "$OWN_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+    OWN_TOK_PID=$(cat "$OWN_PIDFILE" 2>/dev/null || true)
+
+    # Decoy: genuinely setsid'd too, listening on a DIFFERENT port, carrying a
+    # DIFFERENT token -- must survive a teardown call scoped to TOK_OWN.
+    DECOY_PIDFILE="$WORK/setsid_decoy.pid"
+    ( LOKI_VERIFY_RUN_TOKEN="$TOK_DECOY" perl -e '
+        use POSIX qw(setsid);
+        setsid();
+        open(my $f, ">", $ARGV[0]) or die $!;
+        print $f $$;
+        close $f;
+        exec($ARGV[1], "-c", "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"127.0.0.1\", '"$DECOY_TOK_PORT"'))
+s.listen(5)
+time.sleep(30)
+");
+    ' "$DECOY_PIDFILE" "$PY" >/dev/null 2>&1 & )
+    i=0
+    while [ $i -lt 80 ]; do [ -s "$DECOY_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+    DECOY_TOK_PID=$(cat "$DECOY_PIDFILE" 2>/dev/null || true)
+
+    if [ -z "$OWN_TOK_PID" ] || ! kill -0 "$OWN_TOK_PID" 2>/dev/null \
+       || [ -z "$DECOY_TOK_PID" ] || ! kill -0 "$DECOY_TOK_PID" 2>/dev/null; then
+        bad "setsid own/decoy token fixtures did not start (test setup broken, not the function under test)"
+    else
+        OWN_TOK_PGID="$(ps -o pgid= -p "$OWN_TOK_PID" 2>/dev/null | tr -d ' ')"
+        OWN_TOK_PPID="$(ps -o ppid= -p "$OWN_TOK_PID" 2>/dev/null | tr -d ' ')"
+        if [ "$OWN_TOK_PPID" != "1" ] || [ "$OWN_TOK_PGID" != "$OWN_TOK_PID" ]; then
+            bad "own-daemon setsid setup is wrong (ppid=$OWN_TOK_PPID want 1; pgid=$OWN_TOK_PGID want $OWN_TOK_PID) -- the assertion below would be vacuous"
+        else
+            ok "own-daemon is genuinely setsid'd (pgid equals its own pid, ppid=1) -- the exact shape none of the first three arms can match"
+        fi
+        if ! lsof -ti tcp:"$OWN_PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$OWN_TOK_PID"; then
+            bad "positive control failed: lsof cannot enumerate the setsid own-daemon listener"
+        else
+            ok "positive control: lsof enumerates the setsid own-daemon listener before teardown"
+            # app_pid does not matter for the token arm; pass a fake, dead PID
+            # to prove the first three arms cannot be what reclaims this.
+            _verify_runtime_teardown 999999 "$OWN_PORT" "" "$TOK_OWN"
+            sleep 0.5
+            if kill -0 "$OWN_TOK_PID" 2>/dev/null; then
+                bad "own-daemon setsid listener LEAKED -- the round-4 regression is still present"
+            else
+                ok "own-daemon setsid listener (carrying the run token) is reclaimed by the fourth arm"
+            fi
+        fi
+        if ! lsof -ti tcp:"$DECOY_TOK_PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$DECOY_TOK_PID"; then
+            bad "positive control failed: lsof cannot enumerate the setsid decoy listener"
+        else
+            ok "positive control: lsof enumerates the setsid decoy listener before teardown"
+            _verify_runtime_teardown 999999 "$DECOY_TOK_PORT" "" "$TOK_OWN"
+            sleep 0.5
+            if kill -0 "$DECOY_TOK_PID" 2>/dev/null; then
+                ok "setsid decoy carrying a DIFFERENT token survives a teardown scoped to the own token"
+            else
+                bad "setsid decoy with a different token was KILLED -- the fourth arm is not scoped to the exact token"
+            fi
+        fi
+    fi
+    kill -9 "$OWN_TOK_PID" 2>/dev/null || true
+    kill -9 "$DECOY_TOK_PID" 2>/dev/null || true
 fi
 
 echo ""
