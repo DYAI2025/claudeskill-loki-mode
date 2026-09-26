@@ -5,6 +5,44 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.54.1
+
+**A loki-mode session ending could terminate other, unrelated Claude Code
+sessions on the same machine. This is now fixed.**
+
+What happened: when a `loki start` run ended via a signal (a supervisor
+signal, pressing Ctrl+C twice, or pressing Ctrl+C once while running in
+perpetual/autonomous mode), its cleanup step ran `pkill -f` against the
+provider process names (`claude`, `codex`, `aider`, `cline`) with no
+scoping at all. `pkill -f` matches the full command line of every matching
+process on the whole machine, not just the ones this run started. In
+practice this meant: any time a loki-mode run ended that way, every other
+Claude Code session open in a different terminal or a different project on
+the same machine, whose command line happened to match, could be
+terminated along with it.
+
+Who was affected: anyone who ran `loki start` (directly or through the
+`loki-mode` skill) and ended that run with Ctrl+C, a supervisor signal, or
+by letting a perpetual/autonomous run be interrupted, while other Claude
+Code sessions (`claude`, `codex`, `aider` or `cline` processes) were open
+on the same machine. A run that finished normally, or was stopped with
+`loki stop` (no signal), was not affected; the bug was specific to the
+function's signal-driven cleanup path (`kill_provider_child` in
+`autonomy/run.sh`).
+
+The fix: that cleanup step now only ever signals a process that shares
+this run's own operating-system process group, which a completely
+separate Claude Code session never does. It still cleans up the provider
+processes this run itself launched, including ones that were reparented
+after an earlier crash or retry, but it can no longer reach outside this
+run's own process tree. Covered by a new regression test
+(`tests/test-kill-provider-child-scoping.sh`) that proves both directions:
+a leaked process belonging to this run is still cleaned up, and an
+unrelated process in a different process group survives. Registered in
+the release gate so this class of regression cannot ship silently again.
+See `docs/v10/DECISIONS.md` D14 through D17 for the full record, including
+two related bugs the same investigation found and fixed in test code.
+
 ## v9.54.0
 
 **Resuming a session no longer endangers the user's files.** Six council
