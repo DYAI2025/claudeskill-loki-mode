@@ -8765,10 +8765,20 @@ start_resource_monitor() {
     # Initial check
     check_system_resources
 
-    # Background monitoring loop
+    # Background monitoring loop. BACKLOG 22: a bare `sleep N` inside this
+    # subshell survives a TERM to the subshell -- caught traps do not carry
+    # into a foreground child, so the sleep reparents to init and outlives the
+    # run for up to RESOURCE_CHECK_INTERVAL seconds. Backgrounding the sleep
+    # and recording its PID lets a TERM trap kill it directly; `wait` returns
+    # immediately once the trap fires, so shutdown is not delayed either.
     (
+        _loki_rm_sleep_pid=""
+        trap '[ -n "$_loki_rm_sleep_pid" ] && kill "$_loki_rm_sleep_pid" 2>/dev/null; exit 0' TERM
         while true; do
-            sleep "$RESOURCE_CHECK_INTERVAL"
+            sleep "$RESOURCE_CHECK_INTERVAL" &
+            _loki_rm_sleep_pid=$!
+            wait "$_loki_rm_sleep_pid"
+            _loki_rm_sleep_pid=""
             check_system_resources
         done
     ) &
