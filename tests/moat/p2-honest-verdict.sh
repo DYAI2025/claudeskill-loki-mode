@@ -194,12 +194,16 @@ jfield() { # <file> <python expr over d>
 case_advisory_only() {
     need python3 git || return
     local adv='{"code_review":"passed","devils_advocate":"passed","magic_debate":"passed","council":"passed","anti_sycophancy":"passed"}'
-    local ctl='{"code_review":"passed","static_analysis":"passed","mock_integrity":"passed"}'
+    # Control isolates the ONE variable this case tests: the probe's exact gate
+    # set plus one exogenous passed gate (static_analysis), same tests=no. With
+    # no tests, "tests" always lands in degraded (status not_run), so the
+    # exogenous pass can only reach VERIFIED WITH GAPS, never a clean VERIFIED.
+    local ctl='{"code_review":"passed","devils_advocate":"passed","magic_debate":"passed","council":"passed","anti_sycophancy":"passed","static_analysis":"passed"}'
     local h c
     h="$(gen_headlines advonly "$adv" no)"
-    c="$(gen_headlines advctl "$ctl" yes)"
-    if [ "$c" != "VERIFIED|VERIFIED" ]; then
-        _why="positive control broken: exogenous passes + verified tests produced '$c', expected VERIFIED|VERIFIED"
+    c="$(gen_headlines advctl "$ctl" no)"
+    if [ "$c" != "VERIFIED WITH GAPS|VERIFIED WITH GAPS" ]; then
+        _why="positive control broken: an exogenous pass (no tests) produced '$c', expected VERIFIED WITH GAPS|VERIFIED WITH GAPS"
         return
     fi
     case "$h" in
