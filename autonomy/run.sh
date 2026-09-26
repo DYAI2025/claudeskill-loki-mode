@@ -9387,17 +9387,37 @@ _loki_tracked_by_user_since_anchor() {
 
 # _loki_advance_tracked_since_anchor
 # Move .loki/state/tracked-since.sha to the current HEAD and clear
-# .loki/state/turn-in-flight. Called after every provider turn
-# (_loki_record_session_created) and at normal session end
-# (commit_session_changes), i.e. at every point this run can prove no provider
-# turn is currently running. A HEAD that does not resolve (unborn branch) skips
-# silently; the anchor stays as it was (still "no anchor yet" pre-first-commit).
+# .loki/state/turn-in-flight, but ONLY once the anchor write is confirmed on
+# disk. Called after every provider turn (_loki_record_session_created) and at
+# normal session end (commit_session_changes), i.e. at every point this run
+# can prove no provider turn is currently running -- PROVIDED the anchor write
+# itself lands, since _loki_tracked_by_user_since_anchor trusts both signals
+# together (anchor position + in-flight marker) to prove a commit happened
+# strictly after the anchor with no turn running. Clearing the marker on a
+# failed write would decouple them: a stale anchor stays on disk while the
+# marker falsely reports "no turn was in flight", so a later resume could
+# prove something it can't actually prove and prune an agent's own commit with
+# no disclosure (this is BACKLOG 68's failure mode, reintroduced). A HEAD that
+# does not resolve (unborn branch) is not a write failure -- there is nothing
+# to anchor yet -- so the marker still clears; the anchor stays "not set" as
+# before. Always returns 0 (both call sites are bare, unchecked calls): the
+# in-flight marker, not the return code, is the safety signal on a failed
+# write.
 _loki_advance_tracked_since_anchor() {
     local sha=""
     sha="$(git rev-parse --verify -q HEAD 2>/dev/null)" || true
     if [ -n "$sha" ]; then
-        printf '%s\n' "$sha" > .loki/state/tracked-since.sha.tmp 2>/dev/null \
-            && mv -f .loki/state/tracked-since.sha.tmp .loki/state/tracked-since.sha 2>/dev/null
+        if ! { printf '%s\n' "$sha" > .loki/state/tracked-since.sha.tmp 2>/dev/null \
+               && mv -f .loki/state/tracked-since.sha.tmp .loki/state/tracked-since.sha 2>/dev/null; }; then
+            # Anchor write failed (disk full, a stray .tmp collision, a
+            # concurrent writer). Deliberately leave turn-in-flight SET and
+            # return here, before the unconditional clear below: the safe
+            # direction is to keep the old fallback-to-no-pruning path active
+            # for one more check, never to clear a marker the anchor write did
+            # not earn.
+            rm -f .loki/state/tracked-since.sha.tmp 2>/dev/null
+            return 0
+        fi
     fi
     rm -f .loki/state/turn-in-flight 2>/dev/null
     return 0

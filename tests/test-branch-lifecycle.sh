@@ -1935,6 +1935,62 @@ else
 fi
 
 # =============================================================================
+# Test T68-anchor-write-failure-keeps-marker (second-reviewer regression): a
+# STALE anchor is already on disk from an earlier turn, a turn is in flight,
+# and the agent commits a pre-existing file mid-turn -- then the anchor .tmp
+# write is forced to fail (a directory pre-created at the exact .tmp path, an
+# ordinary transient-fs-hiccup shape: disk full, permission issue, a stray
+# leftover, a concurrent writer). _loki_advance_tracked_since_anchor must
+# leave .loki/state/turn-in-flight SET when the write did not land: clearing
+# it anyway would decouple the stale anchor from the marker and let the next
+# check "prove" the mid-turn commit is safe to prune with zero disclosure --
+# exactly the fail-unsafe hole the whole T68 rework exists to close. Calls the
+# real call site (_loki_record_session_created), not the anchor function
+# directly, so the exact production code path is exercised.
+# =============================================================================
+echo "Test T68-anchor-write-failure-keeps-marker: a failed anchor write leaves turn-in-flight SET, mid-turn commit stays disclosed not pruned"
+R68W="$(make_repo t68anchorwritefail)"
+out68w="$(
+    cd "$R68W" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Seed a STALE anchor (the session mint commit, already behind).
+    stale_anchor="$(git rev-parse HEAD)"
+    mkdir -p .loki/state
+    printf '%s\n' "$stale_anchor" > .loki/state/tracked-since.sha
+    : > .loki/state/turn-in-flight
+    # Agent commits the pre-existing file mid-turn.
+    git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
+    # Force the anchor .tmp write to fail: pre-create a directory at the exact
+    # .tmp path _loki_advance_tracked_since_anchor writes to.
+    mkdir -p .loki/state/tracked-since.sha.tmp
+    # Real call site: _loki_record_session_created calls
+    # _loki_advance_tracked_since_anchor internally.
+    _LOKI_SNAPSHOT_THIS_RUN=1 _loki_record_session_created >/dev/null 2>&1
+    marker_kept="$([ -f .loki/state/turn-in-flight ] && echo yes || echo no)"
+    anchor_unchanged="$([ "$(cat .loki/state/tracked-since.sha 2>/dev/null)" = "$stale_anchor" ] && echo yes || echo no)"
+    rmdir .loki/state/tracked-since.sha.tmp 2>/dev/null || true
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
+    off_tip="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'MARKERKEPT=%s ANCHORUNCHANGED=%s DISCLOSED=%s OFFTIP=%s ONDISK=%s AGENT2=%s' \
+        "$marker_kept" "$anchor_unchanged" "$disclosed" "$off_tip" "$on_disk" "$agent2"
+)"
+if [ "$out68w" = "MARKERKEPT=yes ANCHORUNCHANGED=yes DISCLOSED=yes OFFTIP=no ONDISK=yes AGENT2=yes" ]; then
+    pass "a failed anchor write leaves turn-in-flight set; the stale anchor never launders the mid-turn commit, still disclosed and off the tip"
+else
+    fail "REGRESSION: a failed anchor write cleared turn-in-flight anyway, letting the stale anchor prune a mid-turn commit silently" "got: $out68w"
+fi
+
+# =============================================================================
 # MUTATION CHECK (non-vacuity proof for the BACKLOG 68 rework): remove the
 # in-flight-marker check from _loki_tracked_by_user_since_anchor in a COPY of
 # BRANCH_LIB (so the anchor alone, without the marker, gates pruning) and
