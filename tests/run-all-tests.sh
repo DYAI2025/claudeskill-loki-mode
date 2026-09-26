@@ -624,6 +624,8 @@ run_test "Council Contrarian Transcript Fields" "$SCRIPT_DIR/test-council-contra
 run_test "Bugfix Audit (CLI regressions)" "$SCRIPT_DIR/test-bugfix-audit.sh"
 run_test "CLAUDE.md Walker (project graph layers)" "$SCRIPT_DIR/test-claude-md-walker.sh"
 run_test "CI Command (--fail-on thresholds)" "$SCRIPT_DIR/test-ci-command.sh"
+run_test "CI report body via stdin, not argv (BACKLOG 25)" "$SCRIPT_DIR/test-ci-report-argmax.sh"
+run_test "CI JSON payloads via temp file/stdin, not exported env vars (BACKLOG 25)" "$SCRIPT_DIR/test-ci-json-argmax.sh"
 
 # Batch 7 of the orphaned-suite registration (2026-07-27).
 run_test "Report Command" "$SCRIPT_DIR/test-report-command.sh"
