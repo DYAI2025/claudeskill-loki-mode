@@ -42,6 +42,7 @@ interact and why hitting one is a failure rather than a success.
 | `LOKI_MAX_TIER` | unlimited | Caps model tier, so a run cannot escalate past what you are willing to pay for. |
 | `LOKI_MODEL_OVERRIDE` | unset | Overrides the resolved model outright. |
 | `LOKI_TIER` | `oss` | **Not a model setting.** The open-core licensing seam. Leave it unset. |
+| `LOKI_ALLOW_CLAUDE_SIDECALLS` | unset | `1` (exactly) lets PRD enrichment, done recognition, the council voters, the USAGE.md refresh and the quickstart intent check prompt the `claude` CLI under a non-claude provider; `loki doctor --airgap` then reports that as required egress to Anthropic. |
 
 ### Picking a model without naming one
 

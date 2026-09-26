@@ -13306,6 +13306,19 @@ _loki_airgap_audit() {
             ;;
     esac
 
+    # LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine side-calls prompt the claude
+    # CLI under another provider: inference to Anthropic whatever the model.
+    # Same policy helper the side-call sites use (providers/loader.sh).
+    local sidecall_required="no" sidecall_host="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+    type loki_claude_sidecall_allowed >/dev/null 2>&1 \
+        || . "$_LOKI_SCRIPT_DIR/../providers/loader.sh" 2>/dev/null
+    if [ "$provider" != "claude" ] && command -v claude >/dev/null 2>&1 \
+       && loki_claude_sidecall_allowed "$provider" 2>/dev/null; then
+        sidecall_required="yes"
+    fi
+    local blocked="$model_required"
+    [ "$sidecall_required" = "yes" ] && blocked="yes"
+
     # Optional egress, each individually disableable.
     # Telemetry: the same gate main() used to send this command's own event.
     # It is ON by default for an individual interactive install, so a
@@ -13321,6 +13334,7 @@ _loki_airgap_audit() {
     if [ "$as_json" = "true" ]; then
         _AG_PROV="$provider" _AG_PSRC="$provider_src" _AG_HOST="$model_host" _AG_REQ="$model_required" \
         _AG_NOTE="$model_note" _AG_TEL="$tel_state" _AG_TELHOST="$tel_host" _AG_UPD="$upd_state" \
+        _AG_SC="$sidecall_required" _AG_SCHOST="$sidecall_host" \
         python3 -c '
 import json, os
 req = os.environ["_AG_REQ"] == "yes"
@@ -13343,6 +13357,14 @@ egress = [{
     "enabled": os.environ["_AG_UPD"] == "on",
     "disable": "export LOKI_NO_UPDATE_CHECK=1",
 }]
+if os.environ["_AG_SC"] == "yes":
+    egress.append({
+        "name": "claude_sidecalls",
+        "host": os.environ["_AG_SCHOST"],
+        "required": True,
+        "disable": "unset LOKI_ALLOW_CLAUDE_SIDECALLS",
+        "note": "LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine steps prompt the claude CLI under this provider",
+    })
 blockers = [e for e in egress if e.get("required")]
 print(json.dumps({
     "provider": os.environ["_AG_PROV"],
@@ -13361,7 +13383,7 @@ print(json.dumps({
     }],
 }, indent=2))
 '
-        [ "$model_required" = "yes" ] && return 1
+        [ "$blocked" = "yes" ] && return 1
         return 0
     fi
 
@@ -13376,6 +13398,10 @@ print(json.dumps({
         echo -e "  ${GREEN}none${NC}      model inference -> $model_host"
     fi
     echo "            $model_note"
+    if [ "$sidecall_required" = "yes" ]; then
+        echo -e "  ${YELLOW}REQUIRED${NC}  claude side-calls -> $sidecall_host"
+        echo "            LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine steps prompt the claude CLI under $provider."
+    fi
     echo -e "  optional  telemetry           [$tel_state]  -> $tel_host"
     echo "            disable: loki telemetry off, DO_NOT_TRACK=1, or LOKI_AIRGAP=true (on by default for interactive installs)"
     echo -e "  optional  update check        [$upd_state]  disable: export LOKI_NO_UPDATE_CHECK=1"
@@ -13388,9 +13414,16 @@ print(json.dumps({
     echo "  delegate PR       git push and gh pr create to your remote after a successful run,"
     echo "                    when gh is installed. disable: LOKI_DELEGATE_PR=0"
     echo ""
+    if [ "$sidecall_required" = "yes" ] && [ "$model_required" != "yes" ]; then
+        echo -e "${YELLOW}Not air-gap ready in this configuration.${NC}"
+        echo "  One required egress remains: claude side-calls."
+        echo "  To close it: unset LOKI_ALLOW_CLAUDE_SIDECALLS"
+        return 1
+    fi
     if [ "$model_required" = "yes" ]; then
         echo -e "${YELLOW}Not air-gap ready in this configuration.${NC}"
         echo "  One required egress remains: model inference."
+        [ "$sidecall_required" = "yes" ] && echo "  (Also unset LOKI_ALLOW_CLAUDE_SIDECALLS: claude side-calls are required egress too.)"
         echo "  To close it, serve the model locally:"
         echo "    loki provider set opencode"
         echo "    export LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder"
@@ -14471,9 +14504,9 @@ for _sk_name, _sk_rel, _sk_id in _SKILL_ENTRIES:
         # islink is true for a DANGLING link (lstat-based), which is exactly
         # the broken case the text path reports. fail only for the effective
         # provider; otherwise warn, matching the text path badge for badge.
-        # `required` stays 'required' in both arms: an absent link has always
+        # 'required' stays 'required' in both arms: an absent link has always
         # been warn+required, so the warn arm introduces no new shape, and a
-        # consumer keys on `status`.
+        # consumer keys on 'status'.
         _sk_blocking = bool(_sk_selected) and _sk_id == _sk_selected
         skills.append({'name': _sk_name, 'path': _sk_json_path,
                        'status': 'fail' if _sk_blocking else 'warn',

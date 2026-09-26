@@ -79,6 +79,14 @@ set -uo pipefail
 #       probe's own prompt is recorded. The opt-in Bun loop (LOKI_SDK_LOOP=1)
 #       is not covered.
 #
+#   P5.claude-sidecall-opt-in-audited
+#       The escape hatch is explicit and audited: LOKI_ALLOW_CLAUDE_SIDECALLS=1
+#       (exact value; "true" does not count) restores every probed side-call
+#       under opencode, and `doctor --airgap` on both routes then lists
+#       claude_sidecalls as REQUIRED egress and is not ready. Control: the same
+#       audit without the variable IS ready. Unset => 0 prompts is pinned by
+#       P5.local-provider-no-claude-sidecalls.
+#
 # Every audit runs from a clean temp project dir, so a .loki/ in the caller's
 # checkout cannot change a verdict.
 #
@@ -96,7 +104,7 @@ export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=tru
 MOAT_START=$(date +%s)
 MOAT_MAIN_PID=$$
 MOAT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/moat-p5.XXXXXX")" || { echo "p5: mktemp failed" >&2; exit 1; }
-MOAT_IDS="P5.egress-blocked-start-seal-verify P5.airgap-audit-honest P5.airgap-audit-default-route P5.airgap-audit-per-provider-model P5.airgap-audit-effective-provider P5.airgap-audit-telemetry-state P5.airgap-audit-ollama-cloud-not-local P5.local-provider-no-claude-sidecalls"
+MOAT_IDS="P5.egress-blocked-start-seal-verify P5.airgap-audit-honest P5.airgap-audit-default-route P5.airgap-audit-per-provider-model P5.airgap-audit-effective-provider P5.airgap-audit-telemetry-state P5.airgap-audit-ollama-cloud-not-local P5.local-provider-no-claude-sidecalls P5.claude-sidecall-opt-in-audited"
 MOAT_EMITTED=" "
 MOAT_PGIDS=""
 
@@ -433,12 +441,12 @@ airgap() {  # <route> <out> [VAR=value ...]
     (
         cd "$AG_CWD" || exit 97
         env -u OPENAI_BASE_URL -u OPENROUTER_API_KEY -u LOKI_OPENCODE_MODEL -u LOKI_AIDER_MODEL -u LOKI_CLINE_MODEL \
-            -u ANTHROPIC_BASE_URL -u LOKI_LEGACY_BASH -u LOKI_TELEMETRY -u LOKI_DIR \
+            -u ANTHROPIC_BASE_URL -u LOKI_LEGACY_BASH -u LOKI_TELEMETRY -u LOKI_DIR -u LOKI_ALLOW_CLAUDE_SIDECALLS \
             HOME="$MOAT_TMP/home" LOKI_PROVIDER=opencode ${legacy:+"$legacy"} "$@" \
             "$LOKI_BIN" doctor --airgap --json >"$out" 2>"$out.err"
         printf '%s' "$?" > "$out.rc"
         env -u OPENAI_BASE_URL -u OPENROUTER_API_KEY -u LOKI_OPENCODE_MODEL -u LOKI_AIDER_MODEL -u LOKI_CLINE_MODEL \
-            -u ANTHROPIC_BASE_URL -u LOKI_LEGACY_BASH -u LOKI_TELEMETRY -u LOKI_DIR \
+            -u ANTHROPIC_BASE_URL -u LOKI_LEGACY_BASH -u LOKI_TELEMETRY -u LOKI_DIR -u LOKI_ALLOW_CLAUDE_SIDECALLS \
             HOME="$MOAT_TMP/home" LOKI_PROVIDER=opencode ${legacy:+"$legacy"} "$@" \
             "$LOKI_BIN" doctor --airgap >"$out.txt" 2>&1
     )
@@ -575,16 +583,19 @@ case_airgap_telemetry_state() {
     done
 }
 
-# With opencode selected, nothing may prompt the claude CLI.
-case_no_claude_sidecalls() {
+# Side-call fixtures, shared by the two side-call cases: a recording stub
+# claude, a stub opencode provider, a fixture repo and the invoker probe.
+SC_S="$MOAT_TMP/sc" SC_SB="$MOAT_TMP/sc/bin" SC_CL="$MOAT_TMP/sc/claude.log" SC_OL="$MOAT_TMP/sc/opencode.log"
+SC_READY=""
+sc_setup() {
+    [ -n "$SC_READY" ] && return 0
     [ -n "$EGRESS_MECH" ] || detect_egress_block
     if [ -z "$EGRESS_MECH" ]; then
         nok "prerequisite missing: egress sandbox (the stub claude is only trusted inside the block)"
-        return
+        return 1
     fi
-    local S="$MOAT_TMP/sc" SB="$MOAT_TMP/sc/bin" CL="$MOAT_TMP/sc/claude.log" OL="$MOAT_TMP/sc/opencode.log"
-    mkdir -p "$S/work" "$SB" "$S/home"
-    : > "$CL"; : > "$OL"
+    mkdir -p "$SC_S/work" "$SC_SB" "$SC_S/home"
+    : > "$SC_CL"; : > "$SC_OL"
     # Recording stub claude: logs every prompt call (-p); answers the local
     # --help / --version capability probes so the claude-only paths are live.
     {
@@ -592,16 +603,16 @@ case_no_claude_sidecalls() {
         printf 'case " $* " in *" -p "*) ;; *)\n'
         printf '    case "$1" in --version) echo "2.1.999 (Claude Code)" ;; *) echo "--agents --json-schema --output-format --bare --model -p --print" ;; esac\n'
         printf '    exit 0 ;;\nesac\n'
-        printf 'printf "CALL %%s\\n" "$(printf "%%s " "$@" | tr "\\n" " " | cut -c1-160)" >> %q\n' "$CL"
+        printf 'printf "CALL %%s\\n" "$(printf "%%s " "$@" | tr "\\n" " " | cut -c1-160)" >> %q\n' "$SC_CL"
         printf 'for a in "$@"; do last="$a"; done\n'
         printf '[ "$last" = "-" ] && cat >/dev/null\n'
         printf 'echo "# stub"\n'
-    } > "$SB/claude"
+    } > "$SC_SB/claude"
     # Stub opencode: the active provider. Completes through the signal file.
-    cat > "$SB/opencode" <<STUB
+    cat > "$SC_SB/opencode" <<STUB
 #!/usr/bin/env bash
 [ "\$1" = "--version" ] && { echo "0.0.0-moat-stub"; exit 0; }
-printf 'RUN\n' >> $(printf '%q' "$OL")
+printf 'RUN\n' >> $(printf '%q' "$SC_OL")
 for a in "\$@"; do prompt="\$a"; done
 case "\$prompt" in
     *"<loki_system>"*)
@@ -615,22 +626,22 @@ case "\$prompt" in
 esac
 echo "stub opencode done."
 STUB
-    chmod +x "$SB/claude" "$SB/opencode"
+    chmod +x "$SC_SB/claude" "$SC_SB/opencode"
     # The council dispatch calls `timeout` with no fallback; without one the
     # positive control could not see that probe. A pass-through shim keeps it live.
     if ! command -v timeout >/dev/null 2>&1; then
-        printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$SB/timeout"
-        chmod +x "$SB/timeout"
+        printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$SC_SB/timeout"
+        chmod +x "$SC_SB/timeout"
     fi
-    if ! ( cd "$S/work" && git init -q && git config user.email moat@example.invalid \
+    if ! ( cd "$SC_S/work" && git init -q && git config user.email moat@example.invalid \
             && git config user.name moat && git config commit.gpgsign false \
             && printf '# PRD: Greeter\n\nBuild greet(name) in greeter.py returning "hello <name>".\n' > prd.md \
             && printf 'seed\n' > README.md && git add -A && git commit -qm init ) >/dev/null 2>&1; then
         nok "fixture repo setup failed"
-        return
+        return 1
     fi
     # Direct probes of the claude-only invokers, per LOKI_PROVIDER.
-    cat > "$S/probe.sh" <<'PROBE'
+    cat > "$SC_S/probe.sh" <<'PROBE'
 cd "$1" || exit 90
 export LOKI_PROVIDER="$2"
 log_info() { :; }; log_warn() { :; }; log_debug() { :; }; log_error() { :; }
@@ -649,57 +660,98 @@ echo "probe voters" >&2;      loki_council_dispatch_agents 1 "" >/dev/null 2>&1
 echo "probe quickstart" >&2;  _qs_classify_invoke "moat probe quickstart" >/dev/null 2>&1
 exit 0
 PROBE
-    local p n
-    for p in claude opencode; do
-        {
-            printf 'export HOME=%q PATH=%q\n' "$S/home" "$SB:$PATH"
-            printf 'export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9\n'
-            printf 'unset LOKI_SDK_PRD_ENRICH LOKI_SDK_DONE_RECOG LOKI_SDK_VOTER_AGENTS\n'
-            printf '[ "$(command -v claude)" = %q ] || { echo "claude resolves to $(command -v claude)" > %q; exit 0; }\n' "$SB/claude" "$S/probe-$p.ctl"
-            printf 'bash %q %q %q %q 2>%q\n' "$S/probe.sh" "$REPO_ROOT" "$p" "$S/council-$p" "$S/probe-$p.err"
-        } > "$S/probe-$p.run"
-        : > "$CL"
-        run_owned run_blocked "$S/probe-$p.run" >/dev/null 2>&1
-        if [ -s "$S/probe-$p.ctl" ]; then
-            nok "control: $(cat "$S/probe-$p.ctl") inside the block, not the stub"
-            return
-        fi
-        n="$(grep -c '^CALL' "$CL")"
-        if [ "$p" = claude ]; then
-            # Positive control, per invoker: each one's own prompt reached claude.
-            local marker
-            for marker in "moat probe prd-enrich" "moat probe done-recognition" "Loki council iteration" "moat probe quickstart"; do
-                grep -q -F "$marker" "$CL" || nok "control: with LOKI_PROVIDER=claude no claude call carried '$marker' (that probe cannot see a call)"
-            done
-        else
-            [ "$n" = 0 ] || nok "LOKI_PROVIDER=opencode: claude-only invokers still prompted the claude CLI $n time(s): $(cut -c1-60 "$CL" | tr '\n' '|')"
-        fi
+    SC_READY=1
+}
+
+# sc_probe <label> <provider> [VAR=value ...]: run the four invoker probes under
+# the block, the recording log left in $SC_CL. Returns 1 (and records it) when
+# `claude` does not resolve to the stub inside the block.
+sc_probe() {
+    local label="$1" p="$2"
+    shift 2
+    {
+        printf 'export HOME=%q PATH=%q\n' "$SC_S/home" "$SC_SB:$PATH"
+        printf 'export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9\n'
+        printf 'unset LOKI_SDK_PRD_ENRICH LOKI_SDK_DONE_RECOG LOKI_SDK_VOTER_AGENTS LOKI_ALLOW_CLAUDE_SIDECALLS\n'
+        [ $# -gt 0 ] && printf 'export %s\n' "$(printf '%q ' "$@")"
+        printf '[ "$(command -v claude)" = %q ] || { echo "claude resolves to $(command -v claude)" > %q; exit 0; }\n' "$SC_SB/claude" "$SC_S/probe-$label.ctl"
+        printf 'bash %q %q %q %q 2>%q\n' "$SC_S/probe.sh" "$REPO_ROOT" "$p" "$SC_S/council-$label" "$SC_S/probe-$label.err"
+    } > "$SC_S/probe-$label.run"
+    : > "$SC_CL"
+    rm -f "$SC_S/probe-$label.ctl"
+    run_owned run_blocked "$SC_S/probe-$label.run" >/dev/null 2>&1
+    if [ -s "$SC_S/probe-$label.ctl" ]; then
+        nok "control: $(cat "$SC_S/probe-$label.ctl") inside the block, not the stub"
+        return 1
+    fi
+}
+# sc_each_invoker_called <context>: each invoker's own prompt reached claude.
+sc_each_invoker_called() {
+    local marker
+    for marker in "moat probe prd-enrich" "moat probe done-recognition" "Loki council iteration" "moat probe quickstart"; do
+        grep -q -F "$marker" "$SC_CL" || nok "$1: no claude call carried '$marker'"
     done
+}
+
+# With opencode selected, nothing may prompt the claude CLI.
+case_no_claude_sidecalls() {
+    sc_setup || return
+    local n
+    # Positive control, per invoker: each one's own prompt reaches claude.
+    sc_probe claude claude || return
+    sc_each_invoker_called "control: with LOKI_PROVIDER=claude (that probe cannot see a call)"
+    sc_probe opencode opencode || return
+    n="$(grep -c '^CALL' "$SC_CL")"
+    [ "$n" = 0 ] || nok "LOKI_PROVIDER=opencode: claude-only invokers still prompted the claude CLI $n time(s): $(cut -c1-60 "$SC_CL" | tr '\n' '|')"
     # E2E: a default start on opencode with an ollama/ model, under the block.
-    : > "$CL"
+    : > "$SC_CL"
     {
         printf 'set -u\n'
-        printf 'export HOME=%q PATH=%q TMPDIR=%q\n' "$S/home" "$SB:$PATH" "${TMPDIR:-/tmp}"
+        printf 'export HOME=%q PATH=%q TMPDIR=%q\n' "$SC_S/home" "$SC_SB:$PATH" "${TMPDIR:-/tmp}"
         printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=0 LOKI_DASHBOARD=false\n'
         printf 'export LOKI_PROVIDER=opencode LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder LOKI_MAX_ITERATIONS=2 LOKI_COMPLETION_PROMISE=MOAT_P5_COMPLETE LOKI_AUTO_CONFIRM=true\n'
         printf 'export LOKI_SKIP_PREREQS=true LOKI_PHASE_CODE_REVIEW=false LOKI_COUNCIL_ENABLED=false LOKI_APP_RUNNER=false\n'
         printf 'export LOKI_NO_NEW_SESSION=1 LOKI_SKIP_NET_PREFLIGHT=1 LOKI_RESOURCE_CHECK_INTERVAL=2\n'
         printf 'export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9 NO_PROXY= no_proxy=\n'
-        printf 'unset LOKI_LEGACY_BASH LOKI_SDK_LOOP LOKI_SDK_MODE LOKI_SDK_PRD_ENRICH\n'
-        printf '[ "$(command -v claude)" = %q ] || { echo "claude resolves to $(command -v claude)" > %q; exit 0; }\n' "$SB/claude" "$S/e2e.ctl"
-        printf 'cd %q || exit 41\n' "$S/work"
-        printf '%s 150 %q start ./prd.md >%q 2>&1\n' "$DEADLINE_CMD" "$LOKI_BIN" "$S/start.out"
-        printf 'echo $? >%q\n' "$S/start.rc"
-    } > "$S/e2e.sh"
-    run_owned run_blocked "$S/e2e.sh" >/dev/null 2>"$S/e2e.err"
-    if [ -s "$S/e2e.ctl" ]; then
-        nok "control: $(cat "$S/e2e.ctl") inside the block, not the stub"
+        printf 'unset LOKI_LEGACY_BASH LOKI_SDK_LOOP LOKI_SDK_MODE LOKI_SDK_PRD_ENRICH LOKI_ALLOW_CLAUDE_SIDECALLS\n'
+        printf '[ "$(command -v claude)" = %q ] || { echo "claude resolves to $(command -v claude)" > %q; exit 0; }\n' "$SC_SB/claude" "$SC_S/e2e.ctl"
+        printf 'cd %q || exit 41\n' "$SC_S/work"
+        printf '%s 150 %q start ./prd.md >%q 2>&1\n' "$DEADLINE_CMD" "$LOKI_BIN" "$SC_S/start.out"
+        printf 'echo $? >%q\n' "$SC_S/start.rc"
+    } > "$SC_S/e2e.sh"
+    run_owned run_blocked "$SC_S/e2e.sh" >/dev/null 2>"$SC_S/e2e.err"
+    if [ -s "$SC_S/e2e.ctl" ]; then
+        nok "control: $(cat "$SC_S/e2e.ctl") inside the block, not the stub"
         return
     fi
-    [ -s "$OL" ] || { nok "control: the stub opencode provider never ran (start rc=$(cat "$S/start.rc" 2>/dev/null); $(tail -1 "$S/start.out" 2>/dev/null))"; return; }
-    n="$(grep -c '^CALL' "$CL")"
-    [ "$n" = 0 ] || nok "loki start on opencode prompted the claude CLI $n time(s): $(cut -c1-60 "$CL" | tr '\n' '|')"
-    log "sidecalls e2e: start rc=$(cat "$S/start.rc" 2>/dev/null), opencode runs=$(grep -c RUN "$OL"), claude prompts=$n"
+    [ -s "$SC_OL" ] || { nok "control: the stub opencode provider never ran (start rc=$(cat "$SC_S/start.rc" 2>/dev/null); $(tail -1 "$SC_S/start.out" 2>/dev/null))"; return; }
+    n="$(grep -c '^CALL' "$SC_CL")"
+    [ "$n" = 0 ] || nok "loki start on opencode prompted the claude CLI $n time(s): $(cut -c1-60 "$SC_CL" | tr '\n' '|')"
+    log "sidecalls e2e: start rc=$(cat "$SC_S/start.rc" 2>/dev/null), opencode runs=$(grep -c RUN "$SC_OL"), claude prompts=$n"
+}
+
+# LOKI_ALLOW_CLAUDE_SIDECALLS=1 (exact) restores the side-calls, and the audit
+# then counts them as required egress, so it can never read air-gap ready.
+case_sidecall_opt_in() {
+    sc_setup || return
+    local route out
+    sc_probe optin-true opencode LOKI_ALLOW_CLAUDE_SIDECALLS=true || return
+    [ "$(grep -c '^CALL' "$SC_CL")" = 0 ] || nok "LOKI_ALLOW_CLAUDE_SIDECALLS=true (not exactly 1) still let a side-call prompt claude"
+    sc_probe optin opencode LOKI_ALLOW_CLAUDE_SIDECALLS=1 || return
+    sc_each_invoker_called "LOKI_PROVIDER=opencode LOKI_ALLOW_CLAUDE_SIDECALLS=1"
+    for route in default bash; do
+        out="$MOAT_TMP/ag-optin-$route-on"
+        airgap "$route" "$out" PATH="$SC_SB:$PATH" LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder LOKI_ALLOW_CLAUDE_SIDECALLS=1
+        [ "$(airgap_ready "$out")" = "false" ] || nok "$route: audit reports airgap_ready=$(airgap_ready "$out") with the side-call opt-in set and claude on PATH"
+        [ "$(ag_field "$out" '"claude_sidecalls" in d["required_egress"]')" = "True" ] || nok "$route: audit JSON does not list claude_sidecalls as required egress"
+        [ "$(cat "$out.rc")" != "0" ] || nok "$route: audit exits 0 with the side-call opt-in set"
+        ! grep -q 'Air-gap ready' "$out.txt" || nok "$route: text audit claims 'Air-gap ready' with the side-call opt-in set"
+        grep -q 'REQUIRED.*claude side-calls' "$out.txt" || nok "$route: text audit does not name claude side-calls as REQUIRED"
+        # Control: the same configuration without the opt-in IS ready.
+        out="$MOAT_TMP/ag-optin-$route-off"
+        airgap "$route" "$out" PATH="$SC_SB:$PATH" LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder
+        [ "$(airgap_ready "$out")" = "true" ] || nok "$route: control: without the opt-in the same configuration is not ready ($(airgap_ready "$out"))"
+    done
 }
 
 # An Ollama cloud model is remote inference through the local daemon.
@@ -750,4 +802,7 @@ moat_run "P5.airgap-audit-ollama-cloud-not-local" \
 moat_run "P5.local-provider-no-claude-sidecalls" \
     "with opencode selected, no prompt reaches the claude CLI on PATH (bash-route start under the egress block, plus PRD-enrichment, done-recognition, council and quickstart probes)" \
     case_no_claude_sidecalls
+moat_run "P5.claude-sidecall-opt-in-audited" \
+    "LOKI_ALLOW_CLAUDE_SIDECALLS=1 (exact) restores the claude side-calls under opencode, and doctor --airgap (both routes) then reports them as required egress" \
+    case_sidecall_opt_in
 exit 0
