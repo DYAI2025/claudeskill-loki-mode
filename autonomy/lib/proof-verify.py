@@ -968,6 +968,16 @@ def drift_unverifiable(result):
     OTHER check to have passed before honoring a None here keeps a real
     failure from being laundered into "could not check". Any check added
     later that is not explicitly listed here defaults to exit 1, never 2.
+
+    Known ceiling (not a new regression): this allowlist only covers a
+    genuinely unmeasurable check. A forger who re-hashes the receipt after
+    stripping base_sha, tree_sha256, and the diff stat produces a receipt
+    that passes hash_ok and every other listed check, then reaches this
+    function with the same unresolvable-drift signature as an honest
+    outside-the-repo verification -- so it also exits 2 ("could not check"),
+    not 1 ("failed"). `ok` stays False either way, so nothing here reports
+    VERIFIED; the ceiling is only that a deliberately stripped receipt and an
+    honestly unverifiable one are not distinguished from each other.
     """
     if result.get("ok"):
         return False
