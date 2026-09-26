@@ -59,12 +59,20 @@ mkdir -p "$REPO_DIR"
 # is larger per finding (quotes, keys, indentation) than the raw exported
 # value that actually has to clear execve()'s limit. Sizing off the JSON
 # output undercounts the true crash threshold, so this uses the raw-string
-# rate: 16,000 findings clears ARG_MAX (typically 1 MiB) on the raw export
-# with real margin. This is close to the 20,000-line fixture that reproduced
-# the original crash; it is not reduced further because cutting it enough to
-# matter for runtime (order 6,000) was measured to fall UNDER the raw-export
-# threshold and produce a false pass against the unfixed code.
-FINDING_COUNT=16000
+# rate.
+#
+# FINDING_COUNT is derived from the MEASURED ARG_MAX on whatever machine
+# runs this test, not a fixed constant: a fixture sized for macOS's ~1 MiB
+# ARG_MAX (16,000 findings, ~1.15 MB raw) silently under-shoots Linux CI's
+# ~4 MiB ARG_MAX (measured: getconf ARG_MAX 4194304 on the GitHub Actions
+# ubuntu runner), so the raw export never actually exceeds the ceiling
+# there and the crash this test exists to catch goes unexercised -- exactly
+# how a fixture this size passed locally and then still failed to prove
+# anything on CI. 2x margin over the measured ARG_MAX, ~72 bytes/finding.
+_argmax_for_sizing="$ARG_MAX"
+case "$_argmax_for_sizing" in '' | 0 | *[!0-9]*) _argmax_for_sizing=1048576 ;; esac
+FINDING_COUNT=$(( (_argmax_for_sizing * 2) / 72 ))
+[ "$FINDING_COUNT" -lt 16000 ] && FINDING_COUNT=16000
 (
     cd "$REPO_DIR" || exit 1
     python3 -c "

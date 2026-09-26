@@ -8,7 +8,6 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOKI="$SCRIPT_DIR/../autonomy/loki"
-VERSION_FILE="$SCRIPT_DIR/../VERSION"
 
 PASS=0
 FAIL=0
@@ -179,9 +178,13 @@ test_source "BUG-CMD-001: web wildcard case has shift before the start path" \
 # -------------------------------------------
 # BUG-CMD-002: cmd_ci --test-suggest never exports LOKI_CI_CHANGED_FILES
 # Fix: Add export before Python heredoc
+# Superseded by BACKLOG 25 (ARG_MAX): the changed-files list is diff-
+# proportional, so it now goes through a temp file/argv instead of an
+# exported env var, which shares the same ARG_MAX ceiling. See
+# tests/test-ci-json-argmax.sh for the crash this closes.
 # -------------------------------------------
-test_source "BUG-CMD-002: LOKI_CI_CHANGED_FILES is exported before test suggest" \
-    'export LOKI_CI_CHANGED_FILES="\$changed_files"'
+test_source_absent "BUG-CMD-002: LOKI_CI_CHANGED_FILES no longer exported (ARG_MAX, BACKLOG 25)" \
+    'export LOKI_CI_CHANGED_FILES='
 
 # -------------------------------------------
 # BUG-CMD-006: cmd_telemetry has Python code injection
@@ -251,8 +254,12 @@ test_source "BUG-CLI-013: dashboard uses HTTP health check" \
 # -------------------------------------------
 # BUG-CMD-003: cmd_ci github format missing LOKI_CI_TEST_SUGG export
 # Fix: Export before Python heredoc
+# Superseded by BACKLOG 25 (ARG_MAX): test-suggestion text is
+# diff-proportional, so it now goes over stdin instead of an exported env
+# var, which shares the same ARG_MAX ceiling. See
+# tests/test-ci-json-argmax.sh for the crash this closes.
 # -------------------------------------------
-test_source "BUG-CMD-003: LOKI_CI_TEST_SUGG exported in github format" \
+test_source_absent "BUG-CMD-003: LOKI_CI_TEST_SUGG no longer exported (ARG_MAX, BACKLOG 25)" \
     'export LOKI_CI_TEST_SUGG='
 
 # -------------------------------------------
