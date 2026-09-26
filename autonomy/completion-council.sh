@@ -219,13 +219,22 @@ council_augment_from_managed_memory() {
         return 0
     fi
     local target_dir="${TARGET_DIR:-.}"
-    local project_dir="${PROJECT_DIR:-$(pwd)}"
+    # D7: never fall back to the cwd. The council runs with cwd inside the
+    # agent's own repo, which can ship its own memory/managed_memory package
+    # that shadows the real one -- `${PROJECT_DIR:-$(pwd)}` would `cd` into
+    # that repo and `python3 -m memory.managed_memory.retrieve` would import
+    # the agent's module (BACKLOG 63). PROJECT_DIR must be explicit; unset ->
+    # skip augmentation (silent no-op, same as the flags-off path above).
+    if [ -z "${PROJECT_DIR:-}" ]; then
+        return 0
+    fi
+    local project_dir="$PROJECT_DIR"
     local out_file="$target_dir/.loki/managed/council-augment.txt"
     mkdir -p "$target_dir/.loki/managed" 2>/dev/null || true
     (
         cd "$project_dir" 2>/dev/null && \
         LOKI_TARGET_DIR="$target_dir" \
-        timeout 5 python3 -m memory.managed_memory.retrieve \
+        timeout 5 python3 -E -m memory.managed_memory.retrieve \
             --query "completion-council verdict context" --top-k 3 \
             > "$out_file" 2>/dev/null || true
     ) || true
