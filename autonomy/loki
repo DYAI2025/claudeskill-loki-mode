@@ -778,6 +778,30 @@ loki_remote_fetch_receipt() {
 # UNSIGNED there would be a false statement about the receipt (it IS signed),
 # and saying VERIFIED would be a false statement about this machine (it checked
 # nothing). It gets its own line and never claims verification.
+# Resolve a tool name to an absolute path, rejecting any PATH entry that is
+# not itself absolute. A bare "" component in PATH (what "export PATH=x:$PATH"
+# on an unset variable leaves, or an accidental "PATH=":$PATH"") is treated by
+# the shell as the current directory, and so is "."; but ANY other relative
+# entry (a bare "bin", "./tools", "../x") resolves against the verifier's cwd
+# just as unsafely, so all of them are rejected the same way, not just those
+# two literal strings. An unscoped `command -v python3`/`gpg`/`git` on a verify
+# path can otherwise resolve to a committed shim sitting in the checkout being
+# verified. Prints nothing (never a relative name) when no real binary is on
+# a real (absolute) PATH entry, so callers fail closed the same way
+# `command -v` failing does.
+loki_verify_tool_path() {
+    local name="$1" dir
+    local IFS=:
+    for dir in $PATH; do
+        case "$dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        [ -x "$dir/$name" ] && [ ! -d "$dir/$name" ] && { printf '%s\n' "$dir/$name"; return 0; }
+    done
+    return 1
+}
+
 # Ask gpg WHY a signature failed. Echoes "nopubkey" when the signing key is
 # absent (uncheckable), "" otherwise (a genuinely bad signature, or we could
 # not tell). Fails toward "" so an unclear answer keeps the loud TAMPERED
@@ -33437,6 +33461,21 @@ cmd_canary() {
         echo "loki outcomes canary: installed tool is unavailable: $tool_name" >&2
         return 2
     fi
+    if [ "$subcommand" = "verify" ]; then
+        # D7: this is a verify path. -E stops PYTHONPATH (an empty component
+        # would add the cwd as an absolute path) and a committed
+        # sitecustomize.py from acting before the tool runs. python3 is
+        # resolved to an absolute path first so an empty PATH component (or a
+        # relative one) cannot let a committed python3 shim in the checkout
+        # being verified answer in its place.
+        local py3
+        py3="$(loki_verify_tool_path python3)" || {
+            echo "loki outcomes canary verify: python3 is unavailable" >&2
+            return 2
+        }
+        "$py3" -E "$tool" "$@"
+        return $?
+    fi
     python3 "$tool" "$@"
 }
 
@@ -36680,7 +36719,23 @@ PYEOF
             if command -v jq &>/dev/null; then
                 jq . "$pj"
             else
-                LOKI_PROOF_JSON="$pj" python3 -c "import json,os; print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))"
+                # D7: this is a verify-adjacent read of proof.json. -E stops
+                # PYTHONPATH/sitecustomize.py from acting before this line, and
+                # python3 is resolved to an absolute path first so an empty
+                # PATH component cannot let a committed python3 shim in the
+                # checkout answer instead of the real interpreter. The cwd is
+                # dropped from sys.path before the real json/os import, so a
+                # committed json.py/os.py cannot answer either.
+                local _show_py3
+                _show_py3="$(loki_verify_tool_path python3)" || {
+                    echo -e "${RED}python3 is unavailable${NC}" >&2
+                    exit 2
+                }
+                LOKI_PROOF_JSON="$pj" "$_show_py3" -E -c "
+import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+import json, os
+print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
+"
             fi
             exit 0
             ;;
@@ -37002,6 +37057,13 @@ PYEOF
             local skip_confirm=0
             local visibility="--public"
             local hosted=0
+            # D7: every python3 invocation below reads proof.json from inside
+            # the checkout being shared. Resolve an absolute path once so an
+            # empty PATH component cannot let a committed python3 shim in that
+            # checkout answer instead of the real interpreter; each call site
+            # also runs -E and drops the cwd from sys.path.
+            local _share_py3
+            _share_py3="$(loki_verify_tool_path python3)" || _share_py3=""
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --yes|-y) skip_confirm=1; shift ;;
@@ -37057,8 +37119,11 @@ PYEOF
             echo ""
             echo "What will be shared:"
             echo "  - ${html}"
-            if [ -f "$pj" ]; then
-                LOKI_PROOF_JSON="$pj" python3 - <<'PYEOF' 2>/dev/null || true
+            if [ -f "$pj" ] && [ -n "$_share_py3" ]; then
+                LOKI_PROOF_JSON="$pj" "$_share_py3" -E - <<'PYEOF' 2>/dev/null || true
+# The cwd is the checkout being shared: drop it from sys.path before any
+# other import, or a committed json.py/os.py could answer this preview.
+import sys; sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import json, os
 try:
     d = json.load(open(os.environ["LOKI_PROOF_JSON"]))
@@ -37105,9 +37170,12 @@ PYEOF
             # Print a ready-to-post one-line hook (real cost + url) so the user
             # can paste it straight to X/HN. When cost was not collected, omit
             # the cost (never fabricate a number, never print "$0.00").
-            if [ -n "${LOKI_LAST_GIST_URL:-}" ] && [ -f "$pj" ]; then
+            if [ -n "${LOKI_LAST_GIST_URL:-}" ] && [ -f "$pj" ] && [ -n "$_share_py3" ]; then
                 local hook
-                hook=$(LOKI_PROOF_JSON="$pj" LOKI_GIST_URL="$LOKI_LAST_GIST_URL" python3 - <<'PYEOF' 2>/dev/null || true
+                hook=$(LOKI_PROOF_JSON="$pj" LOKI_GIST_URL="$LOKI_LAST_GIST_URL" "$_share_py3" -E - <<'PYEOF' 2>/dev/null || true
+# The cwd is the checkout being shared: drop it from sys.path before any
+# other import, or a committed json.py/os.py could answer this hook text.
+import sys; sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import json, os
 try:
     d = json.load(open(os.environ["LOKI_PROOF_JSON"]))
@@ -37183,7 +37251,10 @@ PYEOF
                 # The badge links to the gist we just published (no new egress).
                 # shields.io static/v1 query endpoint avoids structural hyphens.
                 local badge
-                badge=$(LOKI_PROOF_JSON="$pj" LOKI_GIST_URL="$LOKI_LAST_GIST_URL" python3 - <<'PYEOF' 2>/dev/null || true
+                badge=$(LOKI_PROOF_JSON="$pj" LOKI_GIST_URL="$LOKI_LAST_GIST_URL" "$_share_py3" -E - <<'PYEOF' 2>/dev/null || true
+# The cwd is the checkout being shared: drop it from sys.path before any
+# other import, or a committed json.py/os.py could answer this badge text.
+import sys; sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import json, os
 from urllib.parse import quote
 try:
