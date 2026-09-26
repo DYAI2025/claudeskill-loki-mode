@@ -150,3 +150,60 @@ Mac's ~1 MiB `ARG_MAX` and silently under-shot the GitHub Actions ubuntu
 runner's ~4 MiB `ARG_MAX`, so the crash the test exists to catch went
 unexercised there. `FINDING_COUNT` is now derived from the measured
 `ARG_MAX` at runtime, never a fixed constant. Fixed forward in `5c9d4373`.
+
+## PF-3 merged, S-11 merged, review-quorum bug caught and fixed (2026-09-26)
+
+PF-3 (repo-wide kill-by-name scan, 21 commits, 6 review rounds, unanimous
+2/2 final APPROVE) merged to main via `--no-ff` as `b539391d`. Its 9 new
+test files were found unregistered in `tests/run-all-tests.sh` (8 of 9
+missing entirely, 1 missing its executable bit); fixed in `6560ca95`,
+pushed `5b785b51..6560ca95`.
+
+S-11 (BACKLOG 42, `doctor --airgap` OLLAMA_HOST substring bug) reviewed
+unanimous 2/2 APPROVE, merged as `698ce1c8`, pushed.
+
+**Caught mid-session, before any harm:** dispatched 5 reviews (S-04, S-05,
+S-07, S-08, S-13) without a `model` parameter, so they silently inherited
+the session model instead of being pinned per-reviewer as D13 requires,
+and gave MEDIUM-tier slices (S-05/S-07/S-08/S-13) only 1 reviewer each
+instead of SWARM.md's required 2. Caught by the advisor before any verdict
+was acted on. All 5 stopped via TaskStop before returning a result;
+re-dispatched correctly (2 pinned reviewers for MEDIUM, 1 for LOW S-04)
+via a Workflow script. No slice was merged on an invalid quorum.
+
+PF-2 (P7 scanner, 5 rejected review rounds, whack-a-mole pattern) rebased
+onto current main (`2c69d301`) and re-dispatched at HIGH tier (3+1
+pinned) with a corrected scoping rule: a finding only blocks if it is a
+regression, false positive, or weakening introduced by THIS diff; a
+bypass shape pre-existing main's scanner also misses is a candidate for a
+new slice, never a veto. This is meant to end the infinite-loop failure
+mode where D12's unanimous-approval bar was being applied to "is this
+scanner perfect" instead of "is this diff a strict improvement."
+
+S-09 rejected 0/2 (both reviewers: the "behavioral" detector never reads
+the real captured prompt, always writes the checklist regardless of
+content -- a synthetic self-test, not a real behavioral check). Rework
+dispatched fresh from origin/main with both reproductions and instructed
+to either land a genuinely causal check or honestly rescope the claim.
+
+S-18 correctly reported BLOCKED: GF-3 (unmerged, HIGH tier, in review)
+has already substantially rewritten `tests/moat/p9-rule-of-two.sh`
+(974/-227 vs the 642-line file S-18 would extend), so building against
+main's current structure would be throwaway work. Confirmed GF-3 does not
+already cover BACKLOG 44 (no credential-file scan exists in it). Needs
+GF-3 merged first.
+
+S-01 and S-12 were listed "merged, local" / "awaiting release window" on
+BOARD.md -- verified both SHAs are already ancestors of origin/main;
+those notes were stale and corrected.
+
+Applied the same BACKLOG-26 disk-tolerance fix S-04 found in
+`bun-parity.yml` to its `scripts/local-ci.sh` twin (same stale
+floor-only normalization, deferred to the full tier so it doesn't gate
+every push but can flake a `LOCAL_CI_TIER=full` run). Committed `d78341a1`.
+
+Still open: S-07's report flags that `loki-ts/src/runner/council.ts` was
+never checked for the same runner/status ordering bug -- needs its own
+slice. GF-2/GF-3/GF-4 have sat in "review" status with no reviewer
+assigned all session; they are the only items that would move the moat
+off 2 of 9 proven.
