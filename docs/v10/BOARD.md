@@ -12,11 +12,18 @@ merge (all touch trust-core or security-relevant surfaces), oldest first.
 
 | ID | Owner | Branch @ SHA | File set (summary) | Tier | Status | Notes |
 |---|---|---|---|---|---|---|
-| GF-1 | cycle-4 (main) | main @ d98592ca | cycle 4 + verdict fix + XSS fix + D8-D13 | HIGH | approved | Fast tier green (109/0) twice. Council round 4 killed mid-run (D13, model-pin bug) before relaunch; needs one clean HIGH round before this becomes v9.55.0. |
+| GF-1 | cycle-4 (main) | main @ 9cd51d1a | cycle 4 + verdict fix + XSS fix + pkill-scoping fix (D15) + D8-D14 | HIGH | review-blocked | Council round 4 finished 3 APPROVE / 1 CONCERN (blocking, P7 scanner gap: fallback/ternary/Array.of literal rows not caught). Fix dispatched to a worktree slice. Full council re-run required after (D12). |
 | GF-2 | P5 slice | worktree-agent-a2ff5f2304261e820 @ 7e5e303a | providers/loader.sh, autonomy/loki, bin/loki, docs/air-gapped.md, docs/enterprise/*, README.md, tests/moat/p5-*.sh, tests/test-doctor-json-sentrux.sh | HIGH | review | P5 PROVEN in worktree (9/9 cases). Not yet reviewed. Rebase onto GF-1's SHA before review. |
 | GF-3 | P9 slice | worktree-agent-a706097c126bd997f @ 7a92f848 | .github/workflows/*.yml, .github/actions/issue-to-pr, autonomy/run.sh (github_token wrap), loki-ts/src/runner/github_token.ts, tests/moat/p9-rule-of-two.sh | HIGH | review | P9 PROVEN in worktree (4/4 cases). Needs a validation PR (auto-merge OFF; see SWARM.md Captain step 6) BEFORE counting P9 proven on main, per the workflow-YAML-is-untested-locally rule. Ship alone (touches release.yml). |
 | GF-4 | P4 slice | worktree-agent-ab9323b385483298c @ 2282ff20 | providers/model_catalog.json, loki-ts/src/commands/start.ts, loki-ts/src/runner/providers.ts | MEDIUM | review | 2 of 4 P4 cases promoted (catalog, three-setups). Needs D10 recorded before merge (done, D10 is in DECISIONS.md). Rebase onto GF-1. |
 | GF-5 | verdict/security fix | worktree-agent-a9b8124e8cfc6809a @ 399e1f3a | web-app/src/components/EvidenceReceiptPanel.tsx, dashboard-ui/components/loki-audit-viewer.js, dashboard/audit.py, dashboard/server.py (get_proof), dashboard/auth.py | HIGH | merged | Cherry-picked onto main as 3a139d81 (GF-1 now includes it). This row is historical; do not re-review separately. |
+
+## Priority out-of-band fix (severity: kills unrelated user sessions)
+
+| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| PF-1 | pkill-scoping fix | main @ 9cd51d1a | autonomy/run.sh (kill_provider_child), tests/test-kill-provider-child-scoping.sh, docs/v10/DECISIONS.md (D15) | HIGH | review | Founder-reported: every loki-mode session ending via signal (supervisor signal, double Ctrl+C, Ctrl+C in perpetual mode) ran an unscoped `pkill -f` matching ANY process on the machine by command-line substring, terminating unrelated Claude Code sessions. Fixed to scope by process group. Dedicated HIGH-tier council launched (4 lenses, all models pinned). Ships as its own patch release ahead of the swarm queue once approved. |
+| PF-2 | P7 scanner gap fix | worktree (dispatched) | tests/moat/p7-no-fabricated-data.sh | HIGH | building | Round-4 blocking finding: P7.no-sample-data-panels cannot see literal rows used as a `||`/`??`/ternary fallback or via Array.of/Array.from. Dispatched to close GF-1's blocker. |
 
 ## Fixed on main already (not slices; recorded for PO context)
 
