@@ -310,12 +310,27 @@ else
     TOK_OWN="tok-own-$$-${RANDOM}-${RANDOM}"
     TOK_DECOY="tok-decoy-$$-${RANDOM}-${RANDOM}"
     OWN_PORT=$((60000 + (RANDOM % 3000)))
-    DECOY_TOK_PORT=$((63000 + (RANDOM % 3000)))
+    # round-5 fix: 63000 + (RANDOM % 3000) can reach 65999, above 65535 (the
+    # max valid TCP port) -- whenever RANDOM % 3000 >= 2536 (~15.5% of runs,
+    # confirmed against the theoretical rate and reproduced deterministically
+    # with a pinned out-of-range value), python3's socket.bind() raised an
+    # uncaught OverflowError and the decoy process died immediately. Silent
+    # (stderr was redirected to /dev/null), and NOT a timing issue: the perl
+    # wrapper still wrote its pidfile before exec either way, so the wait loop
+    # always broke fast regardless of outcome -- the earlier 4s/8s timing
+    # widening never touched this failure mode at all. Narrowed to keep the
+    # max at 64999, safely in range.
+    DECOY_TOK_PORT=$((63000 + (RANDOM % 2500)))
 
     # Own daemon: genuinely setsid'd (own session+pgid, ppid=1), carries
     # TOK_OWN in its environment -- exactly what _verify_runtime_teardown's
     # launch site now exports as LOKI_VERIFY_RUN_TOKEN for a real run.
+    # stderr goes to a per-fixture LOG file, not /dev/null: a silent
+    # subprocess death (the port-overflow bug above) is otherwise invisible,
+    # which is exactly what let that bug hide before. Surfaced below on setup
+    # failure so any future silent death is diagnosable instead of swallowed.
     OWN_PIDFILE="$WORK/setsid_own.pid"
+    OWN_LOG="$WORK/setsid_own.log"
     ( LOKI_VERIFY_RUN_TOKEN="$TOK_OWN" perl -e '
         use POSIX qw(setsid);
         setsid();
@@ -330,19 +345,21 @@ s.bind((\"127.0.0.1\", '"$OWN_PORT"'))
 s.listen(5)
 time.sleep(30)
 ");
-    ' "$OWN_PIDFILE" "$PY" >/dev/null 2>&1 & )
+    ' "$OWN_PIDFILE" "$PY" >"$OWN_LOG" 2>&1 & )
     i=0
-    # Wider budget (80x0.1s=8s vs the 4s used elsewhere in this file): this
-    # fixture does an extra exec() inside perl after setsid(), one step more
-    # than the other decoys, and was observed to occasionally need slightly
-    # longer under a loaded machine (confirmed as a timing flake, not a logic
-    # bug, by an immediate re-run passing cleanly).
-    while [ $i -lt 80 ]; do [ -s "$OWN_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+    # 4s budget (matches every other decoy in this file). The round-4 comment
+    # here previously claimed this needed widening to 8s for timing reasons;
+    # round 5 found the real bug (a port-overflow OverflowError killing the
+    # decoy outright, not a slow start) and confirmed via direct measurement
+    # that the pidfile write itself takes ~0.1s -- the wait loop was never
+    # the bottleneck. Reverted to 4s.
+    while [ $i -lt 40 ]; do [ -s "$OWN_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
     OWN_TOK_PID=$(cat "$OWN_PIDFILE" 2>/dev/null || true)
 
     # Decoy: genuinely setsid'd too, listening on a DIFFERENT port, carrying a
     # DIFFERENT token -- must survive a teardown call scoped to TOK_OWN.
     DECOY_PIDFILE="$WORK/setsid_decoy.pid"
+    DECOY_LOG="$WORK/setsid_decoy.log"
     ( LOKI_VERIFY_RUN_TOKEN="$TOK_DECOY" perl -e '
         use POSIX qw(setsid);
         setsid();
@@ -357,14 +374,14 @@ s.bind((\"127.0.0.1\", '"$DECOY_TOK_PORT"'))
 s.listen(5)
 time.sleep(30)
 ");
-    ' "$DECOY_PIDFILE" "$PY" >/dev/null 2>&1 & )
+    ' "$DECOY_PIDFILE" "$PY" >"$DECOY_LOG" 2>&1 & )
     i=0
-    while [ $i -lt 80 ]; do [ -s "$DECOY_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+    while [ $i -lt 40 ]; do [ -s "$DECOY_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
     DECOY_TOK_PID=$(cat "$DECOY_PIDFILE" 2>/dev/null || true)
 
     if [ -z "$OWN_TOK_PID" ] || ! kill -0 "$OWN_TOK_PID" 2>/dev/null \
        || [ -z "$DECOY_TOK_PID" ] || ! kill -0 "$DECOY_TOK_PID" 2>/dev/null; then
-        bad "setsid own/decoy token fixtures did not start (test setup broken, not the function under test)"
+        bad "setsid own/decoy token fixtures did not start or died immediately (test setup broken, not the function under test) -- own_log: $(cat "$OWN_LOG" 2>/dev/null | tr '\n' ' '); decoy_log: $(cat "$DECOY_LOG" 2>/dev/null | tr '\n' ' ')"
     else
         OWN_TOK_PGID="$(ps -o pgid= -p "$OWN_TOK_PID" 2>/dev/null | tr -d ' ')"
         OWN_TOK_PPID="$(ps -o ppid= -p "$OWN_TOK_PID" 2>/dev/null | tr -d ' ')"
