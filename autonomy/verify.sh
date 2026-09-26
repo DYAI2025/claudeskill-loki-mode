@@ -1974,8 +1974,30 @@ _verify_runtime_teardown() {
                     local _h_pgid="" _h_ppid=""
                     _h_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
                     _h_ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+                    # THIRD ARM (council round 2, REJECT reproduced and fixed):
+                    # GNU `timeout` (this codebase's launcher, verify.sh:1699)
+                    # makes ITSELF the process-group leader, so the group's
+                    # pgid equals timeout's own pid, which equals app_pid (the
+                    # subshell execs straight into timeout with no fork). If
+                    # the launched command daemonizes -- forks a server and
+                    # the parent (timeout, then sh -c) exits -- by teardown
+                    # time: child_pgid is EMPTY (timeout already exited, so
+                    # `ps -o pgid= -p "$app_pid"` finds nothing); the orphan's
+                    # ppid is 1, not app_pid; but its pgid is STILL app_pid,
+                    # the value it inherited when timeout created the group.
+                    # Neither of the two arms above can ever match this case,
+                    # so the classic "daemonized" leak this function's own
+                    # comments describe was never reclaimed. Reproduced
+                    # directly: own daemon listener LEAKED pre-this-arm,
+                    # reclaimed after. Safe as an ownership proof, not a
+                    # loosening: a process group's pgid cannot be reassigned
+                    # to an unrelated group while any member of the original
+                    # group (here, the orphan itself, still alive and
+                    # reporting this exact pgid) still exists -- POSIX pgid
+                    # reuse is blocked until the whole group is empty.
                     if { [ -n "$child_pgid" ] && [ -n "$_h_pgid" ] && [ "$_h_pgid" = "$child_pgid" ]; } \
-                       || { [ -n "$app_pid" ] && [ -n "$_h_ppid" ] && [ "$_h_ppid" = "$app_pid" ]; }; then
+                       || { [ -n "$app_pid" ] && [ -n "$_h_ppid" ] && [ "$_h_ppid" = "$app_pid" ]; } \
+                       || { [ -n "$app_pid" ] && [ -n "$_h_pgid" ] && [ "$_h_pgid" = "$app_pid" ]; }; then
                         kill -9 "$pid" 2>/dev/null || true
                     fi
                 done

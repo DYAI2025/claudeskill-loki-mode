@@ -64,8 +64,23 @@ source "$FN_FILE"
 PORT=$((41000 + (RANDOM % 5000)))
 
 listener_script() {
+    # NOTE: this text is embedded inside a SINGLE-quoted shell string when the
+    # launcher script is generated below -- a literal apostrophe anywhere in
+    # this comment breaks that quoting and corrupts the generated script with
+    # a confusing downstream syntax error, not an error here. Write around
+    # contractions/possessives instead of using one.
     cat <<PYEOF
-import socket, sys, time
+import socket, signal, time
+# Ignore SIGTERM (the isolation control demanded by the D14/D15/D16 council
+# round-2 review): _verify_runtime_teardown does an EARLIER pkill -P
+# "\$app_pid" pass (a plain SIGTERM, no -9) that would otherwise kill a
+# default-handling listener before the port-reclaim loop under test ever
+# runs, making the reclaim assertion pass even if that loop were a complete
+# no-op -- exactly the gap that let the daemonized-leak regression slip
+# through review undetected. A SIGTERM-ignoring listener can only be brought
+# down by an explicit kill -9, so this assertion can only pass if the
+# reclaim loop itself does the work.
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", $PORT))
@@ -197,6 +212,70 @@ else
     kill -9 "$FAKE_APP_PID" 2>/dev/null || true
 fi
 kill -9 "$DECOY_PID" 2>/dev/null || true
+
+# --- T3: the actual regression this round's council round-2 REJECT found and
+# reproduced. autonomy/verify.sh launches the app via
+# `exec "$timeout_bin" "$boot_timeout" sh -c "$method"` (verify.sh:1699) from a
+# subshell, so app_pid IS timeout's own pid (exec replaces the subshell image,
+# no fork). GNU `timeout` makes ITSELF the process-group leader. If the
+# launched command forks a server and the parent (timeout, then sh -c) exits
+# -- the classic "daemonized" leak this function's own comments describe --
+# by teardown time: timeout has already exited, so child_pgid (captured via
+# `ps -o pgid= -p "$app_pid"`) is EMPTY; the orphaned listener's ppid is 1, not
+# app_pid; but its pgid is STILL app_pid, the value it inherited when timeout
+# created the group. Neither the child_pgid arm nor the ppid arm can ever
+# match this shape -- only a third arm comparing the holder's pgid directly
+# against app_pid closes it. This scenario is the one the OTHER two decoys in
+# this file (own-tree direct-child, and unrelated-process-group) do NOT
+# reproduce, which is why the regression passed this file's own suite before
+# being caught by human/council review instead.
+GNU_TIMEOUT="$(command -v timeout || true)"
+if [ -z "$GNU_TIMEOUT" ] || ! "$GNU_TIMEOUT" --version 2>/dev/null | grep -qi 'GNU coreutils'; then
+    echo "SKIPPED: no GNU timeout on PATH (BSD timeout does not reproduce this process-group shape) -- T1/T2 above still count"
+else
+    DAEMON_PORT=$((48000 + (RANDOM % 3000)))
+    METHOD="$PY -c \"
+import socket, os, sys, time
+pid = os.fork()
+if pid == 0:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('127.0.0.1', $DAEMON_PORT))
+    s.listen(5)
+    time.sleep(30)
+else:
+    sys.exit(0)
+\""
+    (
+        export PORT="$DAEMON_PORT"
+        exec "$GNU_TIMEOUT" 30 sh -c "$METHOD"
+    ) &
+    DAEMON_APP_PID=$!
+    sleep 1.5
+    DAEMON_LISTENER_PID="$(lsof -ti tcp:"$DAEMON_PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+
+    if [ -z "$DAEMON_LISTENER_PID" ]; then
+        bad "GNU-timeout daemonize setup did not bind its port (test setup broken, not the function under test)"
+    else
+        DAEMON_LISTENER_PGID="$(ps -o pgid= -p "$DAEMON_LISTENER_PID" 2>/dev/null | tr -d ' ')"
+        DAEMON_LISTENER_PPID="$(ps -o ppid= -p "$DAEMON_LISTENER_PID" 2>/dev/null | tr -d ' ')"
+        APP_STILL_ALIVE="no"; kill -0 "$DAEMON_APP_PID" 2>/dev/null && APP_STILL_ALIVE="yes"
+        if [ "$DAEMON_LISTENER_PPID" != "1" ] || [ "$APP_STILL_ALIVE" = "yes" ] || [ "$DAEMON_LISTENER_PGID" != "$DAEMON_APP_PID" ]; then
+            bad "GNU-timeout daemonize setup is wrong (listener_ppid=$DAEMON_LISTENER_PPID want 1; timeout_still_alive=$APP_STILL_ALIVE want no; listener_pgid=$DAEMON_LISTENER_PGID want $DAEMON_APP_PID) -- the assertion below would be vacuous"
+        else
+            ok "GNU-timeout daemonize setup reproduces the exact regression shape (listener orphaned to ppid=1, pgid still equals the exited timeout's own pid)"
+            _verify_runtime_teardown "$DAEMON_APP_PID" "$DAEMON_PORT" ""
+            sleep 0.5
+            if kill -0 "$DAEMON_LISTENER_PID" 2>/dev/null; then
+                bad "own daemon listener LEAKED by _verify_runtime_teardown -- the council round-2 regression is still present"
+            else
+                ok "own daemon listener (orphaned via GNU timeout daemonize) is reclaimed"
+            fi
+        fi
+    fi
+    kill -9 "$DAEMON_LISTENER_PID" 2>/dev/null || true
+    kill -9 "$DAEMON_APP_PID" 2>/dev/null || true
+fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
