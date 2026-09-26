@@ -9180,6 +9180,12 @@ setup_agent_branch() {
         log_warn "Left uncommitted from an earlier unfinished session, now treated as your files: $leftover"
     fi
     rm -f .loki/state/session-created.z 2>/dev/null
+    # BACKLOG 68 rework: a fresh mint starts with no tracked-since anchor and no
+    # in-flight marker (never seed the anchor from session-start-sha -- an
+    # anchor==start would let a later resume's "anchor..HEAD" diff include this
+    # session's OWN commits, pruning them from the next session's union as if
+    # the user had tracked them between sessions).
+    rm -f .loki/state/tracked-since.sha .loki/state/turn-in-flight 2>/dev/null
     if [ "$snap_ok" = 1 ]; then _LOKI_SNAPSHOT_THIS_RUN=1; fi
 
     # Every mint (a refused resume included) records its own base and the
@@ -9290,14 +9296,34 @@ _loki_snapshot_verify() {
 # a directory only when an ignore pattern matches it, so node_modules/ is one
 # "dir/" entry covering its subtree, while logs/ holding only *.log files is
 # listed file by file (a new logs/app.json is still the agent's). "union" keeps
-# the paths already recorded. The sibling .sha.z (content hash per file entry)
-# lets the receipt list a pre-existing file the run changed; it is removed
-# first, so a failed hash step means no detection, never stale hashes. Returns
-# non-zero, leaving any earlier list in place, when git cannot list. Seals a
-# digest of both files on success (BACKLOG 70) so later reads can detect
-# tampering.
+# the paths already recorded, minus any that became tracked because the USER
+# committed them between sessions (BACKLOG 68 rework). Distinguishing that from
+# "the AGENT itself committed or staged this pre-existing file during THIS
+# session, then got killed" is the entire point of the anchor below: only a
+# path git ADDED strictly after the last point this run itself could reach is
+# ever pruned. A path the agent tracked before that point is left IN the union
+# so it still flows into _loki_untrack_agent_committed_user_files's disclosure
+# (warn, remove from the branch tip, keep on disk) -- never silently swept in.
+#
+# The anchor is .loki/state/tracked-since.sha, a commit SHA written by
+# _loki_record_session_created (after each provider turn) and by
+# commit_session_changes (at session end): the newest point this run itself
+# recorded. .loki/state/turn-in-flight marks a provider turn as currently
+# running (set right before invocation, cleared by the same record call that
+# advances the anchor); its presence means a turn may have committed something
+# since the last anchor write, so pruning is skipped entirely rather than risk
+# treating an agent's mid-turn commit as the user's. Any anchor-resolution
+# failure (missing anchor, anchor not an ancestor of HEAD, merge-base failure)
+# also skips pruning: the safe direction is the old behavior (false blame, file
+# kept on disk), never silent adoption.
+#
+# The sibling .sha.z (content hash per file entry) lets the receipt list a
+# pre-existing file the run changed; it is removed first, so a failed hash step
+# means no detection, never stale hashes. Returns non-zero, leaving any earlier
+# list in place, when git cannot list. Seals a digest of both files on success
+# (BACKLOG 70) so later reads can detect tampering.
 _loki_snapshot_preexisting() {
-    local snap=".loki/state/preexisting-untracked.z" top="" base="" exclude=""
+    local snap=".loki/state/preexisting-untracked.z" top="" base="" exclude="" tracked=""
     rm -f "${snap%.z}.sha.z" 2>/dev/null
     top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
     mkdir -p .loki/state 2>/dev/null || return 1
@@ -9305,18 +9331,24 @@ _loki_snapshot_preexisting() {
     # made by a session that did not finish (interrupt, pod loss), so the
     # session that finishes the work commits them. If the user edits one of
     # them between sessions it is still the session's file and is committed
-    # with the edit. Recorded entries only block additions; they never remove
-    # a path already in the list.
+    # with the edit. Recorded entries only block additions; a path this run can
+    # prove the USER tracked between sessions is the one case they DO remove
+    # (see _loki_tracked_by_user_since_anchor below).
     if [ "${1:-}" = union ]; then
         base="$snap"
         exclude=".loki/state/session-created.z"
+        tracked="$snap.tracked"
+        if ! _loki_tracked_by_user_since_anchor "$top" "$tracked"; then
+            rm -f "$tracked"
+            tracked=""
+        fi
     fi
     if ! _loki_untracked_status "$snap.status" \
-       || ! _loki_untracked_merge "$snap.status" "$base" "$exclude" exact "$snap"; then
-        rm -f "$snap.status" "$snap.tmp"
+       || ! _loki_untracked_merge "$snap.status" "$base" "$exclude" exact "$snap" "$tracked"; then
+        rm -f "$tracked" "$snap.status" "$snap.tmp"
         return 1
     fi
-    rm -f "$snap.status"
+    rm -f "$tracked" "$snap.status"
     python3 -E "$SCRIPT_DIR/lib/workspace_diff.py" hash-snapshot "$top" "$snap" >/dev/null 2>&1 \
         || log_warn "Could not hash your pre-existing untracked files; the receipt cannot list the ones this run changes"
     _loki_snapshot_seal
@@ -9338,21 +9370,24 @@ _loki_untracked_status() {
     return 1
 }
 
-# _loki_untracked_merge <status> <base> <exclude> exact|cover <out>
-# Atomically write <out>: the NUL-delimited paths of <base>, plus every
-# untracked ("??") or ignored ("!!") path in <status> that <exclude> does not
-# hold. With "cover", an <exclude> entry ending in "/" also holds every path
-# below it (workspace_diff._covered). An empty or missing <base> or <exclude>
-# is an empty list; any other read or write failure is non-zero and leaves
-# <out> as it was. Sorted bytewise, like `LC_ALL=C sort -z -u`. One python
-# process: bash 3.2 has no associative arrays, and a bash loop cost 300ms per
-# 6,000 entries on /bin/bash. -E and no cwd on sys.path (D7): the cwd is the
-# agent's repo.
+# _loki_untracked_merge <status> <base> <exclude> exact|cover <out> [tracked]
+# Atomically write <out>: the NUL-delimited paths of <base> minus any path
+# <tracked> lists (BACKLOG 68: entries the USER tracked between sessions, as
+# resolved by _loki_tracked_by_user_since_anchor -- never the whole index),
+# plus every untracked ("??") or ignored ("!!") path in <status> that <exclude>
+# does not hold. With "cover", an <exclude> entry ending in "/" also holds
+# every path below it (workspace_diff._covered). An empty or missing <base> or
+# <exclude> is an empty list; any other read or write failure is non-zero and
+# leaves <out> as it was. Sorted bytewise, like `LC_ALL=C sort -z -u`. One
+# python process: bash 3.2 has no associative arrays, and a bash loop cost
+# 300ms per 6,000 entries on /bin/bash. -E and no cwd on sys.path (D7): the cwd
+# is the agent's repo.
 _loki_untracked_merge() {
     python3 -E -c 'import sys
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import os
 status, base, exclude, mode, out = sys.argv[1:6]
+tracked = sys.argv[6] if len(sys.argv) > 6 else ""
 def entries(path, missing_ok=True):
     try:
         with open(path, "rb") as fh:
@@ -9372,6 +9407,11 @@ def covered(path):
         cut = path.find(b"/", cut + 1)
     return False
 paths = set(entries(base)) if base else set()
+if tracked:
+    # Exact match only: a "dir/" entry is never dropped even if a file under it
+    # is now tracked, so an ignored directory (node_modules/) never re-exposes
+    # the rest of its subtree (BACKLOG 66/78 territory).
+    paths -= set(entries(tracked))
 for rec in entries(status, missing_ok=False):
     # The session-created record ("cover" mode) never holds a directory entry:
     # a whole-directory entry (logs/, out/) would stop the resume union from
@@ -9385,6 +9425,73 @@ for rec in entries(status, missing_ok=False):
 with open(out + ".tmp", "wb") as fh:
     fh.write(b"".join(p + b"\0" for p in sorted(paths)))
 os.replace(out + ".tmp", out)' "$@" 2>/dev/null
+}
+
+# _loki_tracked_by_user_since_anchor <top> <out> (BACKLOG 68 rework)
+# Write <out>: the NUL-delimited paths git added to the index between the
+# recorded "tracked-since" anchor and HEAD -- i.e. what a resume union may
+# safely treat as "the USER tracked this between sessions" and prune. Returns
+# non-zero (writing nothing) whenever that inference is not safe, which leaves
+# the caller pruning nothing (the old, safe-by-default behavior):
+#   - no anchor recorded yet (an older session, or nothing survived a turn)
+#   - a provider turn is marked in-flight (.loki/state/turn-in-flight): a turn
+#     can commit or stage a file and then be SIGKILLed before the next record
+#     call advances the anchor, so anything since the LAST anchor is unproven
+#   - the anchor does not resolve, or is not an ancestor of HEAD (branch
+#     switched, history rewritten, anchor stale)
+# --diff-filter=A, --no-renames: only additions, matching
+# _loki_untrack_agent_committed_user_files's own diff so the two never
+# disagree about which paths are "added since X".
+_loki_tracked_by_user_since_anchor() {
+    local top="$1" out="$2" anchor_file=".loki/state/tracked-since.sha" anchor=""
+    [ -f .loki/state/turn-in-flight ] && return 1
+    [ -s "$anchor_file" ] || return 1
+    anchor="$(cat "$anchor_file" 2>/dev/null)"
+    [ -n "$anchor" ] || return 1
+    git rev-parse --verify -q "$anchor" >/dev/null 2>&1 || return 1
+    git merge-base --is-ancestor "$anchor" HEAD 2>/dev/null || return 1
+    git -C "$top" diff --name-only -z --no-renames --diff-filter=A "$anchor" HEAD > "$out.tmp" 2>/dev/null \
+        || { rm -f "$out.tmp"; return 1; }
+    mv -f "$out.tmp" "$out"
+    return 0
+}
+
+# _loki_advance_tracked_since_anchor
+# Move .loki/state/tracked-since.sha to the current HEAD and clear
+# .loki/state/turn-in-flight, but ONLY once the anchor write is confirmed on
+# disk. Called after every provider turn (_loki_record_session_created) and at
+# normal session end (commit_session_changes), i.e. at every point this run
+# can prove no provider turn is currently running -- PROVIDED the anchor write
+# itself lands, since _loki_tracked_by_user_since_anchor trusts both signals
+# together (anchor position + in-flight marker) to prove a commit happened
+# strictly after the anchor with no turn running. Clearing the marker on a
+# failed write would decouple them: a stale anchor stays on disk while the
+# marker falsely reports "no turn was in flight", so a later resume could
+# prove something it can't actually prove and prune an agent's own commit with
+# no disclosure (this is BACKLOG 68's failure mode, reintroduced). A HEAD that
+# does not resolve (unborn branch) is not a write failure -- there is nothing
+# to anchor yet -- so the marker still clears; the anchor stays "not set" as
+# before. Always returns 0 (both call sites are bare, unchecked calls): the
+# in-flight marker, not the return code, is the safety signal on a failed
+# write.
+_loki_advance_tracked_since_anchor() {
+    local sha=""
+    sha="$(git rev-parse --verify -q HEAD 2>/dev/null)" || true
+    if [ -n "$sha" ]; then
+        if ! { printf '%s\n' "$sha" > .loki/state/tracked-since.sha.tmp 2>/dev/null \
+               && mv -f .loki/state/tracked-since.sha.tmp .loki/state/tracked-since.sha 2>/dev/null; }; then
+            # Anchor write failed (disk full, a stray .tmp collision, a
+            # concurrent writer). Deliberately leave turn-in-flight SET and
+            # return here, before the unconditional clear below: the safe
+            # direction is to keep the old fallback-to-no-pruning path active
+            # for one more check, never to clear a marker the anchor write did
+            # not earn.
+            rm -f .loki/state/tracked-since.sha.tmp 2>/dev/null
+            return 0
+        fi
+    fi
+    rm -f .loki/state/turn-in-flight 2>/dev/null
+    return 0
 }
 
 # _loki_record_session_created
@@ -9407,6 +9514,12 @@ _loki_record_session_created() {
     # BACKLOG 70: detect tampering with the sealed snapshot as early as
     # possible (this runs after every provider turn, not just at commit time).
     _loki_snapshot_verify || return 1
+    # BACKLOG 68 rework: this call is the point right after a provider turn
+    # ends, so it also advances the tracked-since anchor and clears the
+    # in-flight marker -- whatever the agent committed or staged during the
+    # turn that just finished is now provably NOT mid-turn, so a later resume's
+    # anchor..HEAD diff may safely be checked against it.
+    _loki_advance_tracked_since_anchor
     if [ -f "$snap" ] && _loki_untracked_status "$out.status" \
        && _loki_untracked_merge "$out.status" "$out" "$snap" cover "$out"; then
         rm -f "$out.status"
@@ -9622,6 +9735,15 @@ commit_session_changes() {
         fi
         return 0
     fi
+
+    # BACKLOG 68 rework: session end is also a point this run can prove no
+    # provider turn is in flight, so advance the tracked-since anchor here too
+    # (not only after each provider turn). Without this, a session that never
+    # calls _loki_record_session_created between its last turn and a normal
+    # end (e.g. a single-iteration run) would leave the anchor stale, and the
+    # NEXT session's resume union would then have nothing to safely prune even
+    # for a genuine user commit made between sessions.
+    _loki_advance_tracked_since_anchor
 
     _loki_untrack_agent_committed_user_files "$cur" || return 0
 
@@ -23657,6 +23779,17 @@ except Exception as exc:
         local exit_code=0
         # v7.5.12: Mark provider pipeline as active so SIGINT trap can kill it.
         LOKI_PROVIDER_ACTIVE=1
+        # BACKLOG 68 rework: mark a turn in-flight so a SIGKILL mid-turn (pod
+        # loss: no trap runs) leaves the tracked-since anchor stale rather than
+        # advanced -- a resume must not prune anything the agent may have
+        # tracked during this still-unrecorded turn. Cleared only by
+        # _loki_record_session_created, right after this turn's own call to it
+        # below. Gated the same way as the anchor itself (this run has a live
+        # snapshot); an older/opted-out run writes no marker, matching its
+        # pre-existing no-anchor ("skip pruning") behavior.
+        if [ "${_LOKI_SNAPSHOT_THIS_RUN:-0}" = 1 ]; then
+            mkdir -p .loki/state 2>/dev/null && : > .loki/state/turn-in-flight 2>/dev/null
+        fi
         # v7.7.31: authorize autonomous operation at the system-prompt tier so
         # the spawned agent does not read the user's global ~/.claude/CLAUDE.md,
         # judge it to conflict with the loki_system prompt, call AskUserQuestion,

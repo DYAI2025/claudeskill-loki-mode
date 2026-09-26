@@ -644,8 +644,8 @@ outefc="$(
     setup_agent_branch >/dev/null 2>&1
     before="$(git rev-list --count HEAD)"
     printf 'agent\n' > work.js
-    # Leading '(' on the case pattern: bash 3.2 misparses a bare pattern ')'
-    # inside $( ... ).
+    # Leading open paren on the case pattern: bash 3.2 misparses a bare
+    # pattern close paren inside $( ... ).
     git() {
         case " $* " in (*" --pathspec-from-file="*) return 129 ;; esac
         command git "$@"
@@ -682,8 +682,8 @@ outog="$(
     source "$PREAMBLE"
     base="$(command git rev-parse --abbrev-ref HEAD)"
     printf 'my private notes\n' > usernotes.txt
-    # Model git 2.17 for the whole session (leading '(' on case patterns for
-    # bash 3.2 inside $( ... )).
+    # Model git 2.17 for the whole session (leading open paren on case
+    # patterns for bash 3.2 inside $( ... )).
     git() {
         case " $* " in
             (*" status "*"--no-renames"*|*" status "*"--ignored=matching"*) return 129 ;;
@@ -1147,8 +1147,8 @@ outsa="$(
     before="$(git rev-list --count HEAD)"
     # A normal source change (must be preserved).
     echo "function feat(){return 1}" > feature.js
-    # A secret in a file the path-globs do NOT match. Tier-1 'sk-' pattern (no
-    # deny filter), >=20 [A-Za-z0-9], so it is a definite scanner finding.
+    # A secret in a file the path-globs do NOT match. Tier-1 sk- prefix pattern
+    # (no deny filter), >=20 [A-Za-z0-9], so it is a definite scanner finding.
     printf '%s\n' 'const KEY="sk-AbCdEf0123456789AbCdEfGh"' > config.js
     ITERATION_COUNT=1
     result=0
@@ -1737,6 +1737,560 @@ if [ "$outgu" = "AGENT=yes INHEAD=no" ]; then
     pass "greenfield, unborn at session end: app.py committed, the user's notes.txt not"
 else
     fail "greenfield session with a pre-existing user file made no session commit (or swept the file)" "got: $outgu"
+fi
+
+# =============================================================================
+# BACKLOG 68 REWORK: distinguish "the USER tracked notes.txt between sessions"
+# (prune from the resume union, no false blame -- the ORIGINAL bug) from "the
+# AGENT itself tracked notes.txt DURING this session, then got killed" (must
+# NOT be pruned -- flows into the existing, correct
+# _loki_untrack_agent_committed_user_files disclosure -- the REGRESSION a
+# naive "prune anything git ls-files --cached now shows" fix would introduce).
+#
+# Test T68-user-commit-between-sessions (the ORIGINAL bug, still fixed): session
+# 1 ends normally (commit_session_changes runs, advancing the tracked-since
+# anchor). Still on the session branch (a normal session end never checks out
+# the base), the USER `git add`s+commits notes.txt (a file session 1 had
+# snapshotted as pre-existing) themselves; then the base is checked out and
+# session 2 resumes. notes.txt is now tracked, dated strictly AFTER the anchor
+# session 1 left, so the resume union prunes it: no false "the agent committed
+# your file" warning, and it stays exactly where the user's own commit put it.
+# =============================================================================
+echo "Test T68-user-commit-between-sessions: a file the USER tracked between sessions is pruned from the union, no false blame"
+R68U="$(make_repo t68usercommit)"
+out68u="$(
+    cd "$R68U" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    session="$(git rev-parse --abbrev-ref HEAD)"
+    printf 'agent 1\n' > work1.js
+    commit_session_changes >/dev/null 2>&1
+    git add notes.txt && git commit -qm "user: track my own notes"
+    user_head="$(git rev-parse HEAD)"
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    resumed="$( [ "$(git rev-parse --abbrev-ref HEAD)" = "$session" ] && echo yes || echo no )"
+    blamed="$(printf '%s' "$resume_log" | grep -qi 'agent committed' && echo yes || echo no)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    false_blame="$(printf '%s' "$msg" | grep -qi 'agent committed your pre-existing' && echo yes || echo no)"
+    still_tracked="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    unchanged="$( [ "$(git rev-parse "${user_head}^{tree}:notes.txt" 2>/dev/null)" = "$(git rev-parse HEAD:notes.txt 2>/dev/null)" ] && echo yes || echo no )"
+    agent="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'RESUMED=%s BLAMED=%s FALSEBLAME=%s TRACKED=%s UNCHANGED=%s AGENT=%s' \
+        "$resumed" "$blamed" "$false_blame" "$still_tracked" "$unchanged" "$agent"
+)"
+if [ "$out68u" = "RESUMED=yes BLAMED=no FALSEBLAME=no TRACKED=yes UNCHANGED=yes AGENT=yes" ]; then
+    pass "user's between-session commit of notes.txt pruned from the union: no false agent-blame, file untouched, session 2's own work committed"
+else
+    fail "a user commit between sessions was wrongly blamed on the agent (original BACKLOG 68 bug reappeared)" "got: $out68u"
+fi
+
+# =============================================================================
+# Test T68-user-commit-after-kill (a-kill variant): same as above, but session 1
+# is killed after ONE completed turn instead of ending normally -- turn begins
+# (in-flight marker set), work happens, the per-turn record runs (advancing the
+# anchor, clearing the marker), and the process dies with NO session commit.
+# The anchor from the per-turn record must be enough: the user's later commit
+# is still provably after it, so it is still pruned on resume.
+# =============================================================================
+echo "Test T68-user-commit-after-kill: the per-turn anchor (not just session-end) is enough to prune a user's between-session commit"
+R68K="$(make_repo t68userkill)"
+out68k="$(
+    cd "$R68K" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Model one provider turn: mark in-flight, do work, record (which advances
+    # the anchor and clears the marker) -- mirroring the real call site.
+    : > .loki/state/turn-in-flight
+    printf 'agent 1\n' > work1.js
+    git add work1.js && git commit -qm "agent turn 1"
+    _loki_record_session_created >/dev/null 2>&1
+    # Killed here: no commit_session_changes call at all. Still on the session
+    # branch (a completed turn never checks out the base) when the USER tracks
+    # notes.txt themselves.
+    git add notes.txt && git commit -qm "user: track my own notes"
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    blamed="$(printf '%s' "$resume_log" | grep -qi 'agent committed' && echo yes || echo no)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    false_blame="$(printf '%s' "$msg" | grep -qi 'agent committed your pre-existing' && echo yes || echo no)"
+    still_tracked="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    agent1="$(git cat-file -e HEAD:work1.js 2>/dev/null && echo yes || echo no)"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'BLAMED=%s FALSEBLAME=%s TRACKED=%s AGENT1=%s AGENT2=%s' \
+        "$blamed" "$false_blame" "$still_tracked" "$agent1" "$agent2"
+)"
+if [ "$out68k" = "BLAMED=no FALSEBLAME=no TRACKED=yes AGENT1=yes AGENT2=yes" ]; then
+    pass "per-turn anchor (session 1 killed after one completed turn, no session-end commit) still prunes the user's later commit correctly"
+else
+    fail "a per-turn anchor was not enough to prune a user's between-session commit" "got: $out68k"
+fi
+
+# =============================================================================
+# Test T68-agent-commits-then-killed (the REGRESSION, reviewer scenario 1): a
+# provider turn begins (marker set), the agent commits notes.txt (a pre-existing
+# file) ITSELF during the turn, and the process is killed before the per-turn
+# record ever runs -- so the anchor is never advanced past the turn that did
+# it, and the in-flight marker is never cleared. On resume, notes.txt must NOT
+# be silently pruned from the union: it must flow into
+# _loki_untrack_agent_committed_user_files's existing disclosure (warn, removed
+# from the branch tip, kept on disk).
+# =============================================================================
+echo "Test T68-agent-commits-then-killed: agent's own commit of a pre-existing file mid-turn is disclosed, never silently pruned"
+R68A="$(make_repo t68agentcommit)"
+out68a="$(
+    cd "$R68A" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Turn begins (marker set, mirroring the real invocation site), the agent
+    # commits the pre-existing file itself, then the process is killed: no
+    # _loki_record_session_created call, no commit_session_changes call.
+    : > .loki/state/turn-in-flight
+    git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
+    warned_history="$(printf '%s' "$msg" | grep -q 'do not push' && echo yes || echo no)"
+    off_tip="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    rec="$(tr '\000' ' ' 2>/dev/null < .loki/state/agent-committed-user-files.z)"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'DISCLOSED=%s HISTORY=%s OFFTIP=%s ONDISK=%s REC=[%s] AGENT2=%s' \
+        "$disclosed" "$warned_history" "$off_tip" "$on_disk" "$rec" "$agent2"
+)"
+if [ "$out68a" = "DISCLOSED=yes HISTORY=yes OFFTIP=no ONDISK=yes REC=[notes.txt ] AGENT2=yes" ]; then
+    pass "agent's mid-turn commit of a pre-existing file survives a kill and is correctly disclosed (removed from tip, kept on disk), not silently pruned"
+else
+    fail "REGRESSION: the agent's own commit of a pre-existing file was silently pruned (undisclosed) instead of flowing to the untrack/disclosure path" "got: $out68a"
+fi
+
+# =============================================================================
+# Test T68-agent-commits-completed-turn-then-killed (reviewer scenario 1, most
+# common timing): unlike T68-agent-commits-then-killed above (killed mid-turn,
+# BEFORE the per-turn record), here the turn's own commit AND its
+# _loki_record_session_created call both complete -- so the anchor legitimately
+# advances PAST the agent's own commit of notes.txt, and the in-flight marker
+# is cleared -- and THEN the process is killed with no further turns and no
+# session-end commit. This is the case the anchor mechanism must not
+# mis-handle: an anchor exists, no marker blocks it, and the agent's commit of
+# notes.txt sits strictly BEFORE that anchor. If the anchor were ever seeded
+# from something other than the actual recorded HEAD (e.g. session-start-sha),
+# this is the scenario that would silently launder the agent's commit as "the
+# user's between-session commit" and prune it -- proving the anchor's VALUE,
+# not just the marker's presence, is load-bearing. Resume is modeled on the
+# already-on-loki path (a real pod-loss restart resumes on the same branch,
+# not via a base checkout), per _loki_resume_snapshot.
+# =============================================================================
+echo "Test T68-agent-commits-completed-turn-then-killed: a completed turn's own commit is disclosed even though its anchor legitimately advanced past it"
+R68C="$(make_repo t68agentcommitcompleted)"
+out68c="$(
+    cd "$R68C" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Turn begins, agent commits the pre-existing file itself, turn completes
+    # normally (record runs: anchor advances PAST this commit, marker clears).
+    : > .loki/state/turn-in-flight
+    git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
+    _loki_record_session_created >/dev/null 2>&1
+    anchor_past_commit="$( [ "$(cat .loki/state/tracked-since.sha 2>/dev/null)" = "$(git rev-parse HEAD)" ] && echo yes || echo no )"
+    # Killed here: no further turn, no commit_session_changes call. Resume on
+    # the already-on-loki path (the real pod-loss restart: same branch).
+    resume_log="$(setup_agent_branch 2>&1)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
+    off_tip="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'ANCHORPASTCOMMIT=%s DISCLOSED=%s OFFTIP=%s ONDISK=%s AGENT2=%s' \
+        "$anchor_past_commit" "$disclosed" "$off_tip" "$on_disk" "$agent2"
+)"
+if [ "$out68c" = "ANCHORPASTCOMMIT=yes DISCLOSED=yes OFFTIP=no ONDISK=yes AGENT2=yes" ]; then
+    pass "a completed turn's own commit of a pre-existing file is still disclosed, even with a legitimately-advanced anchor sitting after it"
+else
+    fail "REGRESSION: the anchor's position (not just the marker) failed to protect the agent's own completed-turn commit" "got: $out68c"
+fi
+
+# =============================================================================
+# Test T68-agent-stages-then-killed (the REGRESSION, reviewer scenario 2): same
+# as above but the agent only STAGES notes.txt (git add, no commit) before being
+# killed. notes.txt never reaches any commit, so it is never in HEAD and the
+# disclosure path (which diffs committed history) has nothing to report -- but
+# it must end up unstaged and on disk, never swept into the NEXT session's
+# commit as if it were the session's own new work.
+# =============================================================================
+echo "Test T68-agent-stages-then-killed: agent staging (no commit) a pre-existing file mid-turn never gets swept into a later session commit"
+R68S="$(make_repo t68agentstage)"
+out68s="$(
+    cd "$R68S" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    : > .loki/state/turn-in-flight
+    git add notes.txt
+    staged_before="$(git diff --cached --name-only | grep -qx notes.txt && echo yes || echo no)"
+    # Killed here: no commit at all, no record call, no session commit.
+    git checkout -q develop
+    setup_agent_branch >/dev/null 2>&1
+    printf 'agent 2\n' > work2.js
+    commit_session_changes >/dev/null 2>&1
+    in_head="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    still_staged="$(git diff --cached --name-only | grep -qx notes.txt && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'STAGEDBEFORE=%s INHEAD=%s STILLSTAGED=%s ONDISK=%s AGENT2=%s' \
+        "$staged_before" "$in_head" "$still_staged" "$on_disk" "$agent2"
+)"
+if [ "$out68s" = "STAGEDBEFORE=yes INHEAD=no STILLSTAGED=no ONDISK=yes AGENT2=yes" ]; then
+    pass "agent's mid-turn staging-only of a pre-existing file: never committed, unstaged, kept on disk, session 2's own work committed"
+else
+    fail "REGRESSION: agent staging-only of a pre-existing file was swept into the next session commit (or lost)" "got: $out68s"
+fi
+
+# =============================================================================
+# Test T68-agent-stages-completed-turn-then-killed: the staging counterpart of
+# T68-agent-commits-completed-turn-then-killed above. A turn STAGES (never
+# commits) the pre-existing file, then completes normally: the per-turn record
+# runs, which legitimately advances the anchor to the current HEAD and clears
+# the in-flight marker -- even though notes.txt is still sitting staged,
+# untouched by that record call (_loki_record_session_created only tracks what
+# git does not track; a staged-but-uncommitted file is invisible to it either
+# way). The process is then killed with no further turn and no session-end
+# commit. Resume must still leave notes.txt out of HEAD, unstaged, and on disk:
+# the anchor-based diff (_loki_tracked_by_user_since_anchor) is COMMIT-based
+# (git diff <anchor> HEAD), so a path that was only ever staged, never
+# committed, can never appear in it regardless of the anchor's position or the
+# marker's state -- this is what actually separates staging from committing,
+# as distinct from the in-flight-marker check (which independently also covers
+# this case, since the marker from this turn was never cleared... except here
+# it WAS cleared, by design, to isolate the diff-shape guarantee from the
+# marker guarantee). Resume is modeled on the already-on-loki path.
+# =============================================================================
+echo "Test T68-agent-stages-completed-turn-then-killed: a completed turn's own staging-only never gets swept in, independent of the marker"
+R68SC="$(make_repo t68agentstagecompleted)"
+out68sc="$(
+    cd "$R68SC" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Turn begins, agent STAGES the pre-existing file only (no commit), turn
+    # completes normally (record runs: anchor advances to HEAD, marker clears
+    # -- HEAD has NOT moved, since nothing was committed).
+    : > .loki/state/turn-in-flight
+    git add notes.txt
+    _loki_record_session_created >/dev/null 2>&1
+    anchor_exists="$( [ -s .loki/state/tracked-since.sha ] && echo yes || echo no )"
+    # Killed here: no further turn, no commit_session_changes call. Resume on
+    # the already-on-loki path (the real pod-loss restart: same branch).
+    setup_agent_branch >/dev/null 2>&1
+    printf 'agent 2\n' > work2.js
+    commit_session_changes >/dev/null 2>&1
+    in_head="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    still_staged="$(git diff --cached --name-only | grep -qx notes.txt && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'ANCHOREXISTS=%s INHEAD=%s STILLSTAGED=%s ONDISK=%s AGENT2=%s' \
+        "$anchor_exists" "$in_head" "$still_staged" "$on_disk" "$agent2"
+)"
+if [ "$out68sc" = "ANCHOREXISTS=yes INHEAD=no STILLSTAGED=no ONDISK=yes AGENT2=yes" ]; then
+    pass "a completed turn's own staging-only of a pre-existing file stays out of HEAD and unstaged, even with a legitimately-advanced anchor"
+else
+    fail "REGRESSION: a completed turn's staging-only of a pre-existing file was swept in despite a legitimately-advanced anchor" "got: $out68sc"
+fi
+
+# =============================================================================
+# Test T68-agent-commits-midturn-after-earlier-record (the REGRESSION,
+# reviewer's "b1-midturn" refinement): session 1 completes ONE turn normally
+# (record runs, anchor advances, marker clears), THEN a SECOND turn begins
+# (marker set again), the agent commits notes.txt during that second turn, and
+# the process is killed before the second turn's own record call. If the fix
+# incorrectly used only "was notes.txt tracked at session start" as its signal
+# (rather than the in-flight marker + anchor), the presence of an EARLIER valid
+# anchor could be mistaken for proof the second turn's commit is safe to prune.
+# It must not be: the marker set at the second turn's start must block pruning
+# regardless of the first turn's already-advanced anchor.
+# =============================================================================
+echo "Test T68-agent-commits-midturn-after-earlier-record: a later turn's mid-turn commit is not laundered by an earlier turn's anchor"
+R68M="$(make_repo t68midturn)"
+out68m="$(
+    cd "$R68M" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Turn 1: begins, does unrelated work, completes normally (record runs).
+    : > .loki/state/turn-in-flight
+    printf 'agent 1\n' > work1.js
+    git add work1.js && git commit -qm "agent turn 1"
+    _loki_record_session_created >/dev/null 2>&1
+    anchor_after_t1="$(cat .loki/state/tracked-since.sha 2>/dev/null)"
+    # Turn 2: begins (marker set again), agent commits the pre-existing file,
+    # then killed before the record call for this turn.
+    : > .loki/state/turn-in-flight
+    git add notes.txt && git commit -qm "agent turn 2 (includes pre-existing notes.txt)"
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    printf 'agent 3\n' > work3.js
+    msg="$(commit_session_changes 2>&1)"
+    disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
+    off_tip="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    turn1_kept="$(git cat-file -e HEAD:work1.js 2>/dev/null && echo yes || echo no)"
+    agent3="$(git cat-file -e HEAD:work3.js 2>/dev/null && echo yes || echo no)"
+    printf 'ANCHORT1=%s DISCLOSED=%s OFFTIP=%s ONDISK=%s TURN1KEPT=%s AGENT3=%s' \
+        "$([ -n "$anchor_after_t1" ] && echo yes || echo no)" "$disclosed" "$off_tip" "$on_disk" "$turn1_kept" "$agent3"
+)"
+if [ "$out68m" = "ANCHORT1=yes DISCLOSED=yes OFFTIP=no ONDISK=yes TURN1KEPT=yes AGENT3=yes" ]; then
+    pass "an earlier turn's already-advanced anchor never launders a LATER turn's mid-turn commit; still disclosed and off the tip"
+else
+    fail "REGRESSION: an earlier anchor let a later turn's mid-turn commit through unnoticed" "got: $out68m"
+fi
+
+# =============================================================================
+# Test T68-anchor-write-failure-keeps-marker (second-reviewer regression): a
+# STALE anchor is already on disk from an earlier turn, a turn is in flight,
+# and the agent commits a pre-existing file mid-turn -- then the anchor .tmp
+# write is forced to fail (a directory pre-created at the exact .tmp path, an
+# ordinary transient-fs-hiccup shape: disk full, permission issue, a stray
+# leftover, a concurrent writer). _loki_advance_tracked_since_anchor must
+# leave .loki/state/turn-in-flight SET when the write did not land: clearing
+# it anyway would decouple the stale anchor from the marker and let the next
+# check "prove" the mid-turn commit is safe to prune with zero disclosure --
+# exactly the fail-unsafe hole the whole T68 rework exists to close. Calls the
+# real call site (_loki_record_session_created), not the anchor function
+# directly, so the exact production code path is exercised.
+# =============================================================================
+echo "Test T68-anchor-write-failure-keeps-marker: a failed anchor write leaves turn-in-flight SET, mid-turn commit stays disclosed not pruned"
+R68W="$(make_repo t68anchorwritefail)"
+out68w="$(
+    cd "$R68W" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'my notes\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    # Seed a STALE anchor (the session mint commit, already behind).
+    stale_anchor="$(git rev-parse HEAD)"
+    mkdir -p .loki/state
+    printf '%s\n' "$stale_anchor" > .loki/state/tracked-since.sha
+    : > .loki/state/turn-in-flight
+    # Agent commits the pre-existing file mid-turn.
+    git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
+    # Force the anchor .tmp write to fail: pre-create a directory at the exact
+    # .tmp path _loki_advance_tracked_since_anchor writes to.
+    mkdir -p .loki/state/tracked-since.sha.tmp
+    # Real call site: _loki_record_session_created calls
+    # _loki_advance_tracked_since_anchor internally.
+    _LOKI_SNAPSHOT_THIS_RUN=1 _loki_record_session_created >/dev/null 2>&1
+    marker_kept="$([ -f .loki/state/turn-in-flight ] && echo yes || echo no)"
+    anchor_unchanged="$([ "$(cat .loki/state/tracked-since.sha 2>/dev/null)" = "$stale_anchor" ] && echo yes || echo no)"
+    rmdir .loki/state/tracked-since.sha.tmp 2>/dev/null || true
+    git checkout -q develop
+    resume_log="$(setup_agent_branch 2>&1)"
+    printf 'agent 2\n' > work2.js
+    msg="$(commit_session_changes 2>&1)"
+    disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
+    off_tip="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    on_disk="$( [ "$(cat notes.txt 2>/dev/null)" = 'my notes' ] && echo yes || echo no )"
+    agent2="$(git cat-file -e HEAD:work2.js 2>/dev/null && echo yes || echo no)"
+    printf 'MARKERKEPT=%s ANCHORUNCHANGED=%s DISCLOSED=%s OFFTIP=%s ONDISK=%s AGENT2=%s' \
+        "$marker_kept" "$anchor_unchanged" "$disclosed" "$off_tip" "$on_disk" "$agent2"
+)"
+if [ "$out68w" = "MARKERKEPT=yes ANCHORUNCHANGED=yes DISCLOSED=yes OFFTIP=no ONDISK=yes AGENT2=yes" ]; then
+    pass "a failed anchor write leaves turn-in-flight set; the stale anchor never launders the mid-turn commit, still disclosed and off the tip"
+else
+    fail "REGRESSION: a failed anchor write cleared turn-in-flight anyway, letting the stale anchor prune a mid-turn commit silently" "got: $out68w"
+fi
+
+# =============================================================================
+# MUTATION CHECK (non-vacuity proof for the BACKLOG 68 rework): remove the
+# in-flight-marker check from _loki_tracked_by_user_since_anchor in a COPY of
+# BRANCH_LIB (so the anchor alone, without the marker, gates pruning) and
+# re-run T68-agent-commits-midturn-after-earlier-record's exact repro against
+# that mutated copy. That scenario (not the plain agent-commits-then-killed
+# one) is the one that actually exercises the marker: it has a REAL prior
+# anchor recorded (from turn 1's normal completion), so with the marker check
+# removed, the anchor alone is (wrongly) enough to let notes.txt's mid-turn
+# commit be pruned. The plain agent-commits-then-killed scenario has NO anchor
+# at all yet, so its repro would stay green under this mutation for an
+# unrelated reason (the "no anchor" guard) and prove nothing about the marker.
+# The mutated version must now FAIL (silently prune notes.txt), proving the
+# marker check is load-bearing, not vacuous.
+# =============================================================================
+echo "Mutation check: drop the in-flight-marker check -> T68-agent-commits-midturn-after-earlier-record must FAIL"
+MUT_BRANCH_LIB="$WORKROOT/branch-lib.mutated.sh"
+cp "$BRANCH_LIB" "$MUT_BRANCH_LIB"
+sed -i.bak "/\[ -f \.loki\/state\/turn-in-flight \] && return 1/d" "$MUT_BRANCH_LIB" && rm -f "$MUT_BRANCH_LIB.bak"
+if grep -q 'turn-in-flight.*&&.*return 1' "$MUT_BRANCH_LIB"; then
+    fail "mutation did not remove the in-flight-marker check (sed pattern drift)"
+else
+    R68MUT="$(make_repo t68mutation)"
+    mut_out="$(
+        cd "$R68MUT" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { return 0; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$MUT_BRANCH_LIB"
+        ITERATION_COUNT=1
+        result=0
+        printf 'my notes\n' > notes.txt
+        setup_agent_branch >/dev/null 2>&1
+        # Turn 1: begins, does unrelated work, completes normally (record runs,
+        # advancing the anchor) -- this is the anchor the mutation exploits.
+        : > .loki/state/turn-in-flight
+        printf 'agent 1\n' > work1.js
+        git add work1.js && git commit -qm "agent turn 1"
+        _loki_record_session_created >/dev/null 2>&1
+        # Turn 2: begins (marker set again), agent commits the pre-existing
+        # file, then killed before the record call for this turn.
+        : > .loki/state/turn-in-flight
+        git add notes.txt && git commit -qm "agent turn 2 (includes pre-existing notes.txt)"
+        git checkout -q develop
+        setup_agent_branch >/dev/null 2>&1
+        printf 'agent 3\n' > work3.js
+        msg="$(commit_session_changes 2>&1)"
+        printf '%s' "$msg" | grep -q 'agent committed your pre-existing' && echo DISCLOSED || echo SILENT
+    )"
+    if [ "$mut_out" = "SILENT" ]; then
+        pass "mutation detected: removing the in-flight-marker check silently prunes a later turn's mid-turn commit via an earlier turn's anchor (T68 is non-vacuous)"
+    else
+        fail "MUTATION NOT DETECTED: agent's mid-turn commit still disclosed without the marker check (T68 marker check is vacuous!)" "got: $mut_out"
+    fi
+fi
+
+# =============================================================================
+# MUTATION CHECK (non-vacuity proof for the ORIGINAL BACKLOG 68 bug fix).
+# Remove the anchor-based pruning entirely (force
+# _loki_tracked_by_user_since_anchor to always fail) in a COPY of BRANCH_LIB and
+# re-run T68-user-commit-between-sessions's exact repro. The mutated version
+# must now FAIL (false-blame the user's own commit), proving the anchor-prune
+# path itself is load-bearing for the original bug, not vacuous.
+# =============================================================================
+echo "Mutation check: disable anchor-based pruning entirely -> T68-user-commit-between-sessions must FAIL"
+MUT_BRANCH_LIB2="$WORKROOT/branch-lib.mutated2.sh"
+cp "$BRANCH_LIB" "$MUT_BRANCH_LIB2"
+sed -i.bak "s/^_loki_tracked_by_user_since_anchor() {/_loki_tracked_by_user_since_anchor() { return 1; #/" "$MUT_BRANCH_LIB2" && rm -f "$MUT_BRANCH_LIB2.bak"
+if ! grep -q '^_loki_tracked_by_user_since_anchor() { return 1; #' "$MUT_BRANCH_LIB2"; then
+    fail "mutation did not disable anchor-based pruning (sed pattern drift)"
+else
+    R68MUT2="$(make_repo t68mutation2)"
+    mut_out2="$(
+        cd "$R68MUT2" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { return 0; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$MUT_BRANCH_LIB2"
+        ITERATION_COUNT=1
+        result=0
+        printf 'my notes\n' > notes.txt
+        setup_agent_branch >/dev/null 2>&1
+        session="$(git rev-parse --abbrev-ref HEAD)"
+        printf 'agent 1\n' > work1.js
+        commit_session_changes >/dev/null 2>&1
+        git checkout -q "$session"
+        git add notes.txt && git commit -qm "user: track my own notes"
+        git checkout -q develop
+        setup_agent_branch >/dev/null 2>&1
+        printf 'agent 2\n' > work2.js
+        msg="$(commit_session_changes 2>&1)"
+        printf '%s' "$msg" | grep -q 'agent committed your pre-existing' && echo FALSEBLAME || echo CLEAN
+    )"
+    if [ "$mut_out2" = "FALSEBLAME" ]; then
+        pass "mutation detected: disabling anchor-based pruning brings back the original false-blame bug (T68-user-commit-between-sessions is non-vacuous)"
+    else
+        fail "MUTATION NOT DETECTED: original bug's false-blame did not reappear when anchor pruning was disabled (test is vacuous!)" "got: $mut_out2"
+    fi
+fi
+
+# =============================================================================
+# MUTATION CHECK (non-vacuity proof for T68-agent-commits-completed-turn-then-
+# killed): seed the anchor from the recorded session-start commit instead of
+# the actual HEAD at record time -- exactly the mistake the mint-path comment
+# warns against ("never seed the anchor from session-start-sha"). With this
+# seeding, start..HEAD still contains the agent's OWN first commit (it was made
+# after session start), so the anchor would wrongly treat that commit's added
+# paths as "the user's between-session work" and prune notes.txt. Re-run
+# T68-agent-commits-completed-turn-then-killed's exact repro against this
+# mutated copy; it must now FAIL (silently prune notes.txt instead of
+# disclosing it), proving the anchor's VALUE (not just the marker's presence)
+# is load-bearing.
+# =============================================================================
+echo "Mutation check: seed the anchor from session-start-sha instead of HEAD -> T68-agent-commits-completed-turn-then-killed must FAIL"
+MUT_BRANCH_LIB3="$WORKROOT/branch-lib.mutated3.sh"
+cp "$BRANCH_LIB" "$MUT_BRANCH_LIB3"
+python3 - "$MUT_BRANCH_LIB3" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+with open(path) as fh:
+    src = fh.read()
+old = '''_loki_advance_tracked_since_anchor() {
+    local sha=""
+    sha="$(git rev-parse --verify -q HEAD 2>/dev/null)" || true'''
+new = '''_loki_advance_tracked_since_anchor() {
+    local sha=""
+    sha="$(cat .loki/state/session-start-sha 2>/dev/null)" || true'''
+if old not in src:
+    sys.exit(1)
+with open(path, "w") as fh:
+    fh.write(src.replace(old, new, 1))
+PYEOF
+if [ $? -ne 0 ]; then
+    fail "mutation did not seed the anchor from session-start-sha (source pattern drift)"
+else
+    R68MUT3="$(make_repo t68mutation3)"
+    mut_out3="$(
+        cd "$R68MUT3" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { return 0; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$MUT_BRANCH_LIB3"
+        ITERATION_COUNT=1
+        result=0
+        printf 'my notes\n' > notes.txt
+        setup_agent_branch >/dev/null 2>&1
+        : > .loki/state/turn-in-flight
+        git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
+        _loki_record_session_created >/dev/null 2>&1
+        setup_agent_branch >/dev/null 2>&1
+        printf 'agent 2\n' > work2.js
+        msg="$(commit_session_changes 2>&1)"
+        printf '%s' "$msg" | grep -q 'agent committed your pre-existing' && echo DISCLOSED || echo SILENT
+    )"
+    if [ "$mut_out3" = "SILENT" ]; then
+        pass "mutation detected: seeding the anchor from session-start-sha silently prunes the agent's own completed-turn commit (T68 is non-vacuous)"
+    else
+        fail "MUTATION NOT DETECTED: agent's completed-turn commit still disclosed with a session-start-sha-seeded anchor (T68 anchor-value check is vacuous!)" "got: $mut_out3"
+    fi
 fi
 
 # =============================================================================
