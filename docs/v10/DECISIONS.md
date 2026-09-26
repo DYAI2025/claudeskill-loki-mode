@@ -50,3 +50,10 @@ One entry per decision: context, choice, why, how to reverse. Newest last.
 - Choice: every Python invocation on a verify path runs `python3 -E`: `proof verify` (bash and Bun), the remote and deploy verifiers, `proof passport`, `proof chain`, and each chain stage that `tools/verify-chain.py` spawns (a council round 8 finding: the stages had inherited `PYTHONPATH`). The inline heredocs also drop `''` and `'.'` from `sys.path` first. Running `tools/verify-chain.py` directly without `-E` is outside this guarantee for the parent process (its stages are still protected); `loki proof chain` is the covered entry point. `-I` was rejected: it drops the user site, so a user-site `cryptography` would degrade every check to NOT CHECKED.
 - Why: an in-script guard cannot stop code that runs during interpreter start-up; `-E` ignores `PYTHON*` variables, so the environment cannot re-add the cwd.
 - Reverse: remove `-E` from those calls (tests in `tests/test-proof-verify-jwks.sh` section 13 go red).
+
+## D8. 2026-09-26: removing a console control that did nothing is not a breaking change
+
+- Context: the cycle-4 P7 sweep found console controls whose effect was never stored or sent: team remove-member and change-role, the RBAC role editor, team sharing checkboxes, settings Save buttons, "Test Connection", a fake QR code, a newsletter signup, invented testimonials.
+- Choice: remove them (or relabel them as browser-only) in a v9.x minor. A control that had no effect is a fabrication, not a feature a user depends on.
+- Why: moat property P7. Before v10.0.0 releases are additive, and deleting something that never worked adds honesty without taking away a capability.
+- Reverse: restore from `0afb6e2c^`, wired to a real endpoint.
