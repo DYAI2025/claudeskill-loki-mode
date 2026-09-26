@@ -384,8 +384,16 @@ runs:
       if: always()
       shell: bash
       run: |
-        # Kill any lingering loki processes
-        pkill -f "loki-run-" 2>/dev/null || true
+        # Stop only the loki run THIS job's workspace owns. `loki stop` with
+        # no arguments is folder-scoped to the current directory's .loki
+        # (autonomy/loki cmd_stop), which is exactly this job's checkout. A
+        # bare `pkill -f "loki-run-"` matches ANY process on the runner whose
+        # argv contains that substring, machine-wide -- on a persistent
+        # self-hosted runner host running several jobs, that kills another
+        # job's live loki run too (see docs/v10/DECISIONS.md D14/D15/D16).
+        # `loki stop --all` is the documented machine-wide escape hatch and is
+        # deliberately NOT used here.
+        loki stop 2>/dev/null || true
         # Clean temp files
         rm -rf "${RUNNER_TEMP}/pr-"*.diff "${RUNNER_TEMP}/review-prd-"*.md \
                "${RUNNER_TEMP}/loki-"*-output.txt "${RUNNER_TEMP}/pr-comment.md" \
