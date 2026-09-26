@@ -177,6 +177,26 @@ council_call() { # <repo> <base-sha> <function>
     )
     echo "$?"
 }
+council_call_args() { # <repo> <base-sha> <function> <function-args...>
+    (
+        cd "$1" || exit 99
+        log_info() { :; }; log_warn() { :; }; log_error() { :; }; log_success() { :; }
+        log_debug() { :; }; log_header() { :; }; log_step() { :; }
+        source "$COUNCIL_SH" >/dev/null 2>&1 || exit 98
+        export COUNCIL_STATE_DIR="$1/.loki/council" TARGET_DIR="$1" ITERATION_COUNT=7
+        export _LOKI_RUN_START_SHA="$2" LOKI_TEST_PROVENANCE=0 __LOKI_CLAUDE_HELP_CACHE=__no_claude__
+        COUNCIL_ENABLED=true; COUNCIL_SIZE=3
+        mkdir -p "$COUNCIL_STATE_DIR/votes"
+        council_aggregate_votes() {
+            printf '%s\n' '{"verdict":"COMPLETE","complete_votes":2,"total_members":3}' \
+                > "$COUNCIL_STATE_DIR/votes/round-${ITERATION_COUNT}.json"
+            echo "COMPLETE"
+        }
+        local fn="$3"; shift 3
+        "$fn" "$@" >/dev/null 2>&1
+    )
+    echo "$?"
+}
 council_repo() { # <dir> <test-results-json|""> -> echoes base sha; commits a real diff
     new_repo "$1" >/dev/null 2>&1 || return 1
     printf '.loki/\n' > "$1/.gitignore"; g "$1" add .gitignore; g "$1" commit -qm ignore
@@ -765,6 +785,23 @@ case_council_readers_not_shadowed() {
             rc="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call "$d" "$b" "$fn")"
             [ "$rc" = "$want" ] || bad="$bad [$leg $fn: got $rc want $want]"
         done
+        # BACKLOG 43 follow-up: council_heuristic_review (test_auditor role),
+        # council_evaluate_member and council_devils_advocate_review each read
+        # the same tr_file with their own inline python3 -c and are on the same
+        # verdict path (a heuristic vote, a member vote, a devil's-advocate
+        # veto) but were not driven by the loop above. Their vote text differs
+        # per function and is not the property under test here; the property is
+        # that a repo-committed json.py/sitecustomize.py never runs while any
+        # of them reads test-results.json, which the shared $d.mark check below
+        # already covers for every function called in this case. Both role
+        # args below are required under this script's set -u: council_call
+        # invokes the function with zero args, and council_evaluate_member's
+        # "local role=\"\$1\"" has no default (unlike the other two), so a
+        # bare council_call would abort on unbound $1 before ever reaching the
+        # test-results read -- silently skipping the coverage this exists to add.
+        (export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_heuristic_review test_auditor "$d/.loki/quality/test-results.json") >/dev/null 2>&1
+        (export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_evaluate_member requirements_verifier) >/dev/null 2>&1
+        (export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call "$d" "$b" council_devils_advocate_review) >/dev/null 2>&1
         [ ! -s "$d.mark" ] || bad="$bad [$leg: a repo module ran in the council: $(sort -u "$d.mark" | tr '\n' ' ')]"
     done
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
