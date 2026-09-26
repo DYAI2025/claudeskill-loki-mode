@@ -92,3 +92,10 @@ One entry per decision: context, choice, why, how to reverse. Newest last.
 - Choice: every council, review or HIGH-tier agent call sets `model` explicitly in the workflow script. None inherit the session model. Composition (for example "2 Opus + 1 Sonnet") is enforced by the script, not assumed from context.
 - Why: an unpinned model silently changes what was reviewed by what, and a session model change is invisible to a running workflow unless it is checked.
 - Reverse: drop the explicit `model` fields and rely on a documented session-model convention instead.
+
+## D14. 2026-09-26: root-caused three session terminations to an unscoped pkill -f in a test
+
+- Context: this session's CLI process terminated cleanly (no crash report, no OOM/jetsam entry, no logged kill signal) three times in about 25 minutes, each time 2-4 minutes into a 4-agent HIGH-tier council review running tests against the main checkout. `tests/test-backend-floor.sh:43` ran `pkill -f "index.mjs"` with no path or PID scoping. Reproduced directly: a decoy process started with an unrelated "index.mjs" substring in its argv was killed by that line. In a shared process namespace (concurrent worktree agents, workflow subagents, the harness's own process tree), this can kill any process whose command line happens to contain that substring, including, plausibly, the session's own process or a concurrent agent's.
+- Choice: fixed to find the PID actually listening on the target port via `lsof -ti tcp:<port> -sTCP:LISTEN` and kill only that PID (`61547203`). The already-scoped trap-line pkill on the unique mktemp path was left unchanged.
+- Why: this is exactly the pattern global CLAUDE.md's cleanup rules and `docs/v10/SWARM.md`'s guardrails already ban (never kill by name or pattern, only by a PID you recorded), and it is the first concrete, reproduced explanation for an otherwise-unexplained class of session death.
+- Reverse: revert `61547203`. Not recommended; the decoy reproduction is on record above and in the commit message.
