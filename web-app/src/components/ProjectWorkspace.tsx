@@ -662,9 +662,9 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
     phase: string;
     iteration: number;
     maxIterations: number;
-    cost: number;
+    cost: number | null;
     startTime: number;
-  }>({ phase: 'idle', iteration: 0, maxIterations: 10, cost: 0, startTime: 0 });
+  }>({ phase: 'idle', iteration: 0, maxIterations: 10, cost: null, startTime: 0 });
   const [filesChangedIndicator, setFilesChangedIndicator] = useState(false);
   const [externalChangeFile, setExternalChangeFile] = useState<string | null>(null);
   const filesChangedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -801,7 +801,9 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
           phase: newPhase,
           iteration: status.iteration || 0,
           maxIterations: status.max_iterations || 10,
-          cost: status.cost || 0,
+          // /api/session/status reports 0 when no cost was recorded, so only a
+          // positive value is a reading. null renders as "not recorded".
+          cost: typeof status.cost === 'number' && status.cost > 0 ? status.cost : null,
           startTime: status.start_time ? status.start_time * 1000 : 0,
         });
 

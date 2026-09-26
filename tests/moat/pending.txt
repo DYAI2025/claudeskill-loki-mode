@@ -36,8 +36,6 @@ P4.seeded-defect-corpus-present M0 no corpus manifest at benchmarks/seeded-defec
 P4.three-setups-resolve M0 the Bun route has no working top or routed setting: it rejects --session-model opus and ignores the per-tier LOKI_CLAUDE_MODEL_* variables; high and small resolve to sonnet on both routes
 P5.airgap-audit-default-route M9 Bun doctor rejects --airgap; either route doctor --airgap to bash in bin/loki or port _loki_airgap_audit to loki-ts doctor.ts
 P7.dashboard-client-routes-exist M7 9 dashboard-ui endpoints have no route in dashboard/server.py (7 under /api/v2, /api/tools, /api/metrics/tools, notifications unacknowledge)
-P7.no-sample-data-panels M7 AdminPage mounts 5 panels that fall back to sample data (including UserManagement and ProjectGovernance) and 3 files show Math.random metrics
-P7.unmeasured-cost-never-zero M7 10 places turn unmeasured cost into 0 or $0.00 in dashboard-ui, web-app and cost.html
 P7.webapp-client-routes-exist M7 the MagicComponentCard 'View code' link opens /api/magic/components/{name}/code, which has no route in web-app/server.py
 P8.ablation-dead-code-not-sealed M2 record not_load_bearing and have _compute_headline refuse VERIFIED when it is set
 P8.ablation-na-docs-only M2 record not_applicable with a non-empty reason when no code changed

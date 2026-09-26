@@ -158,12 +158,14 @@
         '<div class="cap-note">When a cap is set, Loki warns at 80% and hard-stops at 100%.</div></div>';
       return html;
     }
-    var pct = (b.percent_used === null || b.percent_used === undefined) ? 0 : Number(b.percent_used);
-    var fillPct = Math.max(0, Math.min(100, pct));
+    // Unknown use is not 0% used: no fill and no percentage are drawn for it.
+    var pct = (b.percent_used === null || b.percent_used === undefined) ? NaN : Number(b.percent_used);
+    var known = isFinite(pct);
+    var fillPct = known ? Math.max(0, Math.min(100, pct)) : 0;
     var st = esc(b.status || "ok");
     html += '<div class="gauge">' +
       '<div class="top"><span class="muted">' + fmtUsd(b.used) + ' of ' + fmtUsd(b.limit) + ' used</span>' +
-      '<span class="pct">' + pct.toFixed(1) + '%</span></div>' +
+      '<span class="pct">' + (known ? pct.toFixed(1) + '%' : 'not recorded') + '</span></div>' +
       '<div class="bar"><div class="fill ' + st + '" style="width:' + fillPct + '%"></div>' +
       '<div class="warnline" title="80% warn threshold"></div></div>' +
       '<div class="status ' + st + '">' + statusText(b.status) + '</div>' +
@@ -210,23 +212,32 @@
       return html;
     }
     var its = cr.iterations;
-    // Inline SVG cumulative line.
+    // Inline SVG cumulative line. An iteration with no recorded cost is SKIPPED,
+    // never plotted at the floor as a measured zero; x keeps its index so the
+    // gap stays visible.
     var W = 900, H = 140, pad = 8;
+    var measured = [];
     var maxCum = 0;
     for (var i = 0; i < its.length; i++) {
-      var cv = Number(its[i].cumulative_usd) || 0;
+      var raw = its[i].cumulative_usd;
+      var cv = (raw === null || raw === undefined) ? NaN : Number(raw);
+      if (!isFinite(cv)) continue;
+      measured.push([i, cv]);
       if (cv > maxCum) maxCum = cv;
     }
     if (maxCum <= 0) maxCum = 1;
     var pts = [];
-    for (var j = 0; j < its.length; j++) {
-      var x = its.length === 1 ? W / 2 : pad + (j / (its.length - 1)) * (W - 2 * pad);
-      var y = H - pad - ((Number(its[j].cumulative_usd) || 0) / maxCum) * (H - 2 * pad);
+    for (var j = 0; j < measured.length; j++) {
+      var idx = measured[j][0];
+      var x = its.length === 1 ? W / 2 : pad + (idx / (its.length - 1)) * (W - 2 * pad);
+      var y = H - pad - (measured[j][1] / maxCum) * (H - 2 * pad);
       pts.push(x.toFixed(1) + "," + y.toFixed(1));
     }
-    var poly = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
-      '<polyline fill="none" stroke="#6f7bf7" stroke-width="2" points="' + pts.join(" ") + '"/>' +
-      '</svg>';
+    var poly = pts.length === 0
+      ? '<div class="empty">No iteration in this run recorded a cost, so there is nothing to plot.</div>'
+      : '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' +
+        '<polyline fill="none" stroke="#6f7bf7" stroke-width="2" points="' + pts.join(" ") + '"/>' +
+        '</svg>';
     html += '<div class="panel"><div class="muted" style="font-size:13px;margin-bottom:6px;">' +
       'Cumulative spend this run: <span class="mono">' + fmtUsd(cr.total_usd) + '</span></div>' +
       poly + '</div>';

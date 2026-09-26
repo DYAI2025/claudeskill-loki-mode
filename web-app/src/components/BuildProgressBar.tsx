@@ -12,7 +12,7 @@ interface BuildProgressBarProps {
   phase: string;       // 'planning' | 'building' | 'testing' | 'reviewing' | 'complete' | 'idle'
   iteration: number;
   maxIterations: number;
-  cost: number;        // dollars spent
+  cost: number | null; // dollars spent; null when no cost was recorded
   startTime: number;   // timestamp when build started
   isRunning: boolean;
 }
@@ -141,7 +141,7 @@ export function BuildProgressBar({ phase, iteration, maxIterations, cost, startT
           </span>
           <span className="flex items-center gap-1">
             <DollarSign size={12} />
-            ${cost.toFixed(2)}
+            {cost !== null ? `$${cost.toFixed(2)}` : 'not recorded'}
           </span>
         </div>
       </div>

@@ -31,8 +31,8 @@ interface BuildInsightsProps {
   totalTimeSecs: number;
   /** Quality gate score (0-100) */
   qualityScore: number;
-  /** Total cost in dollars */
-  totalCost: number;
+  /** Total cost in dollars; null when no cost was recorded */
+  totalCost: number | null;
   /** Number of iterations */
   iterations: number;
   /** Provider used */
@@ -136,6 +136,7 @@ export function BuildInsights({
   const [expanded, setExpanded] = useState(true);
   const quality = getQualityLabel(qualityScore);
   const maxPhaseDuration = Math.max(...phaseBreakdown.map(p => p.durationSecs), 1);
+  const costLabel = totalCost !== null ? `$${totalCost.toFixed(2)}` : 'Not recorded';
 
   const handleShare = () => {
     const summary = [
@@ -144,7 +145,7 @@ export function BuildInsights({
       `Provider: ${provider}`,
       `Total Time: ${formatTime(totalTimeSecs)}`,
       `Iterations: ${iterations}`,
-      `Cost: $${totalCost.toFixed(2)}`,
+      `Cost: ${costLabel}`,
       '',
       'Output:',
       `  Files Created: ${filesCreated}`,
@@ -243,7 +244,7 @@ export function BuildInsights({
               <TrendingUp size={14} className="text-primary" />
               <span className="text-xs font-medium text-ink">Total Cost</span>
             </div>
-            <span className="text-sm font-bold font-mono text-ink">${totalCost.toFixed(2)}</span>
+            <span className="text-sm font-bold font-mono text-ink">{costLabel}</span>
           </div>
 
           {/* Time breakdown by phase */}
