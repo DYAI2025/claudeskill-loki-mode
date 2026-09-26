@@ -235,7 +235,10 @@ if command -v node >/dev/null 2>&1; then
     # `pgrep -P <wrapper>`). Background a subshell that spawns a node child (a
     # busy-loop with a UNIQUE marker so we can reap it by fixed-string match) and
     # waits on it. The subshell's pid is the wrapper.
-    NODE_MARKER="loki92_composed3_marker"
+    # ponytail: per-run token, not a static string -- a fixed marker would
+    # match another concurrent run of this same suite (parallel worktrees) or
+    # coincidentally a real process on a shared machine (D14/D15/D16 class).
+    NODE_MARKER="loki92_composed3_marker_$$_${RANDOM}_$(date +%s 2>/dev/null || echo 0)"
     # Redirect fds on BOTH the inner node and the outer bash -c so neither holds
     # this script's stdout/stderr open (else a `$()`/pipe harness hangs on EOF).
     bash -c 'node -e "const m=process.argv[1]; setInterval(()=>{},1e9)" '"$NODE_MARKER"' >/dev/null 2>&1 & CH=$!; echo $$ > '"$TEST_DIR/.loki/wrap3.pid"'; wait $CH' >/dev/null 2>&1 &
