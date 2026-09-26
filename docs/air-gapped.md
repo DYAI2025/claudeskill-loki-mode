@@ -45,10 +45,15 @@ That is the property competitors' dashboard-bound verification cannot have.
 ## The one required egress, stated plainly
 
 ```sh
-loki doctor --airgap
+LOKI_LEGACY_BASH=1 loki doctor --airgap
 ```
 
-prints the egress inventory. Today it reports exactly one REQUIRED point:
+The `LOKI_LEGACY_BASH=1` prefix is required for now: the default (Bun) route
+does not yet accept the `--airgap` flag (tracked as
+`P5.airgap-audit-default-route`), so plain `loki doctor --airgap` fails on a
+default install.
+
+Once run, it prints the egress inventory. Today it reports exactly one REQUIRED point:
 
 ```
 REQUIRED  model inference -> https://api.anthropic.com

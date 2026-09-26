@@ -410,8 +410,13 @@ second question.
 ### Find out exactly what leaves the network
 
 ```bash
-loki doctor --airgap
+LOKI_LEGACY_BASH=1 loki doctor --airgap
 ```
+
+The `LOKI_LEGACY_BASH=1` prefix is required for now: the default (Bun) route
+does not yet accept the `--airgap` flag (tracked as
+`P5.airgap-audit-default-route`), so plain `loki doctor --airgap` fails on a
+default install.
 
 It lists every egress point, marks which are **required** versus optional, and
 refuses to report air-gap ready while a required one remains. On a default
@@ -421,7 +426,7 @@ names the remediation, which is to serve the model in-network:
 ```bash
 loki provider set opencode
 export LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder
-loki doctor --airgap        # re-run; the required egress should be gone
+LOKI_LEGACY_BASH=1 loki doctor --airgap        # re-run; the required egress should be gone
 ```
 
 Run this **before** writing NetworkPolicy rules. It is the host inventory those
