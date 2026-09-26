@@ -23,7 +23,7 @@ merge (all touch trust-core or security-relevant surfaces), oldest first.
 | ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
 |---|---|---|---|---|---|---|
 | PF-1 | pkill-scoping fix | main @ 9cd51d1a | autonomy/run.sh (kill_provider_child), tests/test-kill-provider-child-scoping.sh, docs/v10/DECISIONS.md (D15) | HIGH | review | Founder-reported: every loki-mode session ending via signal (supervisor signal, double Ctrl+C, Ctrl+C in perpetual mode) ran an unscoped `pkill -f` matching ANY process on the machine by command-line substring, terminating unrelated Claude Code sessions. Fixed to scope by process group. Dedicated HIGH-tier council launched (4 lenses, all models pinned). Ships as its own patch release ahead of the swarm queue once approved. |
-| PF-2 | P7 scanner gap fix | worktree (dispatched) | tests/moat/p7-no-fabricated-data.sh | HIGH | building | Round-4 blocking finding: P7.no-sample-data-panels cannot see literal rows used as a `||`/`??`/ternary fallback or via Array.of/Array.from. Dispatched to close GF-1's blocker. |
+| PF-2 | P7 scanner gap fix | worktree-agent-a13474d006e084e33 @ ecfd9578 | tests/moat/p7-no-fabricated-data.sh | HIGH | review | Fixed the ||/??/ternary/Array.of gap; dedicated 4-lens council running (adversarial + deviation + ceiling audits). |
 
 ## Fixed on main already (not slices; recorded for PO context)
 
@@ -97,3 +97,9 @@ numeric rollup.
   cherry-picked into main directly (it was a small, already-approved fix,
   not a swarm-cut slice) plus a same-session XSS fix and D8-D13. No release
   cut yet this wave.
+
+## PF-3: repo-wide kill-by-name scan (severity: same class as PF-1/D14, found in shipped surfaces)
+
+| ID | Owner | Branch | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| PF-3 | kill-scan sweep | worktree-agent-adbba28e01561483c (7 commits on 0f3e214a) | autonomy/loki (cmd_web_stop), .github/actions/.../action.yml, dashboard harness scripts, scripts/cleanup-test-processes.sh, 4 test-hardening fixes | HIGH | review | `loki web stop` and the published Marketplace action's Cleanup step both had unscoped kill-by-name/pattern. HIGH-tier 4-lens council running now. |
