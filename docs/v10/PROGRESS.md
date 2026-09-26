@@ -94,3 +94,16 @@ no release was mid-flight; the two dashboard-server processes noticed
 earlier in the session are unowned by any PID this session recorded, so left
 running per the never-kill-by-name rule. No data or work was lost across the
 three restarts: everything durable was already committed or in a worktree.
+
+## v9.54.1 release (2026-09-26, swarm mode)
+
+Shipped as the swarm's first release, ahead of the queue, per direct
+founder priority: PF-1 (D15, kill_provider_child unscoped pkill killing
+unrelated Claude Code sessions on session end) plus the D16/D17 test fixes
+found by its own 2-round HIGH-tier council. Fast tier green (110/0) before
+push; pushed at `779c50e5` with `PRE_PUSH_SKIP=1` (D5). See CHANGELOG.md for
+the user-facing account.
+
+Also merged in this release: S-06 (docs pointing at a rejected
+`doctor --airgap` on the default route, cherry-picked as `c83732b2`, LOW
+tier, single-reviewer APPROVE).
