@@ -499,6 +499,92 @@ TS
     return 0
 }
 
+# BACKLOG 73 + 89: a runner that exits 0 while its own summary line reports
+# failures (`jest || true`, a script that swallows the status) failed, and a
+# recorded failed_count > 0 is a failure whatever `pass` says. The stub jest
+# prints the given output file and exits 0, so only the summary tells red from
+# green. The green control also carries a test's own log line naming "failed",
+# which must not count.
+ef_fixture() { # <dir> <jest output file>
+    mkdir -p "$1/node_modules/.bin" || return 1
+    printf '%s\n' '{"name":"moat-ef","version":"1.0.0","private":true,"scripts":{"test":"jest"}}' > "$1/package.json"
+    printf '#!/bin/sh\ncat "%s" >&2\nexit 0\n' "$2" > "$1/node_modules/.bin/jest"
+    chmod +x "$1/node_modules/.bin/jest"
+}
+
+case_exit_zero_with_failures() {
+    need python3 git node npm bash bun timeout || return
+    local h="$RUN/ef-harness.sh" leg d b out tpass fcount marker rc dpass shape json bad=""
+    zt_harness "$h" || { _why="could not cut enforce_test_coverage out of run.sh"; return; }
+    printf '%s\n' '  console.log' '    all green here' '' 'Tests:       1 failed, 2 passed, 3 total' \
+        'Snapshots:   0 total' 'Time:        0.4 s' 'Ran all test suites.' > "$RUN/ef-red.out"
+    printf '%s\n' '  console.log' '    retried 2 failed uploads' '' 'Tests:       3 passed, 3 total' \
+        'Snapshots:   0 total' 'Time:        0.4 s' 'Ran all test suites.' > "$RUN/ef-green.out"
+    # Bash route (73): the real gate writes test-results.json, then the real
+    # council evidence gate reads it.
+    for leg in green red; do
+        d="$RUN/ef-bash-$leg"
+        b="$(council_repo "$d" "")" && ef_fixture "$d" "$RUN/ef-$leg.out" || { _why="fixture $leg failed"; return; }
+        (cd "$d" && TARGET_DIR="$d" LOKI_GATE_TIMEOUT=60 bash -c ". '$h'; enforce_test_coverage") >/dev/null 2>&1
+        rc="$(council_call "$d" "$b" council_evidence_gate)"
+        tpass="$(jfield "$d/.loki/quality/test-results.json" "json.dumps(d.get('pass'))")"
+        fcount="$(jfield "$d/.loki/quality/test-results.json" "json.dumps(d.get('failed_count'))")"
+        dpass="$(jfield "$d/.loki/council/evidence-gate-details.json" "json.dumps(d['tests']['pass'])")"
+        if [ -e "$d/.loki/quality/unit-tests.pass" ]; then marker=present; else marker=absent; fi
+        if [ "$leg" = green ]; then
+            [ "$tpass" = true ] && [ "$marker" = present ] && [ "$rc" = 0 ] && [ "$dpass" = true ] \
+                || { _why="control broken: a passing jest summary gave pass=$tpass marker=$marker council rc=$rc details.tests.pass=$dpass"; return; }
+            # A summary that was read and reports no failures is a measured 0.
+            [ "$fcount" = 0 ] || bad="$bad [bash writer: a read 'Tests: 3 passed' summary recorded failed_count=$fcount, want 0]"
+        else
+            [ "$tpass" = false ] || bad="$bad [bash writer: exit 0 + 'Tests: 1 failed' wrote pass=$tpass]"
+            [ "$fcount" = 1 ] || bad="$bad [bash writer: failed_count=$fcount, want 1 (the Tests: line)]"
+            [ "$marker" = absent ] || bad="$bad [bash writer: left unit-tests.pass for a failing run]"
+            [ "$rc" = 1 ] && [ "$dpass" = false ] || bad="$bad [council: the writer's record gave rc=$rc tests.pass=$dpass, want 1/false]"
+        fi
+    done
+    # Council reader (89) and Bun parity on hand-written records: a boolean
+    # pass:true with failed_count > 0 (or the legacy failed > 0) is a failure on
+    # both routes; 0, null (the writer's unparsed count) and missing are not.
+    mkdir -p "$RUN/ef-bun/work"
+    local shapes="fc1:1 legacy2:1 fc0:0 fcnull:0 fcmissing:0" bunargs=""
+    for shape in $shapes; do
+        case "${shape%%:*}" in
+            fc1) json='{"runner":"jest","pass":true,"failed_count":1}' ;;
+            legacy2) json='{"runner":"jest","pass":true,"failed":2}' ;;
+            fc0) json='{"runner":"jest","pass":true,"failed_count":0}' ;;
+            fcnull) json='{"runner":"jest","pass":true,"failed_count":null}' ;;
+            fcmissing) json='{"runner":"jest","pass":true}' ;;
+        esac
+        d="$RUN/ef-council-${shape%%:*}"
+        b="$(council_repo "$d" "$json")" || { _why="fixture ${shape%%:*} failed"; return; }
+        rc="$(council_call "$d" "$b" council_evidence_gate)"
+        [ "$rc" = "${shape#*:}" ] || bad="$bad [council ${shape%%:*}: rc=$rc want ${shape#*:}]"
+        mkdir -p "$RUN/ef-bun/${shape%%:*}/.loki/quality"
+        printf '%s\n' "$json" > "$RUN/ef-bun/${shape%%:*}/.loki/quality/test-results.json"
+        printf '1\n' > "$RUN/ef-bun/${shape%%:*}/.loki/quality/.test-results.iter"
+        bunargs="$bunargs ${shape%%:*}"
+    done
+    cat > "$RUN/ef-bun/probe.ts" <<'TS'
+const repo = process.env.MOAT_REPO!, root = process.env.MOAT_ROOT!;
+const { runTestCoverage } = await import(`${repo}/loki-ts/src/runner/quality_gates.ts`);
+const out: string[] = [];
+for (const name of process.argv.slice(2)) {
+  const cwd = `${root}/${name}`;
+  const r = await runTestCoverage({ lokiDir: `${cwd}/.loki`, cwd, iterationCount: 1, log: () => {} } as never);
+  out.push(`${name}=${r.passed === true && r.inconclusive !== true ? "PASSED" : r.passed === false ? "FAILED" : "INCONCLUSIVE"}`);
+}
+console.log(out.join(" "));
+TS
+    # shellcheck disable=SC2086  # $bunargs is word-split into names on purpose
+    out="$(cd "$RUN/ef-bun/work" && env -u LOKI_STUB_GATE_TEST_COVERAGE MOAT_REPO="$REPO_ROOT" MOAT_ROOT="$RUN/ef-bun" \
+        bun run "$RUN/ef-bun/probe.ts" $bunargs 2> "$RUN/ef-bun/err")"
+    case "$out" in "fc1=FAILED legacy2=FAILED fc0=PASSED fcnull=PASSED fcmissing=PASSED") ;;
+        *) bad="$bad [bun: got '${out:-<none>}', want fc1/legacy2 FAILED and fc0/fcnull/fcmissing PASSED $(head -c 200 "$RUN/ef-bun/err" | tr '\n' ' ')]" ;;
+    esac
+    if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
+}
+
 case_proof_verify_contract() {
     need python3 git bun || return
     local ws="$RUN/pv-ws" route rc want bad=""
@@ -801,6 +887,7 @@ run_case P2.fast-verify-inconclusive-not-zero "loki verify --fast with nothing s
 run_case P2.council-inconclusive-cannot-exit-zero "inconclusive evidence plus a council vote alone cannot approve completion" case_council_inconclusive
 run_case P2.council-readers-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing test results green in the council's readers" case_council_readers_not_shadowed
 run_case P2.checklist-verify-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing PRD checklist checks green (checklist-verify.py, summary, council evidence, hard gate)" case_checklist_not_shadowed
+run_case P2.exit-zero-with-failures-not-pass "a runner that exits 0 while its own summary reports failures (jest 'Tests: 1 failed') is recorded pass:false with no unit-tests.pass, and the council blocks it (bash); a recorded failed_count > 0 (or legacy failed > 0) with pass:true fails the council evidence gate and the Bun test gate alike, while 0, null and a missing count still pass on both" case_exit_zero_with_failures
 
 printf 'moat-p2: finished in %ss\n' "$(( $(date +%s) - T_START ))" >&2
 exit 0

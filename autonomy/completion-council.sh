@@ -1948,6 +1948,15 @@ runner = d.get('runner', 'none')
 # an unrecorded outcome is not a pass. None falls to INCONCLUSIVE below.
 passed = d.get('pass')
 status = d.get('status', '')
+# BACKLOG 89: a recorded failure count above zero is a failure whatever "pass"
+# says, as the Bun gate reads it (quality_gates.ts artifactCount): a numeric
+# failed_count wins, the legacy numeric failed is the fallback, and anything
+# else (null, missing, a bool) is unmeasured, never a failure and never 0.
+def _count(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+failed_n = _count(d.get('failed_count'))
+if failed_n is None:
+    failed_n = _count(d.get('failed'))
 #82 (zero-test-file hardening): a runner that ran but executed ZERO real tests
 # (node --test on a *.test.js with no test() calls; jest --passWithNoTests with
 # no suites) records pass:"inconclusive" + status:"no_tests_run" -- a mini
@@ -1958,7 +1967,7 @@ status = d.get('status', '')
 # Only the boolean True passes as affirmative; only the boolean False blocks.
 if runner == 'none':
     print('PASS:none:true')
-elif passed is False:
+elif passed is False or (failed_n or 0) > 0:
     print('FAIL:%s:false' % runner)
 elif status == 'no_tests_run' or passed is not True:
     # Both are INCONCLUSIVE; NO_PASS names the second: no boolean pass was

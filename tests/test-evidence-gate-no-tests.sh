@@ -465,6 +465,39 @@ case "$reason" in
     *) bad "case11 test_auditor reason" "got [$reason]" ;;
 esac
 
+# ===========================================================================
+# Case 12 (BACKLOG 89): a recorded failed_count > 0 is a failure whatever the
+# pass key says, as the Bun test gate already reads it (quality_gates.ts
+# artifactCount: a numeric failed_count wins, the legacy numeric failed is the
+# fallback, anything else is unmeasured). Controls in the same shape: 0, null
+# (the bash writer's unparsed count), a missing count and a non-numeric bool
+# stay affirmative, so the negatives are not a broken reader.
+# ===========================================================================
+echo "Case 12 (BACKLOG 89): pass:true with failed_count > 0 blocks; 0/null/missing/bool do not"
+n12=0
+while IFS='|' read -r c12 j12 rc12 tp12; do
+    n12=$((n12 + 1))
+    repo="$(new_repo "case12-$n12")"
+    base="$(grepo "$repo" rev-parse HEAD)"
+    add_real_diff "$repo" feature.txt
+    mkdir -p "$repo/.loki/quality"
+    printf '%s\n' "$j12" > "$repo/.loki/quality/test-results.json"
+    LOKI_TEST_PROVENANCE=0 run_gate "$repo" "$base"
+    v="$(jget "$GATE_DETAILS_FILE" tests pass)"
+    if [ "$GATE_RC" = "$rc12" ] && [ "$v" = "$tp12" ]; then
+        ok "case12 $c12 -> rc=$GATE_RC tests.pass=$v"
+    else
+        bad "case12 $c12" "rc=$GATE_RC tests.pass=[$v], want rc=$rc12 tests.pass=$tp12"
+    fi
+done <<'CASE12'
+failed_count-1|{"runner":"jest","pass":true,"failed_count":1,"summary":"Tests: 1 failed, 2 passed"}|1|false
+legacy-failed-2|{"runner":"jest","pass":true,"failed":2}|1|false
+failed_count-0|{"runner":"jest","pass":true,"failed_count":0}|0|true
+failed_count-null|{"runner":"jest","pass":true,"failed_count":null}|0|true
+failed_count-missing|{"runner":"jest","pass":true}|0|true
+failed_count-bool|{"runner":"jest","pass":true,"failed_count":true}|0|true
+CASE12
+
 # ---------------------------------------------------------------------------
 echo
 echo "Total: $((PASS + FAIL))  Passed: $PASS  Failed: $FAIL"

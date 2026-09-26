@@ -12219,7 +12219,9 @@ enforce_test_coverage() {
         # that is the legitimate case they were written for (a package that ships
         # a runner but no npm script).
         local _declared_test_script=""
-        _declared_test_script=$(_LOKI_PKG="${TARGET_DIR:-.}/package.json" python3 -c "
+        # BACKLOG 81 (D7): -E plus the sys.path filter, so the agent's repo (the
+        # cwd) cannot supply json or sitecustomize to this reader.
+        _declared_test_script=$(_LOKI_PKG="${TARGET_DIR:-.}/package.json" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_LOKI_PKG']) as f:
@@ -12339,7 +12341,8 @@ sys.stdout.write(t.strip())
                     # npm test), so the grep only ever picked the LABEL, never
                     # what ran. This corrects the evidence, not the execution.
                     local _ws_script
-                    _ws_script=$(_LOKI_PKG="$pkg_json" python3 -c "
+                    # BACKLOG 81 (D7): same guard as the root reader above.
+                    _ws_script=$(_LOKI_PKG="$pkg_json" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_LOKI_PKG']) as f:
@@ -12659,6 +12662,9 @@ TREOF
         # run instead of re-running the suite. Single source of truth for "tests
         # ran this iteration", set on every return path that writes results.
         printf '%s\n' "${ITERATION_COUNT:-0}" > "$quality_dir/.test-results.iter" 2>/dev/null || true
+        # BACKLOG 91: non-blocking, but nothing was measured: the loop's
+        # stage_complete event reads this and says not_run, not pass.
+        _LOKI_TEST_SUITE_STATUS=not_run
         return 0
     fi
 
@@ -12669,6 +12675,49 @@ TREOF
     # corrupt Evidence Receipt, worse than none. Convert newlines to spaces
     # first, then delete every remaining control char (\000-\037, incl. ESC).
     details=$(echo "$details" | tr '"' "'" | tr '\n' ' ' | tr -d '\000-\037' | head -c 500)
+
+    # BACKLOG 73: a runner that exits 0 while its own summary reports failures
+    # (`jest || true`, a script that swallows the status) failed. The failure
+    # count comes from the runner's summary lines in the FULL output (the details
+    # tail can drop them: the jest branch keeps 3 lines). The highest count
+    # across summaries wins, so output that concatenates several runs (npm test
+    # --workspaces, `jest; vitest`) cannot hide a failed run behind a later
+    # green one. Shapes: jest "Tests: 1 failed, ...", vitest "Tests  1 failed |
+    # ...", pytest "=== 1 failed, 2 passed in 0.1s ===" (or its -q line), node
+    # TAP "# fail 1" and the spec reporter's "<info sign> fail 1", counted only
+    # right after the matching pass line (node TAP echoes a test's own stdout
+    # as "# ..." lines, which must not count), mocha "1 failing", go "--- FAIL:"
+    # lines. A read summary with no failures is a measured 0. With no recognised
+    # summary the old best-effort parse of the tail still applies (null when it
+    # finds nothing). Either way a recorded count above zero is a failure: the
+    # council evidence gate and the Bun gate both read failed_count > 0 as one.
+    # LC_ALL=C: bytes, so any runner output parses; [ \t] not [[:space:]] for
+    # old mawk.
+    local _tr_passed_n _tr_failed_n _tr_summary_red=false
+    _tr_failed_n=$(printf '%s\n' "${output:-}" | LC_ALL=C sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" | LC_ALL=C awk '
+        function upd(n) { if (n > f) f = n; seen = 1 }
+        /^Tests:[ \t]/ || /^[ \t]*Tests[ \t]+[0-9]/ ||
+        /^=+ .*[0-9]+ (passed|failed)/ || /^[0-9]+ (passed|failed).* in [0-9.]+s/ {
+            n = 0; if (match($0, /[0-9]+ failed/)) n = substr($0, RSTART, RLENGTH) + 0; upd(n) }
+        /^[^ A-Za-z0-9]+ fail [0-9]+[ \t]*$/ { if (prev ~ /^[^ A-Za-z0-9]+ pass [0-9]+[ \t]*$/) upd($3 + 0) }
+        /^[ \t]*[0-9]+ passing \(/ { upd(0) }
+        /^[ \t]*[0-9]+ failing[ \t]*$/ { upd($1 + 0) }
+        /^--- FAIL: / { go++ }
+        { prev = $0 }
+        END { if (go > f) { f = go; seen = 1 } if (seen) print f + 0 }')
+    _tr_passed_n=$(printf '%s' "$details" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+    [ -n "$_tr_failed_n" ] || _tr_failed_n=$(printf '%s' "$details" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | head -1)
+    # node --test emits TAP-ish "# pass N" / "# fail N" summary lines, which the
+    # "N passed"/"N failed" pattern above does not match. Fall back to those.
+    [ -n "$_tr_passed_n" ] || _tr_passed_n=$(printf '%s' "$details" | grep -oE '# pass [0-9]+' | grep -oE '[0-9]+' | head -1)
+    [ -n "$_tr_failed_n" ] || _tr_failed_n=$(printf '%s' "$details" | grep -oE '# fail [0-9]+' | grep -oE '[0-9]+' | head -1)
+    [ -n "$_tr_passed_n" ] || _tr_passed_n=null
+    [ -n "$_tr_failed_n" ] || _tr_failed_n=null
+    if [ "$test_passed" = "true" ] && [ "$_tr_failed_n" != "null" ] && [ "$_tr_failed_n" -gt 0 ] 2>/dev/null; then
+        test_passed=false
+        _tr_summary_red=true
+        log_warn "Test suite gate: $test_runner exited 0 but its summary reports $_tr_failed_n failed -- recording a failure"
+    fi
 
     # Evidence Receipt provenance (v7.85.0): record the deterministic FACTS a
     # non-forgeable receipt needs -- the command that ran, its exit code, and a
@@ -12687,6 +12736,8 @@ TREOF
         *)           _tr_cmd="$test_runner" ;;
     esac
     if [ "$test_passed" = "true" ]; then _tr_exit=0; _tr_status="verified"; else _tr_exit=1; _tr_status="failed"; fi
+    # BACKLOG 73: the runner itself exited 0; record that fact, not a made-up 1.
+    if [ "$_tr_summary_red" = "true" ]; then _tr_exit=0; fi
 
     # #82 (zero-test-file hardening): a runner that EXITED 0 but executed ZERO
     # real tests is a mini fake-green -- it records "verified" while proving
@@ -12707,17 +12758,6 @@ TREOF
         _tr_status="no_tests_run"
         log_warn "Verification gap: $test_runner exited 0 but ran ZERO tests -- recording inconclusive (no_tests_run), not verified"
     fi
-
-    # Best-effort pass/fail counts from the summary text (null when not found).
-    local _tr_passed_n _tr_failed_n
-    _tr_passed_n=$(printf '%s' "$details" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-    _tr_failed_n=$(printf '%s' "$details" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | head -1)
-    # node --test emits TAP-ish "# pass N" / "# fail N" summary lines, which the
-    # "N passed"/"N failed" pattern above does not match. Fall back to those.
-    [ -n "$_tr_passed_n" ] || _tr_passed_n=$(printf '%s' "$details" | grep -oE '# pass [0-9]+' | grep -oE '[0-9]+' | head -1)
-    [ -n "$_tr_failed_n" ] || _tr_failed_n=$(printf '%s' "$details" | grep -oE '# fail [0-9]+' | grep -oE '[0-9]+' | head -1)
-    [ -n "$_tr_passed_n" ] || _tr_passed_n=null
-    [ -n "$_tr_failed_n" ] || _tr_failed_n=null
 
     # verification_gap is "none" whenever a real runner executed AND ran tests:
     # the suite ran, so there is no docs-without-execution / source-without-tests
@@ -12888,9 +12928,11 @@ os.replace(tmp, out)
         if [ "$_tr_zero_tests" = "true" ]; then
             rm -f "$quality_dir/unit-tests.pass" 2>/dev/null || true
             log_warn "Test suite gate: $test_runner ran zero tests -- inconclusive (not passed, not failed)"
+            _LOKI_TEST_SUITE_STATUS=not_run  # BACKLOG 91, see the no-runner return
         else
             touch "$quality_dir/unit-tests.pass"
             log_info "Test suite gate: $test_runner passed"
+            _LOKI_TEST_SUITE_STATUS=pass
         fi
         # Coverage block is distinct from tests-red: tests passed, but enforced
         # coverage is below threshold. Return nonzero to gate WITHOUT writing the
@@ -24688,8 +24730,12 @@ EOF
                 local _stg_t0=$(date +%s 2>/dev/null); local _stg_ok=pass
                 # F49: isolate HOME so the project's suite cannot pollute the
                 # user's real home when it execs the generated app.
+                _LOKI_TEST_SUITE_STATUS=""
                 if _loki_with_app_sandbox enforce_test_coverage; then
                     clear_gate_failure "test_coverage"
+                    # BACKLOG 91: a zero-test or no-runner run returns 0 without
+                    # measuring anything; its stage status is not_run, not pass.
+                    if [ "$_LOKI_TEST_SUITE_STATUS" = "not_run" ]; then _stg_ok=not_run; fi
                 else
                     _stg_ok=fail
                     local tc_count

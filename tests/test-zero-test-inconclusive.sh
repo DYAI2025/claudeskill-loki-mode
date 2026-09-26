@@ -523,6 +523,198 @@ else
     _no "H: go-test branch wrong: empty=$H_E(want zero) real=$H_R mixed=$H_M fail=$H_F (want has)"
 fi
 
+# ---- Case I: exit 0 with failures in the runner's own summary (BACKLOG 73) --
+# `npm test` runs `sh ./t.sh`, which prints a canned runner output and exits 0
+# (a script that swallows the runner's status, e.g. `jest || true`). The gate
+# must read the failure count from the summary line and record a failure. Each
+# runner has a green control whose summary reports no failures; the node TAP
+# and jest controls also carry a test's own log line naming failures ("# fail 2"
+# is how node TAP echoes a test's stdout), which must not count.
+export npm_config_update_notifier=false npm_config_audit=false npm_config_fund=false
+if ! command -v npm >/dev/null 2>&1; then
+    _skip "I: npm not on PATH -- exit-0-with-failures cases skipped"
+else
+    ef_run() { # <name> <canned output> -> "pass|failed_count|status|exit_code|marker"
+        local d="$TMP_ROOT/I_$1"
+        mkdir -p "$d"
+        printf '%s\n' '{"name":"ef","version":"1.0.0","private":true,"scripts":{"test":"sh ./t.sh"}}' > "$d/package.json"
+        printf '%s\n' "$2" > "$d/out.txt"
+        printf '#!/bin/sh\ncat ./out.txt\nexit 0\n' > "$d/t.sh"
+        ( cd "$d"; TARGET_DIR="$d" LOKI_GATE_TIMEOUT=60 bash -c "source '$HARNESS'; enforce_test_coverage" >/dev/null 2>&1 )
+        printf '%s|%s|%s|%s|%s\n' "$(tr_field "$d" pass)" "$(tr_field "$d" failed_count)" \
+            "$(tr_field "$d" status)" "$(tr_field "$d" exit_code)" \
+            "$([ -e "$d/.loki/quality/unit-tests.pass" ] && echo marker || echo nomarker)"
+    }
+    ef_expect() { # <name> <want> <canned output>
+        local got
+        got="$(ef_run "$1" "$3")"
+        if [ "$got" = "$2" ]; then _ok "I: $1 -> $got"; else _no "I: $1: want $2, got $got"; fi
+    }
+    RED_WANT="False|1|failed|0|nomarker"
+    ef_expect jest-red "$RED_WANT" "  console.log
+    all green here
+
+Tests:       1 failed, 2 passed, 3 total
+Snapshots:   0 total
+Time:        0.4 s
+Ran all test suites."
+    ef_expect jest-green "True|0|verified|0|marker" "  console.log
+    retried 2 failed uploads
+
+Tests:       3 passed, 3 total
+Snapshots:   0 total
+Time:        0.4 s
+Ran all test suites."
+    # Two runs in one output (npm test --workspaces, `jest; jest`): a later
+    # green summary must not hide the earlier failed one.
+    ef_expect jest-concat-red "$RED_WANT" "Tests:       1 failed, 2 passed, 3 total
+Snapshots:   0 total
+Ran all test suites.
+Tests:       3 passed, 3 total
+Snapshots:   0 total
+Ran all test suites."
+    ef_expect vitest-red "$RED_WANT" " Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+   Duration  0.31s"
+    ef_expect vitest-green "True|0|verified|0|marker" " Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Duration  0.31s"
+    ef_expect pytest-red "$RED_WANT" "FAILED test_x.py::test_a - assert 1 == 2
+========================= 1 failed, 2 passed in 0.03s ========================="
+    ef_expect pytest-green "True|0|verified|0|marker" "========================= 3 passed in 0.02s ========================="
+    ef_expect node-tap-red "$RED_WANT" "TAP version 13
+not ok 1 - adds
+ok 2 - subs
+ok 3 - muls
+1..3
+# tests 3
+# pass 2
+# fail 1
+# cancelled 0"
+    ef_expect node-tap-green "True|0|verified|0|marker" "TAP version 13
+# Subtest: logs
+# fail 2
+ok 1 - logs
+1..1
+# tests 1
+# pass 1
+# fail 0
+# cancelled 0"
+    ef_expect node-spec-red "$RED_WANT" "✖ adds (0.4ms)
+ℹ tests 3
+ℹ pass 2
+ℹ fail 1"
+    ef_expect mocha-red "$RED_WANT" "  2 passing (5ms)
+  1 failing
+
+  1) adds:
+     AssertionError: expected 1 to equal 2"
+    ef_expect mocha-green "True|0|verified|0|marker" "  3 passing (5ms)"
+    ef_expect go-red "$RED_WANT" "--- FAIL: TestAdd (0.00s)
+    add_test.go:9: got 1 want 2
+FAIL
+FAIL	ex	0.1s"
+    # No recognised summary: the old best-effort tail count still applies, and
+    # a count it records above zero is a failure too (never pass:true beside
+    # failed_count > 0, which both readers read as a failure).
+    ef_expect unknown-red "$RED_WANT" "custom runner
+RESULT: 1 failed, 4 passed"
+    # No summary and no count at all: unmeasured (null), unchanged pass.
+    ef_expect unknown-green "True|None|verified|0|marker" "custom runner: all good"
+fi
+
+# ---- Case J: the test_suite stage event (BACKLOG 91) ------------------------
+# The PHASE_UNIT_TESTS block of the loop, cut out of run.sh verbatim, with the
+# gate-failure bookkeeping stubbed and emit_stage_complete capturing its status.
+# A zero-test run and a no-runner run return 0 (non-blocking, inconclusive):
+# their stage status must be the documented not_run, never pass. A real pass is
+# pass and a failure is fail.
+STAGE="$TMP_ROOT/stage.sh"
+{
+    cat "$HARNESS"
+    echo '_loki_with_app_sandbox() { "$@"; }'
+    echo 'clear_gate_failure() { :; }'
+    echo 'track_gate_failure() { echo 1; }'
+    echo 'gate_failure_disposition() { echo block; }'
+    echo 'write_gate_escalation_guidance() { :; }'
+    echo 'emit_stage_complete() { printf "%s %s\n" "$1" "$2" >> "$STAGE_LOG"; }'
+    echo '_stage_block() {'
+    echo '    local gate_failures=""'
+    awk '/^            # Test coverage gate$/ {s=1} s {print} s && /emit_stage_complete "test_suite"/ {e=1} e && /^            fi$/ {exit}' "$RUN_SH"
+    echo '}'
+} > "$STAGE"
+if grep -q 'emit_stage_complete "test_suite"' "$STAGE" && bash -n "$STAGE" 2>/dev/null; then
+    stage_status() { # <repo> -> the status the block emitted for test_suite
+        local log="$1.stage.log"
+        rm -f "$log"
+        ( cd "$1"; TARGET_DIR="$1" STAGE_LOG="$log" LOKI_GATE_TIMEOUT=60 bash -c "source '$STAGE'; _stage_block" >/dev/null 2>&1 )
+        awk '$1 == "test_suite" {print $2}' "$log" 2>/dev/null
+    }
+    J_ZERO="$TMP_ROOT/J_zero"; write_zero_test_repo "$J_ZERO"
+    J_NONE="$TMP_ROOT/J_none"; mkdir -p "$J_NONE"; printf 'print(1)\n' > "$J_NONE/app.py"
+    J_REAL="$TMP_ROOT/J_real"; write_real_test_repo "$J_REAL"
+    J_FAIL="$TMP_ROOT/J_fail"; write_failing_repo "$J_FAIL"
+    JZ="$(stage_status "$J_ZERO")"; JN="$(stage_status "$J_NONE")"
+    JR="$(stage_status "$J_REAL")"; JF="$(stage_status "$J_FAIL")"
+    printf '  [J stage] zero-test=%s no-runner=%s real-pass=%s fail=%s\n' "$JZ" "$JN" "$JR" "$JF"
+    if [ "$JR" = "pass" ] && [ "$JF" = "fail" ]; then
+        _ok "J: control: a real pass emits test_suite pass and a failure emits fail"
+    else
+        _no "J: control broken: real-pass=$JR (want pass), fail=$JF (want fail)"
+    fi
+    if [ "$JZ" = "not_run" ]; then
+        _ok "J: a zero-test run emits stage_complete test_suite not_run (inconclusive), not pass"
+    else
+        _no "J: a zero-test run emitted test_suite '$JZ', want not_run"
+    fi
+    if [ "$JN" = "not_run" ]; then
+        _ok "J: a no-test-runner run emits stage_complete test_suite not_run, not pass"
+    else
+        _no "J: a no-test-runner run emitted test_suite '$JN', want not_run"
+    fi
+else
+    _no "J: could not cut the PHASE_UNIT_TESTS stage block out of run.sh"
+fi
+
+# ---- Case K: the package.json readers run python3 -E (BACKLOG 81, D7) -------
+# enforce_test_coverage reads the root and workspace package.json with inline
+# python3 from inside the agent's repo. A committed json.py (answers every read
+# with a mocha test script) or sitecustomize.py (loaded through an empty
+# PYTHONPATH component) must not steer the runner label. The fixture reaches
+# both readers in one call: a root with workspaces and no test script, and a
+# workspace that declares jest. Clean reads label it monorepo-jest; a shadowed
+# root read gives mocha; a shadowed workspace read gives monorepo-mocha.
+K_REPO="$TMP_ROOT/K_shadow"
+mkdir -p "$K_REPO/packages/a"
+printf '%s\n' '{"name":"ws","version":"1.0.0","private":true,"workspaces":["packages/*"]}' > "$K_REPO/package.json"
+printf '%s\n' '{"name":"a","version":"1.0.0","scripts":{"test":"jest"}}' > "$K_REPO/packages/a/package.json"
+cat > "$K_REPO/json.py" <<'EOF'
+import os
+open(os.environ.get("K_MARK", os.devnull), "a").write("json.py\n")
+class JSONDecodeError(ValueError): pass
+def load(*a, **k): return {"scripts": {"test": "mocha"}}
+def loads(*a, **k): return load()
+def dump(*a, **k): pass
+def dumps(*a, **k): return "{}"
+EOF
+printf '%s\n' 'import os' 'open(os.environ.get("K_MARK", os.devnull), "a").write("sitecustomize.py\n")' > "$K_REPO/sitecustomize.py"
+# Control: an unguarded python3 in this fixture loads both shadows, so an empty
+# marker below is a measurement, not an absence.
+( cd "$K_REPO"; PYTHONPATH=":/nonexistent" K_MARK="$TMP_ROOT/K_ctl.mark" python3 -c 'import json' ) >/dev/null 2>&1
+if grep -q '^json.py$' "$TMP_ROOT/K_ctl.mark" 2>/dev/null && grep -q '^sitecustomize.py$' "$TMP_ROOT/K_ctl.mark" 2>/dev/null; then
+    _ok "K: control: an unguarded python3 in the fixture loads both shadow modules"
+    ( cd "$K_REPO"; PYTHONPATH=":/nonexistent" K_MARK="$TMP_ROOT/K.mark" TARGET_DIR="$K_REPO" LOKI_GATE_TIMEOUT=60 \
+        bash -c "source '$HARNESS'; enforce_test_coverage" >/dev/null 2>&1 )
+    K_RUNNER="$(tr_field "$K_REPO" runner)"
+    if [ "$K_RUNNER" = "monorepo-jest" ] && [ ! -s "$TMP_ROOT/K.mark" ]; then
+        _ok "K: both package.json readers ignore the repo's json.py/sitecustomize.py (runner=monorepo-jest)"
+    else
+        _no "K: a repo module steered the package.json readers: runner=$K_RUNNER (want monorepo-jest), loaded: $(sort -u "$TMP_ROOT/K.mark" 2>/dev/null | tr '\n' ' ')"
+    fi
+else
+    _no "K: control broken: an unguarded python3 in the fixture did not load both shadows"
+fi
+
 # ---- results ---------------------------------------------------------------
 echo "=== results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]
