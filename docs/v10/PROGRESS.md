@@ -207,3 +207,33 @@ never checked for the same runner/status ordering bug -- needs its own
 slice. GF-2/GF-3/GF-4 have sat in "review" status with no reviewer
 assigned all session; they are the only items that would move the moat
 off 2 of 9 proven.
+
+## CI Tests failure root-caused, an earlier wrong conclusion corrected (2026-09-26)
+
+`Tests` failed on `ba6610dc` (shard 3/4): `test-airgap-ollama-host.sh`
+went 2/4. Root-caused by reproducing the exact CI shard-3 sequence
+locally (index-based sharding, `n % 4 == 3` at that commit's test
+count): `tests/test-iteration-grace.sh`'s `probe()` sources
+`autonomy/run.sh` from the shared repo checkout's CWD (never `cd`s into
+its own `$SCRATCH` dir first), and `run.sh:1741-1744`'s provider
+auto-detection writes `.loki/state/provider` as an unconditional side
+effect of being sourced. Every later test in the same CI shard's shared
+checkout inherits that leftover file, and `.loki/state/provider` beats
+`LOKI_PROVIDER` in the CLI's own documented precedence -- so
+`test-airgap-ollama-host.sh`'s `LOKI_PROVIDER=opencode` env var is
+silently overridden by the stale `claude` value.
+
+This corrects an earlier BACKLOG 126 entry that reached the opposite,
+wrong conclusion: I had reproduced the identical symptom locally, but
+my OWN main checkout had independently accumulated a stray
+`.loki/state/provider` from unrelated manual testing during this
+session, and removing it made the test pass -- which I wrongly treated
+as proof the bug was purely local residue, not a real CI-triggering
+mechanism. That stopped the investigation one level too shallow: the
+symptom (a stale file makes the test fail) was real, but the CAUSE I
+attributed it to (local-checkout hygiene) was not the one actually
+firing in CI (cross-test contamination within a shard). Caught by
+actually root-causing the live CI failure log rather than trusting a
+local reproduction that happened to share the same surface symptom for
+a different reason. Fix dispatched: isolate `test-iteration-grace.sh`'s
+two `run.sh`-sourcing call sites into their own scratch CWD.
