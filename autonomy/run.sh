@@ -25859,11 +25859,33 @@ kill_provider_child() {
         fi
         kill -TERM "$child_pid" 2>/dev/null && killed=1
     done
-    # Also kill provider leaf processes by name in case they were reparented.
-    local proc
-    for proc in claude codex aider cline; do
-        pkill -TERM -f "^${proc}( |$)" 2>/dev/null && killed=1
-    done
+    # Also kill provider leaf processes in case they were reparented (to init,
+    # once their immediate parent -- a shell or the provider CLI itself --
+    # exited). A reparented process changes PARENT, not PROCESS GROUP: unless
+    # a process explicitly calls setpgid/setsid, it keeps the pgid it was
+    # launched into, which for every invoke_* call above is this shell's own
+    # pgid ($$). Scope the sweep to that pgid, matched by process name, rather
+    # than a bare `pkill -f "^claude( |$)"` -- that matched the FULL COMMAND
+    # LINE of every "claude", "codex", "aider" or "cline" process on the whole
+    # machine, with no scoping at all, and killed unrelated Claude Code
+    # sessions in other terminals the moment ANY loki-mode run finished,
+    # double-Ctrl-C'd, or Ctrl-C'd in perpetual mode (build prompt D14 and
+    # `feedback-pkill-f-substring-killed-the-session`). Reproduced: a decoy
+    # `claude` process in a DIFFERENT process group survived; one launched
+    # inside this shell's job (matching how a real reparented leaf would sit)
+    # was still caught.
+    local proc my_pgid
+    my_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+    if [ -n "$my_pgid" ]; then
+        for proc in claude codex aider cline; do
+            local leaf_pid leaf_pgid
+            for leaf_pid in $(pgrep -f "^${proc}( |$)" 2>/dev/null); do
+                leaf_pgid="$(ps -o pgid= -p "$leaf_pid" 2>/dev/null | tr -d ' ')"
+                [ -n "$leaf_pgid" ] && [ "$leaf_pgid" = "$my_pgid" ] || continue
+                kill -TERM "$leaf_pid" 2>/dev/null && killed=1
+            done
+        done
+    fi
 
     # Brief wait for graceful exit (max ~2s).
     local i=0
