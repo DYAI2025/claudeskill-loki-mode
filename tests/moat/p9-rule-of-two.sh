@@ -33,6 +33,15 @@ set -uo pipefail
 #       pull_request, workflow_run, workflow_call; any action) does (a), (b)
 #       and (c) together. Units with only trusted triggers (push, schedule,
 #       release, workflow_dispatch) are listed as trusted-triggers-only.
+#       The cache channel, on EVERY unit whatever its triggers: a job holding
+#       a write token (or no permissions block) or a publish secret (any
+#       secrets.* but GITHUB_TOKEN and model credentials) must not restore an
+#       Actions cache (setup-bun without no-cache: true, actions/cache,
+#       setup-node/python/java `cache:`, setup-node v5+ package-manager cache,
+#       setup-go, cache-from type=gha). An issue-triggered agent job runs in
+#       the default branch's cache scope and could write the entry. Positive
+#       control: the pre-fix release.yml publish-npm; negative: the same job
+#       with no-cache, and caches in a read-only or model-key-only job.
 #   P9.comment-trigger-author-gate
 #       An agent job reachable by an event any GitHub user can fire with their
 #       own text checks that user VISIBLY in the YAML, on that event's own
@@ -333,6 +342,38 @@ def cca_cannot_push(st, perms):
     return isinstance(perms, dict)
 
 
+# Secrets that make a job worth poisoning. GITHUB_TOKEN is judged by the job's
+# permissions instead, and model credentials are out of scope here: they
+# cannot push or publish.
+PUBLISH_SECRET = re.compile(r"secrets\.([A-Za-z0-9_]+)")
+MODEL_SECRETS = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"}
+
+
+def cache_restores(steps):
+    """Steps that restore an Actions cache (the channel an issue-triggered job
+    can poison, since it shares the default branch's cache scope)."""
+    out = []
+    for st in steps:
+        uses, w = str(st.get("uses") or ""), st.get("with") or {}
+        name, ver = (uses.split("@") + [""])[:2]
+        major = re.match(r"v(\d+)", ver)
+        if name == "oven-sh/setup-bun" and str(w.get("no-cache", False)).strip().lower() != "true":
+            out.append("oven-sh/setup-bun (caches bun unless no-cache: true)")
+        elif name in ("actions/cache", "actions/cache/restore"):
+            out.append(name)
+        elif name in ("actions/setup-node", "actions/setup-python", "actions/setup-java") \
+                and str(w.get("cache") or "").strip().lower() not in ("", "false"):
+            out.append("%s cache: %s" % (name, w.get("cache")))
+        elif name == "actions/setup-node" and (not major or int(major.group(1)) >= 5) \
+                and str(w.get("package-manager-cache", True)).strip().lower() != "false":
+            out.append("actions/setup-node %s (caches npm unless package-manager-cache: false)" % ver)
+        elif name == "actions/setup-go" and str(w.get("cache", True)).strip().lower() != "false":
+            out.append("actions/setup-go (caches unless cache: false)")
+        elif "type=gha" in str(w.get("cache-from") or ""):
+            out.append("%s cache-from type=gha" % name)
+    return out
+
+
 units, errors, scanned_files = [], [], set()
 wfdir = os.path.join(root, ".github", "workflows")
 for wf in sorted(glob.glob(os.path.join(wfdir, "*.yml")) + glob.glob(os.path.join(wfdir, "*.yaml"))):
@@ -473,11 +514,24 @@ for u in units:
     if untrusted:
         scanned += 1
         verdict = "VIOLATION" if (a and b and c) else "ok"
-    print("SITE %s trig=%s agent=%s a=[%s] b=[%s] c=[%s] verdict=%s" % (
+    # The cache channel, judged on EVERY unit whatever its triggers: a job that
+    # holds a write token or publish secret must not restore a cache, because
+    # an issue-triggered agent job runs in the default branch's cache scope and
+    # can write the entry a release job later executes.
+    held = []
+    if w is None or w:
+        held.append(b[0])
+    held += ["secrets.%s" % s for s in sorted(set(PUBLISH_SECRET.findall(
+        env_text + "\n" + "\n".join(text(s) for s in u["steps"]))) - MODEL_SECRETS)]
+    caches = cache_restores(u["steps"])
+    print("SITE %s trig=%s agent=%s a=[%s] b=[%s] c=[%s] cache=[%s] verdict=%s" % (
         where, ",".join(sorted(trig)) or "any-caller", "+".join(sorted(set(agent))) or "-",
-        "; ".join(a), "; ".join(b), "; ".join(c), verdict))
+        "; ".join(a), "; ".join(b), "; ".join(c), "; ".join(caches) if held else "", verdict))
     if verdict == "VIOLATION":
         violations.append((where, "(a) %s; (b) %s; (c) %s" % (", ".join(a), ", ".join(b), ", ".join(c))))
+    if held and caches:
+        violations.append((where, "(cache) holds %s and restores %s, which an issue-triggered job can write" % (
+            ", ".join(held), ", ".join(caches))))
 
 if check == "rule2":
     # Every workflow or action the npm package ships must be one this scan read.
@@ -794,6 +848,33 @@ jobs:
           LOKI_DELEGATE_PR: '0'
         run: loki start "$GITHUB_REPOSITORY#1"
 YML
+# pre-fix release.yml publish-npm: a publish secret and the default token in a
+# job whose setup-bun restores the bun cache (the cache-poisoning channel).
+cat > "$SYN_BAD/.github/workflows/pre-release.yml" <<'YML'
+name: Release
+on:
+  push:
+    branches: [main]
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+YML
 
 cat > "$SYN_GOOD/.github/workflows/split.yml" <<'YML'
 name: split
@@ -924,6 +1005,46 @@ runs:
         LOKI_DELEGATE_PR: '0'
       run: loki start --simple prd.md
 YML
+# The fixed publish job (no-cache: true), and caches in jobs holding nothing
+# worth poisoning: a read-only job, and one whose only secret is a model key.
+cat > "$SYN_GOOD/.github/workflows/release.yml" <<'YML'
+name: Release
+on:
+  push:
+    branches: [main]
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+          no-cache: true
+      - env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+  unit-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+      - env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: bun test
+YML
 cat > "$SYN_GOOD/.github/actions/agent-only/action.yml" <<'YML'
 name: 'agent only'
 runs:
@@ -985,7 +1106,7 @@ case_rule2() {
     static_case rule2 "bad.yml:agent" "pre-issue-to-pr.yml:resolve" \
         "pre-issue-to-pr-local.yml:resolve" ".github/actions/issue-to-pr/action.yml:(action)" \
         "pre-claude.yml:claude" "pre-enterprise.yml:loki-run" "pre-review.yml:claude-review" \
-        "action.yml:(action)" "pre-publish-interp.yml:publish"
+        "action.yml:(action)" "pre-publish-interp.yml:publish" "pre-release.yml:publish-npm"
 }
 case_gate() {
     static_case gate "bad.yml:agent" "pre-issue-to-pr.yml:resolve" \
