@@ -13184,9 +13184,27 @@ _loki_airgap_audit() {
                 aider)    model_var="LOKI_AIDER_MODEL"    model_id="${LOKI_AIDER_MODEL:-}" ;;
             esac
             if printf '%s' "$model_id" | grep -qiE 'ollama|localhost|127\.0\.0\.1|lmstudio'; then
-                model_host="local weights"
-                model_required="no"
-                model_note="Local model runtime (Ollama / LM Studio / llama.cpp). No inference egress."
+                # A bare "ollama"/"lmstudio" in the model id is only local
+                # evidence when the tool actually talks to this host. Ollama
+                # honors OLLAMA_HOST to redirect its client at a remote
+                # server, so a substring match on the model id alone is
+                # forgeable: OLLAMA_HOST=https://remote.example.com with
+                # model id "ollama/..." would egress to that remote host
+                # while still reading as local. Parse OLLAMA_HOST's actual
+                # host and only trust the substring when no override is set
+                # or the override itself points at loopback.
+                local ollama_host_local=1
+                if [ -n "${OLLAMA_HOST:-}" ] && ! loki_remote_is_local_host "$OLLAMA_HOST"; then
+                    ollama_host_local=0
+                fi
+                if [ "$ollama_host_local" = "1" ]; then
+                    model_host="local weights"
+                    model_required="no"
+                    model_note="Local model runtime (Ollama / LM Studio / llama.cpp). No inference egress."
+                else
+                    model_host="$OLLAMA_HOST"
+                    model_note="OLLAMA_HOST points at a remote host; inference leaves it. Unset OLLAMA_HOST or point it at loopback for zero-egress inference."
+                fi
             else
                 [ -n "$model_host" ] || model_host="remote model provider (no local model configured)"
                 model_note="Remote model gateway. Set $model_var to an ollama/ model id for zero-egress inference."
