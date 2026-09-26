@@ -478,7 +478,9 @@ export const api = {
       };
       runs: Array<{ run_id?: string; cost_usd?: number | null; timestamp?: string | null }>;
       runs_count: number;
-      project_total_usd: number;
+      // null when no run recorded a cost; partial when only some did.
+      project_total_usd: number | null;
+      project_total_partial: boolean;
       budget: {
         limit: number | null;
         // null when a cap is set but no spend was measured (status "unknown").

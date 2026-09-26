@@ -3083,7 +3083,8 @@ class FleetRunResponse(BaseModel):
     running: bool
     phase: str = ""
     iteration: int = 0
-    cost_usd: float = 0.0
+    # None when the project recorded no cost: unknown, never $0.00.
+    cost_usd: Optional[float] = None
     started_at: Optional[str] = None
     duration_seconds: Optional[int] = None
     port: Optional[int] = None
@@ -3094,7 +3095,10 @@ class FleetSummaryResponse(BaseModel):
     total_runs: int
     running_runs: int
     stopped_runs: int
-    total_cost_usd: float
+    # Sum of the runs that recorded a cost; None when none did. Partial when
+    # some runs recorded nothing, so the total is a lower bound.
+    total_cost_usd: Optional[float] = None
+    total_cost_partial: bool = False
 
 
 @app.get(
@@ -3163,7 +3167,7 @@ async def get_fleet_run(identifier: str):
         running=running,
         phase=snap.get("phase", ""),
         iteration=snap.get("iteration", 0),
-        cost_usd=snap.get("cost_usd", 0.0),
+        cost_usd=snap.get("cost_usd"),
         started_at=started_at,
         duration_seconds=duration_seconds,
         port=project.get("port"),
@@ -7845,6 +7849,10 @@ def _compute_cost_snapshot() -> dict:
                 measured = _record_is_measured(data)
                 if measured:
                     cost_recorded = True
+                # Tokens are measured apart from cost: a record that priced an
+                # iteration but carried no token field says nothing about tokens.
+                tokens_measured = _record_is_measured(
+                    {k: data.get(k) for k in _MEASURED_FIELDS if k != "cost_usd"})
 
                 inp = data.get("input_tokens", 0)
                 out = data.get("output_tokens", 0)
@@ -7869,14 +7877,17 @@ def _compute_cost_snapshot() -> dict:
                 # Aggregate by phase and model. `measured` is tracked per
                 # bucket for the same reason as cost_recorded globally: a phase
                 # whose records all carried nothing reports cost null, never a
-                # summed $0.00 beside phases that were really measured.
+                # summed $0.00 beside phases that were really measured. The
+                # same goes for tokens (`tokens_measured`).
                 for bucket, name in ((by_phase, phase), (by_model, model)):
                     if name not in bucket:
-                        bucket[name] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "measured": False}
+                        bucket[name] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                                        "measured": False, "tokens_measured": False}
                     bucket[name]["input_tokens"] += inp
                     bucket[name]["output_tokens"] += out
                     bucket[name]["cost_usd"] += cost
                     bucket[name]["measured"] = bucket[name]["measured"] or measured
+                    bucket[name]["tokens_measured"] = bucket[name]["tokens_measured"] or tokens_measured
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 pass
 
@@ -7914,6 +7925,7 @@ def _compute_cost_snapshot() -> dict:
                         by_model[model]["cost_usd"] += cost
                         # Observed tokens from the tracker (cost_recorded above).
                         by_model[model]["measured"] = True
+                        by_model[model]["tokens_measured"] = True
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 pass
 
@@ -7957,14 +7969,14 @@ def _compute_cost_snapshot() -> dict:
         "estimated_cost_usd": round(estimated_cost, 6) if cost_recorded else None,
         "cost_recorded": cost_recorded,
         "by_phase": {k: {
-            "input_tokens": v["input_tokens"],
-            "output_tokens": v["output_tokens"],
-            "cost_usd": round(v["cost_usd"], 6) if v["measured"] else None,
+            "input_tokens": v["input_tokens"] if v.get("tokens_measured") else None,
+            "output_tokens": v["output_tokens"] if v.get("tokens_measured") else None,
+            "cost_usd": round(v["cost_usd"], 6) if v.get("measured") else None,
         } for k, v in by_phase.items()},
         "by_model": {k: {
-            "input_tokens": v["input_tokens"],
-            "output_tokens": v["output_tokens"],
-            "cost_usd": round(v["cost_usd"], 6) if v["measured"] else None,
+            "input_tokens": v["input_tokens"] if v.get("tokens_measured") else None,
+            "output_tokens": v["output_tokens"] if v.get("tokens_measured") else None,
+            "cost_usd": round(v["cost_usd"], 6) if v.get("measured") else None,
         } for k, v in by_model.items()},
         "budget_limit": budget_limit,
         "budget_used": round(budget_used, 6) if budget_limit is not None and budget_used is not None else None,
@@ -8277,6 +8289,7 @@ def _compute_cost_timeline() -> dict:
     # --- per-run history: from .loki/proofs/*/proof.json --------------------
     runs: list = []
     project_total = 0.0
+    runs_measured = 0
     proofs_dir = _proofs_dir()
     try:
         entries = sorted(proofs_dir.iterdir())
@@ -8294,6 +8307,7 @@ def _compute_cost_timeline() -> dict:
             try:
                 run_cost_num = float(run_cost)
                 project_total += run_cost_num
+                runs_measured += 1
             except (TypeError, ValueError):
                 run_cost_num = None
         runs.append({
@@ -8321,7 +8335,12 @@ def _compute_cost_timeline() -> dict:
         },
         "runs": runs,
         "runs_count": len(runs),
-        "project_total_usd": round(project_total, 6) if runs else 0.0,
+        # Null unless at least one run recorded a cost: runs that each read
+        # "not recorded" do not add up to a $0.00 project. A measured $0.00 run
+        # still makes it 0.0. When only some runs recorded a cost the sum is a
+        # lower bound, and project_total_partial says so.
+        "project_total_usd": round(project_total, 6) if runs_measured else None,
+        "project_total_partial": 0 < runs_measured < len(runs),
         "budget": budget,
     }
 

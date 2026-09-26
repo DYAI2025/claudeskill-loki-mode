@@ -174,7 +174,8 @@ describe('dashboard/static/cost.html', () => {
   };
   const fns = new Function(
     `${pick('esc')}\n${pick('fmtUsd')}\n${pick('statusText')}\n${pick('renderBudget')}\n${pick('renderCurrentRun')}\n` +
-    'return { renderBudget, renderCurrentRun, statusText };')();
+    `${pick('projectTotal')}\n` +
+    'return { renderBudget, renderCurrentRun, statusText, projectTotal };')();
   const points = (out) => {
     const m = /points="([^"]*)"/.exec(out);
     return m ? m[1].trim().split(/\s+/).filter(Boolean).length : 0;
@@ -194,6 +195,15 @@ describe('dashboard/static/cost.html', () => {
       iterations: [{ iteration: 1, cumulative_usd: null }],
     });
     assert.equal(points(out), 0, 'a line was drawn through nothing but unmeasured points');
+  });
+
+  it('the project total over unmeasured runs is not recorded, and a mixed total says partial', () => {
+    // The server sends null when no run recorded a cost, and a sum marked
+    // partial when only some did. A measured $0.00 project stays $0.00.
+    assert.equal(fns.projectTotal({ project_total_usd: null, project_total_partial: false }), 'not recorded');
+    assert.equal(fns.projectTotal({ project_total_usd: 2.5, project_total_partial: true }), '$2.50 (partial)');
+    assert.equal(fns.projectTotal({ project_total_usd: 0, project_total_partial: false }), '$0.00');
+    assert.equal(fns.projectTotal({ project_total_usd: 2.5, project_total_partial: false }), '$2.50');
   });
 
   it('a budget with an unknown percent is not 0.0%', () => {

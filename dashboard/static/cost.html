@@ -136,6 +136,10 @@
     else if (s.split(".")[1].length === 1) s += "0";
     return "$" + s;
   }
+  // A total over runs where only some recorded a cost is a lower bound.
+  function projectTotal(d) {
+    return fmtUsd(d.project_total_usd) + (d.project_total_partial && d.project_total_usd != null ? " (partial)" : "");
+  }
   function badgeClass(v) {
     v = String(v || "").toUpperCase();
     if (v.indexOf("APPROVE") === 0 || v === "PASS" || v === "PASSED") return "b-approve";
@@ -294,7 +298,7 @@
     var b = d.budget || {};
     var cards = '<div class="cards">' +
       '<div class="card"><div class="label">Project total</div>' +
-        '<div class="val">' + fmtUsd(d.project_total_usd) + '</div>' +
+        '<div class="val">' + projectTotal(d) + '</div>' +
         '<div class="note">' + esc(d.runs_count) + ' run(s) recorded</div></div>' +
       '<div class="card"><div class="label">Current run</div>' +
         '<div class="val">' + fmtUsd(d.current_run ? d.current_run.total_usd : null) + '</div>' +

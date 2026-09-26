@@ -18,8 +18,9 @@
 #                                     no metric prop is fed a hardcoded number
 #   P7.unmeasured-cost-never-zero     no cost rendering path turns an unmeasured
 #                                     (null/undefined) cost into 0 or "$0.00",
-#                                     and the budget/cost endpoints send null
-#                                     (not 0) for spend nobody measured
+#                                     and the budget, cost-timeline and fleet
+#                                     endpoints send null (not 0) for spend
+#                                     nobody measured, per run and in totals
 #
 # Contract (tests/moat): one "CASE <ID> PASS|FAIL <text>" stdout line per case,
 # diagnostics on stderr, exit 0 whenever the script ran to completion. A missing
@@ -534,7 +535,7 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 # ---------------------------------------------------------------------------
 # P7.no-sample-data-panels
 # ---------------------------------------------------------------------------
-# Four rules, all on comment-stripped source:
+# Five rules, all on comment-stripped source:
 #   1. A component with a sample fallback (`x || generateSample*()`,
 #      `x || SAMPLE_*`, `x ?? sampleFoo`) must not be reachable from a routed
 #      page (web-app/src/pages/*, App.tsx) through the JSX mount graph. Passing a
@@ -550,8 +551,18 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 #      nobody measured, rendered as a reading (`gatePassRate={0.8}`,
 #      `testCoverage={i > 2 ? 60 : 20}`); an unmeasured value is null and the
 #      component says so. Layout props (size, thickness) are not metric names.
-# dashboard-ui web components are all shipped in the bundle, so rules 1 and 3
-# apply to every dashboard-ui component file directly.
+#   5. No sample, mock, demo, fake or dummy source is assigned, returned, fed
+#      to a JSX prop or used as initial state with no `||`/`??` in front, and no
+#      useState starts from a generate*() function. These are the unconditional
+#      forms rule 1 cannot see: `this._phases = this._getDemoData()` in a catch
+#      block (the old cost waterfall) and `useState(generateOverviewCards)` (the
+#      old admin overview). A name counts when a camelCase word is Sample, Mock,
+#      Demo, Fake or Dummy (Mockup does not); is/has/should/can/show flags are
+#      not data sources. Like rule 3 it applies to every web-app source file,
+#      reachable or not: a hook or helper returning demo rows is not a JSX tag,
+#      so the mount graph cannot see it.
+# dashboard-ui web components are all shipped in the bundle, so rules 1, 3 and
+# 5 apply to every dashboard-ui component file directly.
 cat > "$MOAT_TMP/sample-panels.py" <<'PY'
 import os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -563,6 +574,20 @@ METRIC = re.compile(r'\b\w*(?:uses|count|rating|tokens|cost|percent|total|score|
 NUM = r'-?\d+(?:\.\d+)?'
 HARDPROP = re.compile(r'\b(?:\w*(?:Rate|Coverage|Score|Tokens|Cost|Percent|Percentage|Passing|Generated|Modified|Usage|Spend|Confidence|Errors|Complexity)'
                       r'|rate|coverage|score|tokens|cost|percent|percentage|confidence)=\{\s*(?:' + NUM + r'|[^{}?]*\?\s*' + NUM + r'\s*:\s*' + NUM + r')\s*\}')
+ID = r'((?:this\.)?[A-Za-z_$][\w$]*)'
+ASSIGN = re.compile(r'(?:(?<![=!<>+\-*/%&|^?])=(?![=>])\s*\{?|\breturn\b)\s*(?:\(\s*\)\s*=>\s*)?' + ID)
+STATE = re.compile(r'\buseState\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?' + ID)
+DEMO = re.compile(r'(?:^|[a-z\d_$])(?:Sample|Mock|Demo|Fake|Dummy)(?![a-z])|^_*(?:sample|mock|demo|fake|dummy)(?=[A-Z_\d])|^_*(?:SAMPLE|MOCK|DEMO|FAKE|DUMMY)_')
+FLAG = re.compile(r'^_*(?:is|has|should|can|show)[A-Z]')
+GEN = re.compile(r'^_*generate[A-Z]')
+def demo_lines(s):
+    hits = set()
+    for rx, gen in ((ASSIGN, False), (STATE, True)):
+        for m in rx.finditer(s):
+            name = re.sub(r'^this\.', '', m.group(1))
+            if not FLAG.search(name) and (DEMO.search(name) or (gen and GEN.search(name))):
+                hits.add(s.count('\n', 0, m.start(1)) + 1)
+    return sorted(hits)
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
 findings = []
@@ -601,6 +626,8 @@ for f in sorted(reach):
 for f in files:
     for ln in lines_matching(src[f], METRIC):
         findings.append(f'{rel(f)}:{ln} Math.random() feeds a rendered metric')
+    for ln in demo_lines(src[f]):
+        findings.append(f'{rel(f)}:{ln} demo/sample data assigned or used as state')
 for d in dash_dirs:
     for f in moatlib.walk(d, ('.js',)):
         s = moatlib.strip_comments(moatlib.read(f))
@@ -608,6 +635,8 @@ for d in dash_dirs:
             findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} sample-data fallback in a shipped web component')
         for ln in lines_matching(s, METRIC):
             findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} Math.random() feeds a rendered metric')
+        for ln in demo_lines(s):
+            findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} demo/sample data assigned in a shipped web component')
 print(f'SCANNED pages={len(pages)} reachable={len(reach)} files={len(files)}')
 for f in sorted(reach):
     print('REACH ' + rel(f))
@@ -621,8 +650,8 @@ case_sample_panels() {
     local ctl="$MOAT_TMP/sample-ctl" rc out
     # Positive control: a page reaching a sample-fallback panel and a random
     # metric must both be flagged; confetti randomness must not be.
-    mkdir -p "$ctl/src/pages" "$ctl/src/components" "$ctl/fixed/src/pages" "$ctl/fixed/src/components"
-    printf '%s\n' 'export function P() { return <div><Panel /><Stats /><Clean /><Gauge /><Plain /></div>; }' > "$ctl/src/pages/P.tsx"
+    mkdir -p "$ctl/src/pages" "$ctl/src/components" "$ctl/fixed/src/pages" "$ctl/fixed/src/components" "$ctl/dash/components"
+    printf '%s\n' 'export function P() { return <div><Panel /><Stats /><Clean /><Gauge /><Plain /><Forms /><Honest /></div>; }' > "$ctl/src/pages/P.tsx"
     printf '%s\n' 'export function Panel({ data }) { const d = data || generateSampleData(); return <b>{d}</b>; }' > "$ctl/src/components/Panel.tsx"
     printf '%s\n' 'export function Stats() { const s = { uses: Math.floor(Math.random() * 10) }; return <i>{s.uses}</i>; }' > "$ctl/src/components/Stats.tsx"
     printf '%s\n' 'export function Clean() { const left = Math.random() * 100; return <i style={{ left }} />; }' > "$ctl/src/components/Clean.tsx"
@@ -634,15 +663,68 @@ case_sample_panels() {
     printf '%s\n' 'export function P() { return <div><Panel data={x} /><Gauge g={g} /></div>; }' > "$ctl/fixed/src/pages/P.tsx"
     printf '%s\n' 'export function Panel({ data }) { return <b>{data ?? null}</b>; }' > "$ctl/fixed/src/components/Panel.tsx"
     printf '%s\n' 'export function Gauge({ g }) { return g == null ? null : <Ring gatePassRate={g} size={28} />; }' > "$ctl/fixed/src/components/Gauge.tsx"
+    # Rule 5: every unconditional form on its own line (lines 2-7), each
+    # flagged individually; flags, hooks, Mockup names, id generators and
+    # strings in Honest.tsx never are.
+    printf '%s\n' 'export function Forms() {' \
+        '  const [cards] = useState(generateOverviewCards);' \
+        '  const [rows] = useState<Record<string, Row>>(() => generateRows(5));' \
+        '  const [users] = useState(SAMPLE_USERS);' \
+        '  try { phases = load(); } catch { phases = this._getDemoData(); }' \
+        '  const t = demoTotals;' \
+        '  return <T rows={mockRows} />; }' > "$ctl/src/components/Forms.tsx"
+    printf '%s\n' 'export function Honest() {' \
+        '  const on = isDemoMode(); const [n] = useState(0); const m = InputMockup();' \
+        "  const id = generateId(); const s = sample; const k = 'mock_integrity';" \
+        '  const [x] = useState(() => load()); const y = this._showMockBanner;' \
+        '  return <T rows={rows} />; }' > "$ctl/src/components/Honest.tsx"
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/src" 2>&1)" || rc=$?
     if [ "$rc" != 1 ] || ! grep -q 'components/Panel.tsx:1 sample-data fallback' <<<"$out" \
         || ! grep -q 'components/Stats.tsx:1 Math.random' <<<"$out" || grep -q '^FINDING.*Clean.tsx' <<<"$out" \
         || ! grep -q 'components/Gauge.tsx:2 hardcoded number' <<<"$out" \
-        || ! grep -q 'components/Gauge.tsx:3 hardcoded number' <<<"$out" || grep -q '^FINDING.*Plain.tsx' <<<"$out"; then
+        || ! grep -q 'components/Gauge.tsx:3 hardcoded number' <<<"$out" || grep -q '^FINDING.*Plain.tsx' <<<"$out" \
+        || grep -q '^FINDING.*Honest.tsx' <<<"$out"; then
         echo "FAIL|positive control failed (rc=$rc): $(grep -v '^REACH ' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0
     fi
+    for n in 2 3 4 5 6 7; do
+        grep -q "components/Forms.tsx:$n demo/sample data assigned" <<<"$out" \
+            || { echo "FAIL|positive control: rule 5 missed Forms.tsx line $n: $(sed -n "${n}p" "$ctl/src/components/Forms.tsx")"; return 0; }
+    done
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/fixed/src" 2>&1)" || rc=$?
     [ "$rc" = 0 ] || { echo "FAIL|control: a panel without a sample fallback was flagged: $(grep -v '^REACH ' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0; }
+    # The cost waterfall's old failure path, verbatim: on a failed read it drew
+    # a hardcoded $0.85/$3.20 breakdown as if it were this run. A shipped web
+    # component carrying it must be flagged at the assignment (line 10).
+    cat > "$ctl/dash/components/loki-cost-waterfall.js" <<'JS'
+export class LokiCostWaterfall extends LokiElement {
+  async _loadData() {
+    const api = this._api;
+    try {
+      const data = await api._get('/api/v2/cost/breakdown');
+      this._phases = data.phases || [];
+    } catch {
+      if (api !== this._api) return;
+      if (this._phases.length === 0) {
+        this._phases = this._getDemoData();
+        this._budget = 10.00;
+        this._totalCost = this._phases.reduce((sum, p) => sum + p.cost_usd, 0);
+      }
+    }
+    this.render();
+  }
+
+  _getDemoData() {
+    return [
+      { phase: 'planning',  cost_usd: 0.85, tokens: 12400 },
+      { phase: 'building',  cost_usd: 3.20, tokens: 68500 },
+    ];
+  }
+}
+JS
+    rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/fixed/src" "$ctl/dash/components" 2>&1)" || rc=$?
+    { [ "$rc" = 1 ] && grep -q '^FINDING dash/components/loki-cost-waterfall.js:10 demo/sample data assigned' <<<"$out" \
+        && [ "$(grep -c '^FINDING' <<<"$out")" = 1 ]; } \
+        || { echo "FAIL|positive control: the old waterfall catch-block demo fallback was not flagged exactly once (rc=$rc): $(grep '^FINDING' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0; }
 
     rc=0
     python3 "$MOAT_TMP/sample-panels.py" "$REPO_ROOT/web-app/src" \
@@ -701,34 +783,70 @@ PY
 # budget reader that re-derives 0 from nothing makes every honest formatter
 # above print "$0.00 of $10.00 used, 0.0%". One scenario per process (no module
 # state carries over), LOKI_DIR resolved by the app's own resolver, a budget cap
-# of $10, and one efficiency record:
-#   unmeasured     no token or cost field    -> every budget field null, status
-#                                               never ok/warn/exceeded
-#   measured       tokens + cost_usd 2.5     -> every field a positive number
-#   measured-zero  tokens + cost_usd 0.0     -> spent/percent read 0, not null
-# The last two are the controls: a fix that nulls every zero is as wrong.
+# of $10, one efficiency record, per-run proofs, and a fleet registry of its own
+# under the scenario directory (never the operator's ~/.loki):
+#   unmeasured     no token or cost field    -> every budget field and the
+#                                               by_phase/by_model token counts
+#                                               null, status never
+#                                               ok/warn/exceeded; two
+#                                               proofs with usd null -> project
+#                                               total null; fleet run cost and
+#                                               fleet total null
+#   measured       tokens + cost_usd 2.5     -> every field a positive number;
+#                                               proof 2.5 -> total 2.5; fleet 2.5
+#   measured-zero  tokens + cost_usd 0.0     -> spent/percent read 0, not null;
+#                                               proof 0.0 -> total 0; fleet 0
+#   mixed          as measured, plus a null  -> project total 2.5 marked
+#                  proof and an unmeasured      partial; fleet runs 2.5 and
+#                  second fleet project         null, fleet total 2.5 partial
+# measured, measured-zero and mixed are the controls: a fix that nulls every
+# zero, or that drops the measured runs from a mixed total, is as wrong.
 cat > "$MOAT_TMP/budget-null.py" <<'PY'
 import json, numbers, os, sys
 repo, loki, scenario = sys.argv[1:4]
 sys.path.insert(0, repo)
 os.environ.pop('LOKI_BUDGET_LIMIT', None)
 os.environ['LOKI_DIR'] = loki
+# mixed reads as measured for every budget field; only its totals differ.
+kind = {'mixed': 'measured'}.get(scenario, scenario)
 extra = {
     'unmeasured': {},
     'measured': {'input_tokens': 1000, 'output_tokens': 500, 'cost_usd': 2.5},
     'measured-zero': {'input_tokens': 9412, 'output_tokens': 11008, 'cost_usd': 0.0},
-}[scenario]
+}[kind]
+def write(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as fh:
+        json.dump(obj, fh)
 rec = dict({'iteration': 1, 'model': 'sonnet', 'phase': 'build'}, **extra)
-os.makedirs(os.path.join(loki, 'metrics', 'efficiency'))
-with open(os.path.join(loki, 'metrics', 'efficiency', 'iteration-1.json'), 'w') as fh:
-    json.dump(rec, fh)
-with open(os.path.join(loki, 'metrics', 'budget.json'), 'w') as fh:
-    json.dump({'limit': 10}, fh)
+write(os.path.join(loki, 'metrics', 'efficiency', 'iteration-1.json'), rec)
+write(os.path.join(loki, 'metrics', 'budget.json'), {'limit': 10})
+# (proof run costs, want project_total_usd, want partial, fleet: want per-run
+# costs sorted with None first, want fleet total, want fleet partial)
+NULL = {'usd': None, 'available': False}
+PLAN = {
+    'unmeasured': ([NULL, NULL], None, False, [None], None, False),
+    'measured': ([{'usd': 2.5, 'available': True}], 2.5, False, [2.5], 2.5, False),
+    'measured-zero': ([{'usd': 0.0, 'available': True}], 0.0, False, [0.0], 0.0, False),
+    'mixed': ([NULL, {'usd': 2.5, 'available': True}], 2.5, True, [None, 2.5], 2.5, True),
+}[scenario]
+for i, cost in enumerate(PLAN[0], 1):
+    write(os.path.join(loki, 'proofs', f'run-{i}', 'proof.json'),
+          {'run_id': f'run-{i}', 'generated_at': f'2026-09-0{i}T00:00:00Z', 'cost': cost})
 from fastapi.testclient import TestClient
-from dashboard import server
+from dashboard import server, registry
+home = os.path.dirname(loki)
+registry.REGISTRY_DIR = type(registry.REGISTRY_DIR)(os.path.join(home, 'registry'))
+registry.REGISTRY_FILE = registry.REGISTRY_DIR / 'projects.json'
+registry.register_project(home, name='moat-p7')
+if scenario == 'mixed':
+    other = os.path.join(home, 'other')
+    write(os.path.join(other, '.loki', 'metrics', 'efficiency', 'iteration-1.json'),
+          {'iteration': 1, 'model': 'sonnet', 'phase': 'build'})
+    registry.register_project(other, name='moat-p7-unmeasured')
 client = TestClient(server.app, raise_server_exceptions=False)
 got = {}
-for path in ('/api/cost', '/api/budget', '/api/cost/timeline'):
+for path in ('/api/cost', '/api/budget', '/api/cost/timeline', '/api/fleet/runs', '/api/fleet/summary'):
     r = client.get(path)
     if r.status_code != 200:
         print(f'FATAL GET {path} -> HTTP {r.status_code}')
@@ -738,6 +856,8 @@ for path in ('/api/cost', '/api/budget', '/api/cost/timeline'):
 FIELDS = [
     ('/api/cost budget_used', '/api/cost', ['budget_used'], True),
     ('/api/cost budget_remaining', '/api/cost', ['budget_remaining'], False),
+    ('/api/cost by_phase.build.input_tokens', '/api/cost', ['by_phase', 'build', 'input_tokens'], False),
+    ('/api/cost by_model.sonnet.output_tokens', '/api/cost', ['by_model', 'sonnet', 'output_tokens'], False),
     ('/api/budget current_cost', '/api/budget', ['current_cost'], True),
     ('/api/budget remaining', '/api/budget', ['remaining'], False),
     ('/api/cost/timeline budget.used', '/api/cost/timeline', ['budget', 'used'], True),
@@ -760,18 +880,46 @@ for label, path, keys, zero in FIELDS:
     v = dig(got[path], keys)
     if v is MISSING:
         bad.append(f'{label} missing')
-    elif scenario == 'unmeasured' and v is not None:
+    elif kind == 'unmeasured' and v is not None:
         bad.append(f'{label} = {v!r}, want null')
-    elif scenario == 'measured' and not (isnum(v) and v > 0):
+    elif kind == 'measured' and not (isnum(v) and v > 0):
         bad.append(f'{label} = {v!r}, want a positive number')
-    elif scenario == 'measured-zero' and not (isnum(v) and (v == 0) == zero):
+    elif kind == 'measured-zero' and not (isnum(v) and (v == 0) == zero):
         bad.append(f'{label} = {v!r}, want {"0" if zero else "a positive number"}')
+    elif kind not in ('unmeasured', 'measured', 'measured-zero'):
+        bad.append(f'{label}: scenario {scenario!r} has no expectation')
 status = dig(got['/api/cost/timeline'], ['budget', 'status'])
-if scenario == 'unmeasured' and status in ('ok', 'warn', 'exceeded', MISSING):
+if kind == 'unmeasured' and status in ('ok', 'warn', 'exceeded', MISSING):
     bad.append(f'/api/cost/timeline budget.status = {status!r} claims a reading')
-if scenario != 'unmeasured' and status != 'ok':
+if kind != 'unmeasured' and status != 'ok':
     bad.append(f'/api/cost/timeline budget.status = {status!r}, want ok')
-print(f'CHECKED {len(FIELDS) + 1} fields ({scenario})')
+# Totals: exact value (null, 0 or a number) and an exact partial flag, which
+# must be present: a mixed total that does not say "partial" reads as complete.
+def same(v, want):
+    if want is None:
+        return v is None
+    return isnum(v) and abs(v - want) < 1e-9
+_, want_total, want_partial, want_runs, want_fleet, want_fleet_partial = PLAN
+TOTALS = [
+    ('/api/cost/timeline project_total_usd', dig(got['/api/cost/timeline'], ['project_total_usd']), want_total),
+    ('/api/cost/timeline project_total_partial', dig(got['/api/cost/timeline'], ['project_total_partial']), want_partial),
+    ('/api/fleet/summary total_cost_usd', dig(got['/api/fleet/summary'], ['total_cost_usd']), want_fleet),
+    ('/api/fleet/summary total_cost_partial', dig(got['/api/fleet/summary'], ['total_cost_partial']), want_fleet_partial),
+]
+for label, v, want in TOTALS:
+    if v is MISSING:
+        bad.append(f'{label} missing')
+    elif isinstance(want, bool):
+        if v is not want:
+            bad.append(f'{label} = {v!r}, want {want!r}')
+    elif not same(v, want):
+        bad.append(f'{label} = {v!r}, want {"null" if want is None else repr(want)}')
+runs = got['/api/fleet/runs']
+fleet = sorted((r.get('cost_usd', MISSING) for r in runs if isinstance(r, dict)),
+               key=lambda v: (v is not None, v if isnum(v) else 0))
+if len(fleet) != len(want_runs) or not all(same(v, w) for v, w in zip(fleet, want_runs)):
+    bad.append(f'/api/fleet/runs cost_usd = {fleet!r}, want {want_runs!r}')
+print(f'CHECKED {len(FIELDS) + len(TOTALS) + 2} fields ({scenario})')
 for b in bad:
     print('BAD ' + b)
 sys.exit(1 if bad else 0)
@@ -784,7 +932,7 @@ cost_server_leg() {
     local sc d rc out
     # Controls first: a red unmeasured leg means something only once the same
     # probe has read real numbers back.
-    for sc in measured measured-zero unmeasured; do
+    for sc in measured measured-zero mixed unmeasured; do
         d="$MOAT_TMP/budget-$sc"
         mkdir -p "$d/.loki"
         rc=0
@@ -867,7 +1015,7 @@ EOF
     sed "s#$REPO_ROOT/##; s/^/  /" "$MOAT_TMP/cost.txt" >&2
     case "$rc" in
         0) if [ -n "$srv_fail" ]; then echo "FAIL|$srv_fail"
-           else echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass; /api/cost, /api/budget and /api/cost/timeline send null for unmeasured spend, numbers for measured and measured-zero"; fi ;;
+           else echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass; /api/cost, /api/budget, /api/cost/timeline (budget and project total) and /api/fleet/runs + /api/fleet/summary send null for unmeasured spend, numbers for measured and measured-zero, a partial total for mixed"; fi ;;
         1) echo "FAIL|$(grep -c '^HIT' "$MOAT_TMP/cost.txt") unmeasured-cost-as-zero site(s): $(grep '^HIT' "$MOAT_TMP/cost.txt" | sed "s#^HIT $REPO_ROOT/##; s/: .*//" | tr '\n' ' ')${srv_fail:+; $srv_fail}" ;;
         *) echo "FAIL|scanner refused (rc=$rc)${srv_fail:+; $srv_fail}" ;;
     esac
