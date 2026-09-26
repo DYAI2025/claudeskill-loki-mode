@@ -19331,6 +19331,12 @@ PYEOF
 _intelligent_usage_regen() {
     local target_dir="${TARGET_DIR:-.}"
     local usage_path="$target_dir/USAGE.md"
+    # Only the provider the operator chose may see a prompt (V10 P5): on any
+    # other provider keep the agent-written USAGE.md. Policy (and the
+    # LOKI_ALLOW_CLAUDE_SIDECALLS=1 opt-in) lives in providers/loader.sh,
+    # sourced at the top of this file.
+    # ponytail: upgrade path is routing this call through provider_invoke_argv.
+    loki_claude_sidecall_allowed 2>/dev/null || return 0
     # Find a working `claude` binary; if absent, bail silently.
     if ! command -v claude >/dev/null 2>&1; then
         return 0

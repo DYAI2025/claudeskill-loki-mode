@@ -13251,16 +13251,27 @@ _loki_airgap_audit() {
 
     # Provider inference endpoint: the one egress that is genuinely required,
     # unless the active provider serves weights locally.
-    local provider="${LOKI_PROVIDER:-claude}"
+    # Judge the provider `loki start` would use, with cmd_start's precedence:
+    # the project's saved choice (.loki/state/provider, `loki provider set`)
+    # wins over LOKI_PROVIDER. Reading only the env var reported a saved claude
+    # project as air-gap ready. A --provider flag at start time is not visible
+    # here; with nothing set, run.sh may auto-detect another installed CLI.
+    local provider="" provider_src="$LOKI_DIR/state/provider"
+    [ -f "$LOKI_DIR/state/provider" ] && provider=$(cat "$LOKI_DIR/state/provider" 2>/dev/null)
+    if [ -z "$provider" ]; then
+        provider_src="LOKI_PROVIDER"
+        provider="${LOKI_PROVIDER:-}"
+        [ -n "$provider" ] || { provider="claude"; provider_src="default"; }
+    fi
     local model_host="" model_required="yes" model_note=""
     case "$provider" in
         claude)
             model_host="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
-            model_note="Claude Code inference. Set ANTHROPIC_BASE_URL to an in-network gateway, or switch to a local-weights provider."
+            model_note="Claude Code inference. An in-network gateway (ANTHROPIC_BASE_URL) keeps it inside your network but is still counted as required egress here; only a local-weights provider clears it."
             ;;
         codex)
             model_host="${OPENAI_BASE_URL:-https://api.openai.com}"
-            model_note="Codex inference. Point at an in-network gateway or switch provider."
+            model_note="Codex inference. An in-network gateway (OPENAI_BASE_URL) is still counted as required egress here; only a local-weights provider clears it."
             ;;
         opencode|cline|aider)
             model_host="${OPENAI_BASE_URL:-${OPENROUTER_API_KEY:+https://openrouter.ai}}"
@@ -13276,7 +13287,14 @@ _loki_airgap_audit() {
                 cline)    model_var="LOKI_CLINE_MODEL"    model_id="${LOKI_CLINE_MODEL:-}" ;;
                 aider)    model_var="LOKI_AIDER_MODEL"    model_id="${LOKI_AIDER_MODEL:-}" ;;
             esac
-            if printf '%s' "$model_id" | grep -qiE 'ollama|localhost|127\.0\.0\.1|lmstudio'; then
+            # An Ollama cloud model (tag ending ":cloud" or "-cloud") runs on
+            # ollama.com through the local daemon (docs.ollama.com/cloud), so
+            # naming ollama is not evidence of local inference regardless of
+            # OLLAMA_HOST.
+            if printf '%s' "$model_id" | grep -qiE '[:-]cloud$'; then
+                model_host="https://ollama.com (Ollama cloud model $model_id)"
+                model_note="Ollama cloud models run on ollama.com. Set $model_var to a local ollama/ model id (no :cloud or -cloud tag)."
+            elif printf '%s' "$model_id" | grep -qiE 'ollama|localhost|127\.0\.0\.1|lmstudio'; then
                 # A bare "ollama"/"lmstudio" in the model id is only local
                 # evidence when the tool actually talks to this host. Ollama
                 # honors OLLAMA_HOST to redirect its client at a remote
@@ -13293,7 +13311,7 @@ _loki_airgap_audit() {
                 if [ "$ollama_host_local" = "1" ]; then
                     model_host="local weights"
                     model_required="no"
-                    model_note="Local model runtime (Ollama / LM Studio / llama.cpp). No inference egress."
+                    model_note="Local model runtime named by $model_var=$model_id. Judged from the model id (and OLLAMA_HOST when set): the endpoint set in the opencode, cline or aider config is not read, so confirm it is on this host or inside your network."
                 else
                     model_host="$OLLAMA_HOST"
                     model_note="OLLAMA_HOST points at a remote host; inference leaves it. Unset OLLAMA_HOST or point it at loopback for zero-egress inference."
@@ -13309,15 +13327,35 @@ _loki_airgap_audit() {
             ;;
     esac
 
+    # LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine side-calls prompt the claude
+    # CLI under another provider: inference to Anthropic whatever the model.
+    # Same policy helper the side-call sites use (providers/loader.sh).
+    local sidecall_required="no" sidecall_host="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
+    type loki_claude_sidecall_allowed >/dev/null 2>&1 \
+        || . "$_LOKI_SCRIPT_DIR/../providers/loader.sh" 2>/dev/null
+    if [ "$provider" != "claude" ] && command -v claude >/dev/null 2>&1 \
+       && loki_claude_sidecall_allowed "$provider" 2>/dev/null; then
+        sidecall_required="yes"
+    fi
+    local blocked="$model_required"
+    [ "$sidecall_required" = "yes" ] && blocked="yes"
+
     # Optional egress, each individually disableable.
+    # Telemetry: the same gate main() used to send this command's own event.
+    # It is ON by default for an individual interactive install, so a
+    # hardcoded "off" misreported the one egress this audit itself triggers.
     local tel_state="off"
-    [ "${LOKI_TELEMETRY:-}" = "on" ] && tel_state="on"
+    if declare -f _loki_telemetry_enabled >/dev/null 2>&1 && _loki_telemetry_enabled; then
+        tel_state="on"
+    fi
+    local tel_host="${LOKI_POSTHOG_HOST:-https://us.i.posthog.com}"
     local upd_state="on"
     [ "${LOKI_NO_UPDATE_CHECK:-0}" = "1" ] && upd_state="off"
 
     if [ "$as_json" = "true" ]; then
-        _AG_PROV="$provider" _AG_HOST="$model_host" _AG_REQ="$model_required" \
-        _AG_NOTE="$model_note" _AG_TEL="$tel_state" _AG_UPD="$upd_state" \
+        _AG_PROV="$provider" _AG_PSRC="$provider_src" _AG_HOST="$model_host" _AG_REQ="$model_required" \
+        _AG_NOTE="$model_note" _AG_TEL="$tel_state" _AG_TELHOST="$tel_host" _AG_UPD="$upd_state" \
+        _AG_SC="$sidecall_required" _AG_SCHOST="$sidecall_host" \
         python3 -c '
 import json, os
 req = os.environ["_AG_REQ"] == "yes"
@@ -13325,14 +13363,14 @@ egress = [{
     "name": "model_inference",
     "host": os.environ["_AG_HOST"],
     "required": req,
-    "disable": "use a local-weights provider (ollama/, lmstudio/) or an in-network gateway",
+    "disable": "use a local-weights provider (opencode, cline or aider with a local ollama/ or lmstudio/ model id)",
     "note": os.environ["_AG_NOTE"],
 }, {
     "name": "telemetry",
-    "host": "telemetry endpoint",
+    "host": os.environ["_AG_TELHOST"],
     "required": False,
     "enabled": os.environ["_AG_TEL"] == "on",
-    "disable": "loki telemetry off (already the default)",
+    "disable": "loki telemetry off, DO_NOT_TRACK=1, or LOKI_AIRGAP=true (on by default for interactive installs; auto-off in CI)",
 }, {
     "name": "update_check",
     "host": "registry.npmjs.org",
@@ -13340,21 +13378,39 @@ egress = [{
     "enabled": os.environ["_AG_UPD"] == "on",
     "disable": "export LOKI_NO_UPDATE_CHECK=1",
 }]
+if os.environ["_AG_SC"] == "yes":
+    egress.append({
+        "name": "claude_sidecalls",
+        "host": os.environ["_AG_SCHOST"],
+        "required": True,
+        "disable": "unset LOKI_ALLOW_CLAUDE_SIDECALLS",
+        "note": "LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine steps prompt the claude CLI under this provider",
+    })
 blockers = [e for e in egress if e.get("required")]
 print(json.dumps({
     "provider": os.environ["_AG_PROV"],
+    "provider_source": os.environ["_AG_PSRC"],
     "airgap_ready": not blockers,
     "required_egress": [e["name"] for e in blockers],
     "egress": egress,
+    "not_audited": [{
+        "name": "package_installs",
+        "note": "app runner (npm, pip, docker) for the built app, dashboard venv (PyPI), quality-gate npx for tools not installed locally; pre-install or mirror them, a failed npx fetch fails that gate",
+        "disable": "LOKI_APP_RUNNER=false, LOKI_DASHBOARD=false",
+    }, {
+        "name": "delegate_pr",
+        "note": "git push and gh pr create to your remote after a successful run, when gh is installed",
+        "disable": "LOKI_DELEGATE_PR=0",
+    }],
 }, indent=2))
 '
-        [ "$model_required" = "yes" ] && return 1
+        [ "$blocked" = "yes" ] && return 1
         return 0
     fi
 
     echo -e "${BOLD}Network egress audit${NC}"
     echo ""
-    echo "  Active provider: $provider"
+    echo "  Active provider: $provider (from $provider_src)"
     echo ""
     echo -e "${BOLD}Egress points${NC}"
     if [ "$model_required" = "yes" ]; then
@@ -13363,13 +13419,33 @@ print(json.dumps({
         echo -e "  ${GREEN}none${NC}      model inference -> $model_host"
     fi
     echo "            $model_note"
-    echo -e "  optional  telemetry           [$tel_state]  disable: loki telemetry off (default off)"
+    if [ "$sidecall_required" = "yes" ]; then
+        echo -e "  ${YELLOW}REQUIRED${NC}  claude side-calls -> $sidecall_host"
+        echo "            LOKI_ALLOW_CLAUDE_SIDECALLS=1 lets engine steps prompt the claude CLI under $provider."
+    fi
+    echo -e "  optional  telemetry           [$tel_state]  -> $tel_host"
+    echo "            disable: loki telemetry off, DO_NOT_TRACK=1, or LOKI_AIRGAP=true (on by default for interactive installs)"
     echo -e "  optional  update check        [$upd_state]  disable: export LOKI_NO_UPDATE_CHECK=1"
     echo ""
+    echo -e "${BOLD}Not audited here${NC} (depends on the project; see docs/air-gapped.md)"
+    echo "  package installs  app runner (npm, pip, docker), dashboard venv (PyPI), quality-gate"
+    echo "                    npx for tools not installed locally. Pre-install or mirror them;"
+    echo "                    a failed npx fetch fails that gate."
+    echo "                    disable: LOKI_APP_RUNNER=false, LOKI_DASHBOARD=false"
+    echo "  delegate PR       git push and gh pr create to your remote after a successful run,"
+    echo "                    when gh is installed. disable: LOKI_DELEGATE_PR=0"
+    echo ""
+    if [ "$sidecall_required" = "yes" ] && [ "$model_required" != "yes" ]; then
+        echo -e "${YELLOW}Not air-gap ready in this configuration.${NC}"
+        echo "  One required egress remains: claude side-calls."
+        echo "  To close it: unset LOKI_ALLOW_CLAUDE_SIDECALLS"
+        return 1
+    fi
     if [ "$model_required" = "yes" ]; then
         echo -e "${YELLOW}Not air-gap ready in this configuration.${NC}"
         echo "  One required egress remains: model inference."
-        echo "  To close it, serve the model in-network:"
+        [ "$sidecall_required" = "yes" ] && echo "  (Also unset LOKI_ALLOW_CLAUDE_SIDECALLS: claude side-calls are required egress too.)"
+        echo "  To close it, serve the model locally:"
         echo "    loki provider set opencode"
         echo "    export LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder"
         echo ""
@@ -13402,9 +13478,10 @@ cmd_doctor() {
                 echo ""
                 echo "Options:"
                 echo "  --json    Output machine-readable JSON"
-                echo "  --airgap  Audit network egress: list every host this engine"
-                echo "            can contact, whether it is REQUIRED or optional,"
-                echo "            and how to disable it. Exits non-zero if any"
+                echo "  --airgap  Audit network egress: model inference, telemetry and"
+                echo "            the update check, whether each is REQUIRED or optional,"
+                echo "            and how to disable it; names what it does not audit"
+                echo "            (package installs, delegate PR). Exits non-zero if any"
                 echo "            required egress remains."
                 echo ""
                 echo "Checks: node, python3, jq, git, curl, bash version,"
@@ -14448,9 +14525,9 @@ for _sk_name, _sk_rel, _sk_id in _SKILL_ENTRIES:
         # islink is true for a DANGLING link (lstat-based), which is exactly
         # the broken case the text path reports. fail only for the effective
         # provider; otherwise warn, matching the text path badge for badge.
-        # `required` stays 'required' in both arms: an absent link has always
+        # 'required' stays 'required' in both arms: an absent link has always
         # been warn+required, so the warn arm introduces no new shape, and a
-        # consumer keys on `status`.
+        # consumer keys on 'status'.
         _sk_blocking = bool(_sk_selected) and _sk_id == _sk_selected
         skills.append({'name': _sk_name, 'path': _sk_json_path,
                        'status': 'fail' if _sk_blocking else 'warn',

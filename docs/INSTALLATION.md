@@ -115,11 +115,12 @@ commands and forward-compat with v8.0.0.
 - Installs the `loki` CLI binary to your PATH (`bin/loki` shim)
 - Subsequent `loki setup-skill` creates symlinks at `~/.claude/skills/loki-mode`, `~/.codex/skills/loki-mode`
 
-**Anonymous telemetry is OPT-IN and OFF by default.** A default `npm install`
-sends nothing, so air-gapped and enterprise installs are safe out of the box. To
-opt in to anonymous diagnostics, run `loki telemetry on` or set
-`LOKI_TELEMETRY=on`. To make opting in impossible across a fleet, bake an
-opt-out into your base image (opt-out always wins):
+**Anonymous telemetry is ON by default for an individual interactive install**
+and auto-off in CI, non-interactive sessions, and when `LOKI_ENTERPRISE=true` or
+`LOKI_AIRGAP=true` is set. It is disclosed once on first use. Turn it off with
+`loki telemetry off`; `loki doctor --airgap` shows its current state. To make
+opting in impossible across a fleet, bake an opt-out into your base image
+(opt-out always wins):
 ```bash
 # Hard-disable everywhere (belt and suspenders; opt-out always wins):
 LOKI_TELEMETRY_DISABLED=true npm install -g loki-mode
