@@ -20,7 +20,16 @@ fail() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
 command -v node >/dev/null 2>&1 || { echo "SKIP: node not available"; exit 0; }
 [ -f "$GEN" ] || { echo "FAIL: generate.mjs missing"; exit 1; }
 
-DEMO="$(mktemp -d)"; trap 'rm -rf "$DEMO"; pkill -f "$DEMO/server/index.mjs" 2>/dev/null || true' EXIT
+# Round 4: the prior trap used `pkill -f "$DEMO/server/index.mjs"`, but the
+# server is actually launched below as `node index.mjs` with cwd $DEMO/server
+# (a relative argv, no path prefix) -- the pattern never matched the real
+# process, so the server leaked on any signal or abnormal exit before
+# reaching the explicit `kill "$SRV"` at the bottom of this script. Fixed to
+# kill the exact recorded PID ($SRV, set once the server is launched); guarded
+# with ${SRV:-} since this trap is installed before SRV exists and several
+# early-exit paths (generate failure, npm install SKIP) fire it under set -u
+# while SRV is still unset.
+DEMO="$(mktemp -d)"; trap 'rm -rf "$DEMO"; [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null || true' EXIT
 
 # Generate the real backend from templates (throwaway resource, no PRD).
 node "$GEN" "$DEMO" note title:string body:string >/dev/null 2>&1 \

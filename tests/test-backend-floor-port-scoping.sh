@@ -48,14 +48,23 @@ if echo "$CODE" | grep -qE '^APP_PORT=\$\(\(.*RANDOM'; then
 else
     bad "APP_PORT does not appear to be randomized"
 fi
-# Every remaining `kill` call must target a script-local variable (its own
-# recorded PID), never a value re-derived from lsof/pgrep/ps at kill time.
-KILL_LINES=$(echo "$CODE" | grep -E '\bkill\b' || true)
-BAD_KILL_LINES=$(echo "$KILL_LINES" | grep -vE 'kill "\$SRV"|kill -0|kill -9 "\$SRV"' || true)
+# Every remaining kill/pkill/killall call must target a script-local variable
+# (its own recorded PID), never a value re-derived from lsof/pgrep/ps at kill
+# time. The pattern must catch pkill/killall too: round 4 found a real
+# `pkill -f "$DEMO/server/index.mjs"` in this file's own trap that a bare
+# `\bkill\b` grep could never see -- \b is a word-boundary, and there is no
+# boundary between the "p" and "k" of "pkill" (both are word characters), so
+# \bkill\b matches only a kill call that is NOT prefixed by another word
+# character. This check previously missed exactly the line it exists to
+# catch; it is written broad here (p?kill|killall) and verified below to
+# actually flag the current file's own historical bug on a static fixture,
+# not just assumed to work.
+KILL_LINES=$(echo "$CODE" | grep -E '\b(p?kill|killall)\b' || true)
+BAD_KILL_LINES=$(echo "$KILL_LINES" | grep -vE 'kill "\$\{?SRV(:-)?\}?"|kill -0|kill -9 "\$\{?SRV(:-)?\}?"' || true)
 if [ -n "$BAD_KILL_LINES" ]; then
-    bad "a kill call other than on \$SRV remains: $BAD_KILL_LINES"
+    bad "a kill/pkill/killall call other than on \$SRV remains: $BAD_KILL_LINES"
 else
-    ok "every remaining kill call targets \$SRV (this script's own recorded PID)"
+    ok "every remaining kill/pkill/killall call targets \$SRV (this script's own recorded PID)"
 fi
 
 # --- T2: behavioral ------------------------------------------------------
