@@ -116,3 +116,14 @@ Audit's gitleaks step, flagging a synthetic test fixture in
 `.gitleaksignore` entry). Fixed (`217cb715`), plus S-01 and S-12 (approved,
 merged) and their sibling docs/test updates. Re-cut as v9.54.2 (`9afc216c`)
 per the v9.51.0/v9.51.1 precedent for a failed-before-publish release.
+
+## v9.54.2 verified on all channels; S-03 merged (2026-09-26)
+
+npm `latest` 9.54.2 with `gitHead` `9afc216c`; tag `v9.54.2^{}` resolves to
+the same commit; GitHub release published, not a draft. S-03 (BACKLOG 25,
+`loki ci`'s ARG_MAX crash on both the comment-body argv path and the
+exported-env-var JSON/findings path) merged after a real round-1 REJECT
+found the first fix had missed the actual crash site; round 2 unanimous
+APPROVE with the real crash reproduced and fixed. Both regression tests
+registered in `tests/run-all-tests.sh` (`test-ci-json-argmax.sh` is slow,
+about 2 minutes, kept out of the fast tier deliberately).
