@@ -611,6 +611,11 @@ outnsn="$(
     source "$PREAMBLE"
     setup_agent_branch >/dev/null 2>&1
     rm -f .loki/state/preexisting-untracked.z
+    # This models a session minted before the snapshot feature existed (no
+    # file was ever written for it), not this session's own file vanishing
+    # out from under it (BACKLOG 70 tampering, covered separately below): drop
+    # the in-memory seal a real never-snapshotted session would never have set.
+    _LOKI_SNAPSHOT_SEAL=""
     printf 'agent\n' > work.js
     ITERATION_COUNT=1
     result=0
@@ -772,18 +777,28 @@ outno="$(
     git checkout -q develop
     printf '{"user":"my real settings"}\n' > config.local.json
     base_ignores="$(git check-ignore -q config.local.json && echo yes || echo no)"
-    bash -c '. "$1"; setup_agent_branch' _ "$PREAMBLE" >/dev/null 2>&1
-    s2="$(git rev-parse --abbrev-ref HEAD)"
+    # BACKLOG 70: setup_agent_branch's seal lives in THIS process's memory
+    # (_LOKI_SNAPSHOT_SEAL), so session 2's commit_session_changes must run in
+    # the SAME bash -c as its setup_agent_branch, exactly as a real re-invoked
+    # `loki start` process would -- one process per session, start to finish.
+    # Running the commit in the outer subshell would compare session 2's files
+    # against session 1's (or no) seal and misreport tampering.
+    s2out="$(bash -c '. "$1"; setup_agent_branch >/dev/null 2>&1
+        printf "%s\n" "$(git rev-parse --abbrev-ref HEAD)"
+        cat config.local.json 2>/dev/null
+        printf "build/\n" > .gitignore
+        git check-ignore -q config.local.json && echo no || echo yes
+        printf "print(2)\n" > app2.py
+        commit_session_changes >/dev/null 2>&1
+        git cat-file -e HEAD:config.local.json 2>/dev/null && echo yes || echo no
+        git cat-file -e HEAD:app2.py 2>/dev/null && echo yes || echo no' _ "$PREAMBLE")"
+    s2="$(printf '%s\n' "$s2out" | sed -n '1p')"
+    during="$(printf '%s\n' "$s2out" | sed -n '2p')"
+    exposed="$(printf '%s\n' "$s2out" | sed -n '3p')"
+    in_head="$(printf '%s\n' "$s2out" | sed -n '4p')"
+    agent="$(printf '%s\n' "$s2out" | sed -n '5p')"
     if [[ "$s2" == loki/session-* ]] && [ "$s2" != "$s1" ]; then new=yes; else new=no; fi
     recorded="$( [ "$(cat .loki/state/agent-branch.txt 2>/dev/null)" = "$s2" ] && echo yes || echo no )"
-    during="$(cat config.local.json 2>/dev/null)"
-    # Session 2 un-ignores it too, so only the snapshot keeps it out of the commit.
-    printf 'build/\n' > .gitignore
-    exposed="$(git check-ignore -q config.local.json && echo no || echo yes)"
-    printf 'print(2)\n' > app2.py
-    commit_session_changes >/dev/null 2>&1
-    in_head="$(git cat-file -e HEAD:config.local.json 2>/dev/null && echo yes || echo no)"
-    agent="$(git cat-file -e HEAD:app2.py 2>/dev/null && echo yes || echo no)"
     s1_same="$( [ "$(git rev-parse "$s1")" = "$s1_head" ] && echo yes || echo no )"
     git checkout -q develop
     after="$(cat config.local.json 2>/dev/null || echo MISSING)"
@@ -859,7 +874,15 @@ outir="$(
     record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
     nocommit="$( [ "$(git rev-parse HEAD)" = "$s1_head" ] && echo yes || echo no )"
     printf 'mine, between sessions\n' > 'user notes.txt'
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: setup_agent_branch's seal is a variable in THIS shell
+    # (_LOKI_SNAPSHOT_SEAL); `resume_log="$(setup_agent_branch ...)"` would run
+    # it in a forked command-substitution subshell, whose variable changes
+    # never reach back here (a real re-invoked process has no such split: one
+    # process runs setup and the later commit). Redirect to a file instead so
+    # setup_agent_branch runs in THIS shell and its seal update sticks.
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     carried="$(printf '%s' "$resume_log" | grep -q 'Carried over.*helper.py, test_helper.py' && echo yes || echo no)"
     printf 'import helper\nprint(helper.greet())\n' > app.py
     commit_session_changes >/dev/null 2>&1
@@ -995,6 +1018,116 @@ if [ "$outpm" = "HASHES=yes INHEAD=no LISTED=[preexisting_modified:notes.txt,mod
     pass "edited pre-existing notes.txt not committed but listed as preexisting_modified; untouched keep.txt unlisted"
 else
     fail "agent edit to a pre-existing untracked file not disclosed (or committed)" "got: $outpm"
+fi
+
+# =============================================================================
+# Test T-snapshot-hash-deleted-disclosed (BACKLOG 70): an agent process deletes
+# preexisting-untracked.sha.z between setup and commit, to blind
+# workspace_diff._preexisting_untracked's mismatch check and suppress
+# preexisting_modified disclosure of its own edit. Before the fix this was
+# silent: no warning, no failed marker, and the edited pre-existing file was
+# simply never listed (RED, reproduced against a copy of run.sh with the
+# BACKLOG-70 guard calls stripped, below). After the fix, deleting the sealed
+# hash file is detected as tampering: the session commits nothing, and a
+# warning names it. Disclosure, not silent prevention, is the bar BACKLOG 70
+# asks for -- the guard cannot stop the deletion, only refuse to pretend it
+# did not happen.
+# =============================================================================
+echo "Test T-snapshot-hash-deleted-disclosed: an agent deleting the hash file mid-session is disclosed, not silently ignored"
+RHD="$(make_repo thashdeleted)"
+outhd="$(
+    cd "$RHD" || exit 1
+    source "$PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    printf 'mine\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    hashes_before="$( [ -s .loki/state/preexisting-untracked.sha.z ] && echo yes || echo no )"
+    # The tamper: an agent (or anything it spawns) deletes the sha file this
+    # session already sealed in memory.
+    rm -f .loki/state/preexisting-untracked.sha.z
+    printf 'agent edit\n' >> notes.txt
+    printf 'agent\n' > work.js
+    ITERATION_COUNT=1
+    result=0
+    msg="$(commit_session_changes 2>&1)"
+    rc=$?
+    in_head_notes="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    in_head_work="$(git cat-file -e HEAD:work.js 2>/dev/null && echo yes || echo no)"
+    disclosed="$(printf '%s' "$msg" | grep -qi 'tamper' && echo yes || echo no)"
+    marker="$( [ -f .loki/state/preexisting-untracked.failed ] && echo yes || echo no )"
+    printf 'HASHESBEFORE=%s RC=%s INHEADNOTES=%s INHEADWORK=%s DISCLOSED=%s MARKER=%s' \
+        "$hashes_before" "$rc" "$in_head_notes" "$in_head_work" "$disclosed" "$marker"
+)"
+if [ "$outhd" = "HASHESBEFORE=yes RC=0 INHEADNOTES=no INHEADWORK=no DISCLOSED=yes MARKER=yes" ]; then
+    pass "hash file deleted mid-session: disclosed by name, session commits nothing (agent's own work.js also withheld, fail-closed), failed marker set"
+else
+    fail "deleting the hash file was not disclosed (or the session still committed)" "got: $outhd"
+fi
+
+# RED proof: with the BACKLOG-70 guard calls removed from a COPY of run.sh (the
+# real lib is never touched), the identical scenario must silently keep
+# committing and never mention tampering -- proving the assertion above is not
+# vacuous. A fresh bash process re-extracts the mutated copy so no sourced-once
+# guard hides the mutation.
+RED_RUN_SH="$WORKROOT/run-nobacklog70.sh"
+sed -e '/_loki_snapshot_seal$/d' \
+    -e '/_loki_snapshot_verify || return 1$/d' \
+    -e '/_loki_snapshot_verify || true$/d' \
+    -e '/if ! _loki_snapshot_verify; then/,/^    fi$/d' \
+    "$RUN_SH" > "$RED_RUN_SH"
+RED_LIB="$WORKROOT/red-branch-lib.sh"
+awk '
+    /^setup_agent_branch\(\) \{/ { p=1 }
+    p { print }
+    p && /^create_session_pr\(\) \{/ { f=1 }
+    f && /^}/ { exit }
+' "$RED_RUN_SH" > "$RED_LIB"
+if [ -f "$_SECRET_LIB" ]; then
+    printf '\n' >> "$RED_LIB"
+    cat "$_SECRET_LIB" >> "$RED_LIB"
+fi
+# Non-vacuity for the mutation itself: all four call sites (not the function
+# DEFINITIONS, which stay behind as harmless dead code) must be gone from the
+# extracted block, or this "RED" run would just re-prove the fixed behavior.
+# grep -c always prints a count and exits 1 on zero matches, so it is never
+# combined with `|| echo`, which would print a second, misleading line.
+red_removed="$(grep -c '^    _loki_snapshot_seal$\|_loki_snapshot_verify || return 1\|_loki_snapshot_verify || true\|if ! _loki_snapshot_verify; then' "$RED_LIB")"
+RED_PREAMBLE="$WORKROOT/red-preamble.sh"
+sed "s#$BRANCH_LIB#$RED_LIB#" "$PREAMBLE" > "$RED_PREAMBLE" 2>/dev/null \
+    || cp "$PREAMBLE" "$RED_PREAMBLE"
+# The mutated preamble still needs to source the RED lib, not the real one.
+cat > "$RED_PREAMBLE" <<EOF
+log_info()  { echo "INFO: \$*"; }
+log_warn()  { echo "WARN: \$*"; }
+log_error() { echo "ERROR: \$*"; }
+audit_log() { return 0; }
+audit_agent_action() { return 0; }
+source "$ADVISORY_LIB"
+source "$RED_LIB"
+EOF
+RHDR="$(make_repo thashdeletedred)"
+outhdr="$(
+    cd "$RHDR" || exit 1
+    source "$RED_PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    printf 'mine\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    rm -f .loki/state/preexisting-untracked.sha.z
+    printf 'agent edit\n' >> notes.txt
+    printf 'agent\n' > work.js
+    ITERATION_COUNT=1
+    result=0
+    msg="$(commit_session_changes 2>&1)"
+    rc=$?
+    in_head_notes="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    in_head_work="$(git cat-file -e HEAD:work.js 2>/dev/null && echo yes || echo no)"
+    disclosed="$(printf '%s' "$msg" | grep -qi 'tamper' && echo yes || echo no)"
+    printf 'RC=%s INHEADNOTES=%s INHEADWORK=%s DISCLOSED=%s' "$rc" "$in_head_notes" "$in_head_work" "$disclosed"
+)"
+if [ "$red_removed" = 0 ] && [ "$outhdr" = "RC=0 INHEADNOTES=no INHEADWORK=yes DISCLOSED=no" ]; then
+    pass "RED confirmed: without the BACKLOG-70 guard, the deleted hash file goes undisclosed and the agent's work.js is committed with no warning (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-fix silent-degrade behavior" "red_removed=$red_removed got: $outhdr"
 fi
 
 # =============================================================================

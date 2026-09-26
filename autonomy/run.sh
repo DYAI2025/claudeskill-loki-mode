@@ -9213,6 +9213,75 @@ _loki_snapshot_or_fail_closed() {
     return 1
 }
 
+# BACKLOG 70: preexisting-untracked.z and its .sha.z sibling live in
+# .loki/state, which the agent process (and anything it spawns) can write. A
+# co-located adversarial agent can delete .sha.z to blind
+# workspace_diff._preexisting_untracked's mismatch check (silently suppressing
+# every preexisting_modified disclosure), or append/edit .z entries to hide its
+# own new files from the receipt or falsely disown them. Full prevention against
+# a same-UID process is not achievable (it can read and rewrite anything this
+# process can); the realistic bar, and the one BACKLOG 70 asks for, is
+# DISCLOSURE: this process is the only one that can remember what it itself
+# just wrote, so it seals a sha256 of both files in its own memory right after
+# writing them, and re-derives + compares that digest at every later read site.
+# A mismatch (or the sealed file now missing) is reported as tampering and
+# treated as a failed snapshot (fail closed: no session commit), never patched
+# over silently. Cleared whenever the files are deliberately removed (line
+# ~9165) so that path is never reported as tampering.
+_LOKI_SNAPSHOT_SEAL=""
+
+# _loki_snapshot_digest: sha256 of preexisting-untracked.z + .sha.z content
+# (each independently, "-" standing in for "file absent" so a delete is part of
+# the digest, not indistinguishable from an empty file). python3 -E, no cwd on
+# sys.path (D7): cwd is the agent's repo. Empty output on any read error.
+_loki_snapshot_digest() {
+    python3 -E -c 'import sys, hashlib, os
+sys.path[:] = [p for p in sys.path if p not in ("", ".")]
+out = []
+for path in sys.argv[1:]:
+    try:
+        with open(path, "rb") as fh:
+            out.append(hashlib.sha256(fh.read()).hexdigest())
+    except OSError:
+        out.append("-")
+print(" ".join(out))' \
+        ".loki/state/preexisting-untracked.z" ".loki/state/preexisting-untracked.sha.z" 2>/dev/null
+}
+
+# _loki_snapshot_seal: record this process's own memory of what it just wrote.
+# Called only right after a successful _loki_snapshot_preexisting.
+_loki_snapshot_seal() {
+    _LOKI_SNAPSHOT_SEAL="$(_loki_snapshot_digest)"
+}
+
+# _loki_snapshot_verify: compare the live files against the sealed digest.
+# No seal recorded yet (never snapshotted this process, or deliberately
+# cleared) is not tampering: returns success and does nothing. A seal that no
+# longer matches IS tampering: logs it (disclosure is the bar BACKLOG 70 asks
+# for; a same-UID process can rewrite anything else this one could check), and
+# forces every fail-closed path a missing/failed snapshot already takes --
+# clears the seal so a caller cannot re-check a stale value, clears
+# _LOKI_SNAPSHOT_THIS_RUN so commit_session_changes and
+# _loki_record_session_created both treat this as an unsnapshotted session, and
+# (re)writes preexisting-untracked.failed so BACKLOG 90's existing message
+# fires. Every consumer of the snapshot/hash files calls this first and treats
+# non-zero as "no snapshot".
+_loki_snapshot_verify() {
+    local live=""
+    [ -n "$_LOKI_SNAPSHOT_SEAL" ] || return 0
+    live="$(_loki_snapshot_digest)"
+    if [ "$live" = "$_LOKI_SNAPSHOT_SEAL" ]; then
+        return 0
+    fi
+    _LOKI_SNAPSHOT_SEAL=""
+    _LOKI_SNAPSHOT_THIS_RUN=0
+    log_warn "Pre-existing-file snapshot or its hash file changed after this session recorded it (possible tampering by an agent process); treating this session as unsnapshotted (nothing will be committed)"
+    audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked.z or .sha.z changed after being sealed"
+    mkdir -p .loki/state 2>/dev/null
+    : > .loki/state/preexisting-untracked.failed 2>/dev/null
+    return 1
+}
+
 # _loki_snapshot_preexisting [union]
 # Write .loki/state/preexisting-untracked.z: every path git does not track,
 # untracked and gitignored, repo-wide, NUL-delimited, relative to the repo top.
@@ -9224,7 +9293,9 @@ _loki_snapshot_or_fail_closed() {
 # the paths already recorded. The sibling .sha.z (content hash per file entry)
 # lets the receipt list a pre-existing file the run changed; it is removed
 # first, so a failed hash step means no detection, never stale hashes. Returns
-# non-zero, leaving any earlier list in place, when git cannot list.
+# non-zero, leaving any earlier list in place, when git cannot list. Seals a
+# digest of both files on success (BACKLOG 70) so later reads can detect
+# tampering.
 _loki_snapshot_preexisting() {
     local snap=".loki/state/preexisting-untracked.z" top="" base="" exclude=""
     rm -f "${snap%.z}.sha.z" 2>/dev/null
@@ -9248,6 +9319,7 @@ _loki_snapshot_preexisting() {
     rm -f "$snap.status"
     python3 -E "$SCRIPT_DIR/lib/workspace_diff.py" hash-snapshot "$top" "$snap" >/dev/null 2>&1 \
         || log_warn "Could not hash your pre-existing untracked files; the receipt cannot list the ones this run changes"
+    _loki_snapshot_seal
     return 0
 }
 
@@ -9332,6 +9404,9 @@ os.replace(out + ".tmp", out)' "$@" 2>/dev/null
 _loki_record_session_created() {
     local snap=".loki/state/preexisting-untracked.z" out=".loki/state/session-created.z"
     [ "${_LOKI_SNAPSHOT_THIS_RUN:-0}" = 1 ] || return 0
+    # BACKLOG 70: detect tampering with the sealed snapshot as early as
+    # possible (this runs after every provider turn, not just at commit time).
+    _loki_snapshot_verify || return 1
     if [ -f "$snap" ] && _loki_untracked_status "$out.status" \
        && _loki_untracked_merge "$out.status" "$out" "$snap" cover "$out"; then
         rm -f "$out.status"
@@ -9437,6 +9512,13 @@ _loki_untrack_agent_committed_user_files() {
     local snap=".loki/state/preexisting-untracked.z" rec=".loki/state/agent-committed-user-files.z"
     local base="" fork="" start="" top="" names=""
     local unchecked="Before switching branches, run git rm --cached on each of your files the agent committed and commit, or a checkout of the base deletes them. Left uncommitted: no session commit."
+    # BACKLOG 70: a tampered snapshot cannot be trusted to say which paths were
+    # pre-existing, so treat it the same as "no snapshot" -- fail closed via the
+    # caller, which then skips the session commit entirely.
+    if ! _loki_snapshot_verify; then
+        log_warn "Could not check whether the agent committed your pre-existing untracked files on $1 (snapshot tampered). ${unchecked}"
+        return 1
+    fi
     [ -s "$snap" ] || return 0
     # No commit on the branch yet: the agent committed nothing.
     git rev-parse --verify -q HEAD >/dev/null 2>&1 || return 0
@@ -9514,6 +9596,15 @@ commit_session_changes() {
             return 0
             ;;
     esac
+
+    # BACKLOG 70: a snapshot tampered with since this session sealed it (an
+    # agent process deleting the hash file to suppress preexisting_modified
+    # disclosure, or editing either file to hide or falsely disown paths) is
+    # treated as no snapshot at all: on a mismatch, _loki_snapshot_verify
+    # clears _LOKI_SNAPSHOT_THIS_RUN and writes the same .failed marker a
+    # snapshot failure writes, so the existing fail-closed check below
+    # (BACKLOG 90) also catches tampering, with its own warning.
+    _loki_snapshot_verify || true
 
     # Commit nothing unless THIS run took a current snapshot (BACKLOG 90). The
     # LOCK A1 opt-out takes none, so it never commits, even on a leftover
