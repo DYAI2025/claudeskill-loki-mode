@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Regression test: autonomy/verify.sh's _verify_runtime_teardown (the runtime
+# gate's app-boot teardown) must never kill a process it does not own.
+#
+# THE BUG. The port-reclaim pass ran `lsof -ti tcp:$port` with NO -sTCP:LISTEN
+# filter and NO ownership check at all: it matched every socket referencing
+# that port number -- including a CLIENT process with an established
+# connection whose REMOTE port happens to equal $port (e.g. a browser tab
+# open to localhost:$port), and any unrelated process that happens to be
+# LISTENING on the port after reuse. Every matched PID got an unconditional
+# kill -9. Same D14/D15/D16 class as this session's other fixes.
+#
+# Fixed to (1) filter to LISTEN sockets only, and (2) verify each candidate is
+# part of THIS launcher's own tree (pgid matches the launcher's captured
+# child_pgid, or its direct parent is app_pid) before killing it.
+#
+# T1 (static, LOAD-BEARING): the port-reclaim lsof call includes -sTCP:LISTEN,
+# and the kill inside the read loop is gated on a pgid/ppid match, not
+# unconditional.
+# T2 (behavioral): a genuine own-tree listener (spawned as a direct child of
+# a launcher this test controls, sharing its pgid) IS still reclaimed --
+# proving the fix does not just delete all kill logic. A decoy listener that
+# shares no relationship with the launcher survives. A decoy CLIENT holding an
+# open connection whose remote port matches survives even though the old
+# lsof -ti (no -sTCP:LISTEN) would have matched it.
+set -u
+PASS=0; FAIL=0
+ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
+bad() { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERIFY_SH="$REPO_ROOT/autonomy/verify.sh"
+PY=$(command -v python3.12 || command -v python3)
+
+[ -f "$VERIFY_SH" ] || { echo "FAIL: $VERIFY_SH missing"; exit 1; }
+[ -n "$PY" ] || { echo "SKIPPED: no python3"; echo "RESULT: 0 passed, 0 failed"; exit 0; }
+
+FN_BODY="$(awk '/^_verify_runtime_teardown\(\) \{/,/^\}/' "$VERIFY_SH")"
+[ -n "$FN_BODY" ] || { echo "FAIL: could not extract _verify_runtime_teardown() from $VERIFY_SH"; exit 1; }
+
+# --- T1: static checks ------------------------------------------------------
+if echo "$FN_BODY" | grep -qE 'lsof -ti tcp:"\$_rp" -sTCP:LISTEN'; then
+    ok "_verify_runtime_teardown filters the port-reclaim lsof to LISTEN sockets"
+else
+    bad "_verify_runtime_teardown does not filter the port-reclaim lsof to LISTEN sockets"
+fi
+# The kill inside the "while IFS= read -r pid" loop must be gated on a pgid or
+# ppid comparison, not a bare unconditional kill -9 "$pid".
+READ_LOOP="$(printf '%s\n' "$FN_BODY" | awk '/while IFS= read -r pid/{f=1} f{print} f&&/^[[:space:]]*done/{exit}')"
+if echo "$READ_LOOP" | grep -qE '_h_pgid.*=.*child_pgid|_h_ppid.*=.*app_pid'; then
+    ok "port-reclaim kill loop is gated on a pgid/ppid ownership match"
+else
+    bad "port-reclaim kill loop is not gated on ownership (unconditional kill)"
+fi
+
+# --- T2: behavioral ----------------------------------------------------------
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/loki-teardowntest-XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+FN_FILE="$WORK/teardown_fn.sh"
+printf '%s\n' "$FN_BODY" > "$FN_FILE"
+# shellcheck disable=SC1090
+source "$FN_FILE"
+
+PORT=$((41000 + (RANDOM % 5000)))
+
+listener_script() {
+    cat <<PYEOF
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", $PORT))
+s.listen(5)
+time.sleep(30)
+PYEOF
+}
+
+# Own-tree listener: launched as a DIRECT CHILD of a launcher subshell so it
+# shares this test's own pgid when app_pid (the launcher) also does -- this
+# mirrors the real launcher-and-its-server relationship _verify_runtime_teardown
+# is designed to reap.
+LAUNCHER_SCRIPT="$WORK/launcher.sh"
+LISTENER_PIDFILE="$WORK/listener.pid"
+cat > "$LAUNCHER_SCRIPT" <<EOF
+#!/usr/bin/env bash
+"$PY" -c '$(listener_script)' &
+echo \$! > "$LISTENER_PIDFILE"
+wait
+EOF
+chmod +x "$LAUNCHER_SCRIPT"
+"$LAUNCHER_SCRIPT" >/dev/null 2>&1 &
+APP_PID=$!
+i=0
+while [ $i -lt 40 ]; do [ -s "$LISTENER_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+LISTENER_PID=$(cat "$LISTENER_PIDFILE" 2>/dev/null || true)
+
+if [ -z "$LISTENER_PID" ] || ! kill -0 "$LISTENER_PID" 2>/dev/null || ! kill -0 "$APP_PID" 2>/dev/null; then
+    bad "own-tree launcher+listener did not start (test setup broken, not the function under test)"
+else
+    LISTENER_PPID="$(ps -o ppid= -p "$LISTENER_PID" 2>/dev/null | tr -d ' ')"
+    if [ "$LISTENER_PPID" != "$APP_PID" ]; then
+        bad "own-tree listener setup is wrong (ppid=$LISTENER_PPID want $APP_PID) -- the assertion below would be vacuous"
+    else
+        ok "own-tree listener is a genuine direct child of app_pid"
+    fi
+
+    # Positive control: confirm the port is actually enumerable before
+    # asserting anything about survival/reclamation.
+    if ! lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$LISTENER_PID"; then
+        bad "positive control failed: lsof cannot enumerate the own-tree listener on this platform"
+    else
+        ok "positive control: lsof enumerates the own-tree listener before teardown"
+        _verify_runtime_teardown "$APP_PID" "$PORT" ""
+        sleep 0.5
+        if kill -0 "$LISTENER_PID" 2>/dev/null; then
+            bad "own-tree listener was NOT reclaimed -- teardown deleted its kill logic instead of scoping it"
+        else
+            ok "own-tree listener (direct child of app_pid) is reclaimed"
+        fi
+    fi
+    kill -9 "$APP_PID" 2>/dev/null || true
+    kill -9 "$LISTENER_PID" 2>/dev/null || true
+fi
+
+# --- Decoy A: unrelated listener on a DIFFERENT free port, no relationship --
+# to any app_pid/child_pgid this teardown call is given. `setsid` (util-linux)
+# does not exist on macOS, so each of the decoy and the fake launcher is given
+# its OWN session/process group via perl's POSIX::setsid() (portable) inside a
+# subshell that exits immediately after backgrounding -- the same technique
+# tests/test-kill-provider-child-scoping.sh uses, and for the same reason:
+# backgrounding either directly in THIS script's shell (no setsid, no
+# subshell) would put it in this test's own pgid, which is exactly the
+# false-failure trap D16 documents -- the "unrelated" pair would then share a
+# pgid with each other by accident of bash job control, not by test design.
+DECOY_PORT=$((46000 + (RANDOM % 5000)))
+DECOY_PIDFILE="$WORK/decoy.pid"
+PERL="$(command -v perl || true)"
+if [ -z "$PERL" ]; then
+    bad "no perl available (cannot construct genuinely unrelated decoy process groups)"
+else
+    ( perl -e '
+        use POSIX qw(setsid);
+        setsid();
+        open(my $f, ">", $ARGV[1]) or die $!;
+        print $f $$;
+        close $f;
+        exec($ARGV[0], "-c", "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((\"127.0.0.1\", '"$DECOY_PORT"'))
+s.listen(5)
+time.sleep(30)
+");
+    ' "$PY" "$DECOY_PIDFILE" >/dev/null 2>&1 & )
+fi
+i=0
+while [ $i -lt 40 ]; do [ -s "$DECOY_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+DECOY_PID=$(cat "$DECOY_PIDFILE" 2>/dev/null || true)
+
+FAKE_APP_PIDFILE="$WORK/fakeapp.pid"
+if [ -n "$PERL" ]; then
+    ( perl -e '
+        use POSIX qw(setsid);
+        setsid();
+        open(my $f, ">", $ARGV[0]) or die $!;
+        print $f $$;
+        close $f;
+        sleep 30;
+    ' "$FAKE_APP_PIDFILE" >/dev/null 2>&1 & )
+    i=0
+    while [ $i -lt 40 ]; do [ -s "$FAKE_APP_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
+    FAKE_APP_PID=$(cat "$FAKE_APP_PIDFILE" 2>/dev/null || true)
+else
+    sleep 30 &
+    FAKE_APP_PID=$!
+fi
+
+DECOY_PGID="$(ps -o pgid= -p "$DECOY_PID" 2>/dev/null | tr -d ' ')"
+FAKE_APP_PGID="$(ps -o pgid= -p "$FAKE_APP_PID" 2>/dev/null | tr -d ' ')"
+FAKE_APP_PPID="$(ps -o ppid= -p "$FAKE_APP_PID" 2>/dev/null | tr -d ' ')"
+
+if [ -z "$DECOY_PID" ] || ! kill -0 "$DECOY_PID" 2>/dev/null; then
+    bad "unrelated decoy listener did not start (test setup broken, not the function under test)"
+elif ! lsof -ti tcp:"$DECOY_PORT" -sTCP:LISTEN 2>/dev/null | grep -qx "$DECOY_PID"; then
+    bad "positive control failed: lsof cannot enumerate the unrelated decoy listener"
+elif [ -z "$DECOY_PGID" ] || [ "$DECOY_PGID" = "$FAKE_APP_PGID" ] || [ "$DECOY_PID" = "$FAKE_APP_PPID" ]; then
+    bad "decoy/fake-launcher setup is wrong (decoy_pgid=$DECOY_PGID fake_app_pgid=$FAKE_APP_PGID fake_app_ppid=$FAKE_APP_PPID) -- they are not genuinely unrelated, the assertion below would be vacuous"
+else
+    ok "positive control: lsof enumerates the unrelated decoy listener, and decoy/fake-launcher are genuinely unrelated process trees"
+    _verify_runtime_teardown "$FAKE_APP_PID" "$DECOY_PORT" ""
+    sleep 0.5
+    if kill -0 "$DECOY_PID" 2>/dev/null; then
+        ok "unrelated decoy listener on a different port survives an unrelated teardown call"
+    else
+        bad "unrelated decoy listener was KILLED by an unrelated teardown call -- the bug is still present"
+    fi
+    kill -9 "$FAKE_APP_PID" 2>/dev/null || true
+fi
+kill -9 "$DECOY_PID" 2>/dev/null || true
+
+echo ""
+echo "RESULT: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

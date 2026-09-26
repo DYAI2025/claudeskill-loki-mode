@@ -1943,6 +1943,22 @@ _verify_runtime_teardown() {
     # Reclaim BOTH the detected port and the actually-bound (scraped) port from
     # any orphan that outlived the launcher -- a daemonized server that bound a
     # different port than we guessed would otherwise leak. Bounded, best effort.
+    #
+    # SCOPING (D14/D15/D16 class): `lsof -ti tcp:$port` alone, with no
+    # -sTCP:LISTEN filter, matches EVERY socket referencing that port number,
+    # including a CLIENT with an established connection whose remote port
+    # happens to be $port (e.g. a browser tab open to localhost:$port) -- that
+    # process gets SIGKILL'd even though it never bound anything. And with no
+    # ownership check at all, ANY process (this run's or not) listening on the
+    # reused port gets killed. Fixed to (1) filter to LISTEN sockets only, and
+    # (2) verify each candidate is actually part of THIS launcher's tree before
+    # killing it: its pgid matches $child_pgid (the group this teardown just
+    # tried to signal above), or its direct parent is $app_pid. A holder that
+    # matches neither is left alone -- this run never bound that port, so it
+    # never reclaims it. Trade-off: a server that called setsid() into a fresh
+    # session AND was reparented away from app_pid (neither condition holds)
+    # will leak here; failing closed on an unverified kill is the safer
+    # direction (see docs/v10/DECISIONS.md D14/D15/D16).
     if command -v lsof >/dev/null 2>&1; then
         # Build a unique, non-empty port list (scraped only if it differs).
         local _ports="$port"
@@ -1951,10 +1967,17 @@ _verify_runtime_teardown() {
         for _rp in $_ports; do
             [ -z "$_rp" ] && continue
             local holders
-            holders="$(lsof -ti tcp:"$_rp" 2>/dev/null || true)"
+            holders="$(lsof -ti tcp:"$_rp" -sTCP:LISTEN 2>/dev/null || true)"
             if [ -n "$holders" ]; then
                 printf '%s\n' "$holders" | while IFS= read -r pid; do
-                    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+                    [ -z "$pid" ] && continue
+                    local _h_pgid="" _h_ppid=""
+                    _h_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+                    _h_ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+                    if { [ -n "$child_pgid" ] && [ -n "$_h_pgid" ] && [ "$_h_pgid" = "$child_pgid" ]; } \
+                       || { [ -n "$app_pid" ] && [ -n "$_h_ppid" ] && [ "$_h_ppid" = "$app_pid" ]; }; then
+                        kill -9 "$pid" 2>/dev/null || true
+                    fi
                 done
             fi
         done
