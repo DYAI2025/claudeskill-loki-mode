@@ -570,15 +570,24 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 # Rules 6-9 read the WHOLE file with a bracket matcher, never one line at a
 # time: every fabrication they target spans lines. Like rules 3 and 5 they apply
 # to every web-app source file and every dashboard-ui file, reachable or not.
-#   6. No array of literal rows is passed to a set*() setter or useState(), or
-#      appears anywhere in a catch body (`catch {`, `.catch(() => {...})`). A row
+#   6. No array of literal rows is passed to a set*() setter or useState()
+#      (anywhere in the argument list, not only as the first argument), or
+#      appears anywhere in a catch body (`catch {`, `.catch(() => {...})`), or
+#      is an operand of `||`/`??`, or is either branch of a ternary whose OTHER
+#      branch is not also a literal, or is the right-hand side of `this._x =`
+#      or of a local that later flows into a setter/useState/`this.y =`, or is
+#      the argument of Array.of() or the first argument of Array.from(). A row
 #      is literal when every value is a string, number, boolean, null, a
 #      `new Date(...)`/`Date.now()` expression, `as const`, or a nested literal
 #      array/object. The Teams page seeded every team's Activity tab with four
 #      invented rows in a fetch-less effect, and swapped in a sample team and
 #      sample audit rows whenever a request failed; this is that shape.
 #      `setStats([{ label: 'Stars', value: stars }])` reads a variable and is
-#      not literal.
+#      not literal. A named module-level table (DEFAULT_PERMISSIONS, COLUMNS,
+#      GALLERY, TABS, DEFAULT_PROVIDERS) is a negative control even when it
+#      seeds useState, and a timer callback (setTimeout/setInterval/etc.) is
+#      never treated as a setter. See the ponytail comment above
+#      whole_file_findings() for the shapes this rule still cannot see.
 #   7. No binding NAMED sample, mock, demo, fake, dummy or placeholder (bare,
 #      camelCase or SAMPLE_-style) is bound to an array or object literal. A
 #      string placeholder is input-hint copy and is not flagged.
@@ -714,6 +723,90 @@ line_of = lambda s, i: s.count('\n', 0, i) + 1
 SETTER = re.compile(r'\b(set[A-Z]\w*|useState)\s*(?=[(<])')
 CATCH = re.compile(r'\bcatch\s*(?:\([^()]*\))?\s*\{|\.catch\s*\(')
 ARRAY_CTX = re.compile(r'(?:[=(,:?\[|&]|\breturn)\s*$')
+def expr_end(s):
+    """Index one past the end of the expression at the start of s: up to the
+    first top-level `,`, `;`, or an unmatched closing bracket. Used to isolate
+    a ternary's `:` branch, which has no closing delimiter of its own."""
+    j = 0
+    while j < len(s):
+        c = s[j]
+        if c in '\'"`':
+            j = skip_quoted(s, j)
+        elif c in OPEN:
+            k = close_of(s, j)
+            if k < 0:
+                return j
+            j = k
+        elif c in ')]},;':
+            return j
+        j += 1
+    return j
+def ternary_colon_of(s, q):
+    """s[q] is a bare `?` (a ternary, never `?.`/`??`). Return the index of its
+    matching `:`, scanning forward and skipping quotes and bracket spans, and
+    counting nested bare `?` so a nested ternary's `:` is not mistaken for the
+    outer one. -1 if the expression ends (`,`/`;`/an unmatched closer) first."""
+    depth, j = 0, q + 1
+    while j < len(s):
+        c = s[j]
+        if c in '\'"`':
+            j = skip_quoted(s, j)
+        elif c in OPEN:
+            k = close_of(s, j)
+            if k < 0:
+                return -1
+            j = k
+        elif c in ')]},;':
+            return -1
+        elif c == '?' and s[j:j + 2] not in ('?.', '??'):
+            depth += 1
+        elif c == ':':
+            if depth == 0:
+                return j
+            depth -= 1
+        j += 1
+    return -1
+# Rule 6 extension. Each targets one specific place a literal row array can
+# hide as a fallback or return value, per the round-4 reviewer's fix:
+#   FALLBACK_ARR: an operand of `||` or `??` (never `?.`, which these two
+#     tokens cannot form).
+#   TERNARY: either branch of `a ? x : y`, checked below with ternary_colon_of.
+#     A branch is flagged only when it is a literal-rows array AND THE OTHER
+#     BRANCH IS NOT ALSO A LITERAL (is_literal, reused as-is): choosing
+#     between live data and typed-in rows is the fallback shape rule 6 targets
+#     (`entries.length ? entries.filter(...) : [invented rows]`); choosing
+#     between two literals (`provider === 'claude' ? [{value:'',label:
+#     'Account default'}, ...] : []`) is static UI config the same as a
+#     module-level options table, even when one side is the empty-array
+#     placeholder.
+#   ASSIGN_ARR: `this._x = [rows]` (unconditional: `this.` never occurs at
+#     module scope, so every hit is inside a method) or `const/let/var x =
+#     [rows]` where x later flows into state: passed to a non-timer set*()/
+#     useState(), or assigned to `this.y`. Skipped when the declaration starts
+#     at column 0 (the same module-level convention the DEF regex below relies
+#     on): a named module-level table (DEFAULT_PROVIDERS, DEFAULT_PERMISSIONS,
+#     COLUMNS, GALLERY, TABS) is a negative control even when it seeds
+#     useState, matching how the reviewer scoped this arm to "a local".
+#   ponytail: three structural gaps this arm cannot see, all pre-existing at
+#   HEAD: a render-local literal list fed straight to .map() with no setter in
+#   between (TABS/filters/severities-style UI config has the same shape); an
+#   UNNAMED module-level table that seeds useState (DEFAULT_PROVIDERS is named
+#   and column-0, so it is caught by the exemption instead, but a fabricated
+#   table would read identically); and a ternary whose OTHER branch is also a
+#   literal (`cond ? [rows] : []`, the advisorOpts shape) -- is_literal cannot
+#   tell typed-in fabricated rows from a typed-in options list by structure
+#   alone, and a content heuristic (flag rows shaped like activity/audit
+#   entries) is a keyword list a future case will break. Rules 5 and 7 still
+#   catch a sample/mock/demo/fake/placeholder NAME in any of these. Upgrade
+#   only if review finds a real instance, not preemptively.
+FALLBACK_ARR = re.compile(r'(?:\|\||\?\?)\s*\[')
+TIMER_LIKE = re.compile(r'^(?:setTimeout|setInterval|setImmediate|setAttribute|setItem|setProperty)$')
+ARRAY_OF = re.compile(r'\bArray\.(of|from)\s*\(')
+MODULE_DECL = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:const|let|var)\s', re.M)
+DECL_ARR = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
+THIS_ARR = re.compile(r'\bthis\.([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
+FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?'
+                       r'{name}\s*[,)]|\bthis\.\w+\s*=\s*{name}\b')
 DEMO_NAME = re.compile(r'(?:\b(?:const|let|var)\s+|\bthis\.)([A-Za-z_$][\w$]*)\s*(?::[^=;]*?)?=(?![=>])\s*([\[{])')
 BARE = re.compile(r'^_*(?:sample|mock|demo|fake|dummy|placeholder)s?$|^_*placeholder(?=[A-Z_\d])|^_*PLACEHOLDER_', re.I)
 STAT_KEY = re.compile(r'^["\']?(?:uses|usage|rating|ratings|stars|forks|downloads|installs|views|users|builds|runs|count|total|score|percent|tokens|cost|spend|revenue|reviews|likes|confidence|coverage)["\']?$', re.I)
@@ -735,6 +828,15 @@ def whole_file_findings(s):
     def add_rows(i, msg):
         j = close_of(s, i)
         if j < 0 or any(a <= i <= b for a, b in spans):
+            return
+        if literal_rows(s[i:j + 1]):
+            spans.append((i, j)); out.append((line_of(s, i), msg))
+    def add_rows_call(i, j, msg):
+        """Like add_rows, but (i, j) is a paren span already known to be
+        closed (Array.of(...)), so it is checked as-is instead of re-deriving
+        j from s[i]. literal_rows() strips one char each side regardless of
+        bracket kind, so a paren span works the same as a bracket span."""
+        if any(a <= i <= b for a, b in spans):
             return
         if literal_rows(s[i:j + 1]):
             spans.append((i, j)); out.append((line_of(s, i), msg))
@@ -785,6 +887,64 @@ def whole_file_findings(s):
             out.append((line_of(s, i), 'invented stats lookup table'))
     for m in ZERO_FMT.finditer(s):
         out.append((line_of(s, m.start()), 'unmeasured value rendered as zero (zero fallback fed to a formatter)'))
+    # --- rule 6 extension: literal rows anywhere a fallback/assignment/call
+    #     argument can hold them, not only at a setter's first argument or in a
+    #     catch body. Added after the arms above so their messages and spans
+    #     win the dedupe in add_rows() when both match the same array.
+    for m in FALLBACK_ARR.finditer(s):
+        add_rows(m.end() - 1, 'literal sample rows used as a ||/?? fallback')
+    for m in re.finditer(r'(?<!\?)\?(?![.?:])', s):
+        c = ternary_colon_of(s, m.start())
+        if c < 0:
+            continue
+        q_raw = s[m.end():c]
+        q_branch = q_raw.strip()
+        e = m.end() + len(q_raw) - len(q_raw.lstrip())
+        colon_raw = s[c + 1:]
+        colon_branch_strip = colon_raw.lstrip()
+        cstart = c + 1 + (len(colon_raw) - len(colon_branch_strip))
+        if e < len(s) and s[e] == '[' and not is_literal(colon_raw[:expr_end(colon_raw)]):
+            add_rows(e, 'literal sample rows in a ternary branch')
+        if cstart < len(s) and s[cstart] == '[' and not is_literal(q_branch):
+            add_rows(cstart, 'literal sample rows in a ternary branch')
+    for m in DECL_ARR.finditer(s):
+        name = m.group(1)
+        line_start = s.rfind('\n', 0, m.start()) + 1
+        if MODULE_DECL.match(s, line_start):
+            continue  # named module-level table (DEFAULT_PROVIDERS et al.), a negative control
+        if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(name)), s):
+            add_rows(m.end() - 1, 'literal sample rows assigned to ' + name)
+    for m in THIS_ARR.finditer(s):
+        add_rows(m.end() - 1, 'literal sample rows assigned to this.' + m.group(1))
+    for m in SETTER.finditer(s):
+        i = m.end()
+        if i < len(s) and s[i] == '<':
+            depth = 0
+            while i < len(s):
+                depth += {'<': 1, '>': -1}.get(s[i], 0) if s[i - 1:i + 1] != '=>' else 0
+                i += 1
+                if depth == 0:
+                    break
+        i = len(s) - len(s[i:].lstrip())
+        if i >= len(s) or s[i] != '(' or TIMER_LIKE.match(m.group(1)):
+            continue
+        j = close_of(s, i)
+        if j < 0:
+            continue
+        for k in range(i + 1, j):
+            if s[k] == '[':
+                add_rows(k, f'literal sample rows in the {m.group(1)}() argument list')
+    for m in ARRAY_OF.finditer(s):
+        p = m.end() - 1
+        j = close_of(s, p)
+        if j < 0:
+            continue
+        if m.group(1) == 'of':
+            add_rows_call(p, j, 'literal sample rows via Array.of()')
+        else:
+            arg0 = split_top(s[p + 1:j])
+            if arg0 and arg0[0].startswith('['):
+                add_rows(p + 1 + s[p + 1:j].index('['), 'literal sample rows via Array.from()')
     return sorted(set(out))
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
@@ -1010,6 +1170,182 @@ export class LokiAuditFallback extends LokiElement {
   }
 }
 JS
+    # Round-4 adversarial reviewer's three exact reproductions of the rule 6
+    # gap (a fabrication in a ||/??, ternary or Array.of() fallback, none of
+    # which is a setter's or useState's FIRST argument or inside a catch body):
+    # the TeamsPage ternary, the cost-waterfall || fallback, and Array.of().
+    cat > "$d/src/components/TernaryFallback.tsx" <<'TSX'
+export function T({ entries, selectedTeam }) {
+  useEffect(() => {
+    setActivities(entries.length ? entries.filter(e => e.team_id === selectedTeam.id) : [{ id: 'a1', action: 'Deployed to production', user: 'Team Admin', timestamp: '2 hours ago' }, { id: 'a2', action: 'Invited viewer@example.com', user: 'Team Admin', timestamp: '1 day ago' }]);
+  }, [entries, selectedTeam]);
+  return null;
+}
+TSX
+    cat > "$d/dash/components/loki-cost-waterfall-or.js" <<'JS'
+export class LokiCostWaterfallOr extends LokiElement {
+  async _loadData(data) {
+    this._phases = data.phases || [{ name: 'build', cost_usd: 0.42, tokens: 18000 }, { name: 'test', cost_usd: 0.17, tokens: 7000 }];
+  }
+}
+JS
+    cat > "$d/src/components/ArrayOfFallback.tsx" <<'TSX'
+export function A() {
+  setActivities(Array.of({ id: 'a1', action: 'Deployed to production', user: 'Team Admin', timestamp: '2 hours ago' }));
+  return null;
+}
+TSX
+    # Extra positives for the rule 6 extension's other new shapes: a ternary
+    # whose LITERAL branch is the `?` side (not just the `:` side above), a
+    # local that flows into a plain setter, and the same flowing into a
+    # generic useState<T>(name) form.
+    cat > "$d/src/components/TernaryQBranch.tsx" <<'TSX'
+export function TQ({ data }) {
+  this._x = data.length ? [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }] : data;
+  return null;
+}
+TSX
+    cat > "$d/src/components/DeclFlowsToState.tsx" <<'TSX'
+export function DF({ cond, data }) {
+  const rows = cond ? data : [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  setRows(rows);
+  return null;
+}
+TSX
+    cat > "$d/src/components/DeclGenericUseState.tsx" <<'TSX'
+export function DG() {
+  const items = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  const [x] = useState<Row[]>(items);
+  return null;
+}
+TSX
+    # Per-arm coverage positives: each of these is shaped so exactly one arm
+    # can claim it (an earlier arm in scan order never reaches it), so
+    # deleting that arm changes this control's result. Without these, THIS_ARR,
+    # the setter-span "anywhere in the argument list" reach, and Array.from()
+    # have no committed control at all, and a reviewer deleting any of them
+    # would leave the suite green.
+    cat > "$d/dash/components/ThisArrOnly.js" <<'JS'
+export class ThisArrOnly extends LokiElement {
+  _seed() {
+    this._phases = [{ phase: 'build', cost_usd: 0.42, tokens: 18000 }];
+  }
+}
+JS
+    cat > "$d/src/components/SetterSpanOnly.tsx" <<'TSX'
+export function SS({ prev }) {
+  setActivities(prev.concat([{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }]));
+  return null;
+}
+TSX
+    cat > "$d/dash/components/ArrayFromOnly.js" <<'JS'
+export class ArrayFromOnly extends LokiElement {
+  _seed() {
+    this._rows = Array.from([{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }]);
+  }
+}
+JS
+    cat > "$d/src/components/DeclPlainSetter.tsx" <<'TSX'
+export function DP() {
+  const rows = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  setRows(rows);
+  return null;
+}
+TSX
+    # The two FLOWS_TO_STATE_TMPL alternatives DeclPlainSetter and
+    # DeclGenericUseState do not reach: a local reassigned to `this.y` instead
+    # of passed to a setter, and the lazy useState(() => name) initializer form.
+    cat > "$d/dash/components/ThisFlowOnly.js" <<'JS'
+export class ThisFlowOnly extends LokiElement {
+  _seed() {
+    const rows = [{ phase: 'build', cost_usd: 0.42, tokens: 18000 }];
+    this._phases = rows;
+  }
+}
+JS
+    cat > "$d/src/components/DeclLazyUseState.tsx" <<'TSX'
+export function DL() {
+  const items = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  const [x] = useState(() => items);
+  return null;
+}
+TSX
+    # Negative controls for the rule 6 extension: a ternary between two
+    # literals (advisorOpts, real shape at loki-session-control.js:471), a
+    # render-local literal list mapped straight into markup with no setter, a
+    # named module-level table that seeds useState (DEFAULT_PROVIDERS, real
+    # shape at SystemSettingsPage.tsx:69), the module-level config tables
+    # named in the moat task (DEFAULT_PERMISSIONS, COLUMNS, GALLERY, verbatim
+    # shapes from RBACPanel.tsx, Footer.tsx and ShowcasePage.tsx), and a
+    # timer callback (never a React/state setter).
+    cat > "$d/src/components/AdvisorOptsHonest.tsx" <<'TSX'
+export function H({ provider }) {
+  const advisorOpts = provider === 'claude' ? [
+    { value: '', label: 'Account default' },
+    { value: 'opus', label: 'Opus (stronger judge)' },
+  ] : [];
+  return null;
+}
+TSX
+    cat > "$d/src/components/RenderLocalTabsHonest.tsx" <<'TSX'
+export function R() {
+  const tabs = [
+    { id: 'a', label: 'A' },
+    { id: 'b', label: 'B' },
+  ];
+  return tabs.map((t) => t.id);
+}
+TSX
+    cat > "$d/src/components/DefaultProvidersHonest.tsx" <<'TSX'
+const DEFAULT_PROVIDERS = [
+  { id: 'claude', name: 'Claude', secretKey: 'ANTHROPIC_API_KEY', model: 'claude-opus-4-7', fallbackOrder: 1, enabled: true },
+];
+
+export function S() {
+  const [providers, setProviders] = useState(DEFAULT_PROVIDERS);
+  return providers;
+}
+TSX
+    cat > "$d/src/components/ModuleTablesHonest.tsx" <<'TSX'
+const DEFAULT_PERMISSIONS = [
+  { id: 'project.create', label: 'Create Projects', description: 'Create new projects' },
+  { id: 'project.edit', label: 'Edit Projects', description: 'Modify project files and settings' },
+];
+
+const COLUMNS = [
+  {
+    title: 'Product',
+    links: [
+      { label: 'Features', to: '/' },
+      { label: 'Templates', to: '/templates' },
+    ],
+  },
+];
+
+const GALLERY = [
+  {
+    title: 'SaaS Dashboard',
+    description: 'Admin dashboard with user analytics, charts, and real-time data visualization.',
+    techStack: ['React', 'Tailwind', 'Chart.js'],
+    buildTime: '~25 min',
+    gradient: 'from-[#553DE9] to-[#7B6BEF]',
+    prompt: 'Build a SaaS admin dashboard',
+  },
+];
+
+export function M() {
+  return DEFAULT_PERMISSIONS.length + COLUMNS.length + GALLERY.length;
+}
+TSX
+    cat > "$d/src/components/TimerHonest.tsx" <<'TSX'
+export function TM() {
+  setTimeout(() => {
+    const x = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    void x;
+  }, 0);
+  return null;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -1033,10 +1369,28 @@ Named.tsx:4|'_demoData' binds
 Named.tsx:5|'PLACEHOLDER_USERS' binds
 Named.tsx:6|'fakeStats' binds
 loki-audit-fallback.js:6|literal sample rows assigned in a catch block
+TernaryFallback.tsx:3|literal sample rows in a ternary branch
+loki-cost-waterfall-or.js:3|literal sample rows used as a ||/?? fallback
+ArrayOfFallback.tsx:2|literal sample rows via Array.of()
+TernaryQBranch.tsx:2|literal sample rows in a ternary branch
+DeclFlowsToState.tsx:2|literal sample rows in a ternary branch
+DeclGenericUseState.tsx:2|literal sample rows assigned to items
+ThisArrOnly.js:3|literal sample rows assigned to this._phases
+SetterSpanOnly.tsx:2|literal sample rows in the setActivities() argument list
+ArrayFromOnly.js:3|literal sample rows via Array.from()
+DeclPlainSetter.tsx:2|literal sample rows assigned to rows
+ThisFlowOnly.js:3|literal sample rows assigned to rows
+DeclLazyUseState.tsx:2|literal sample rows assigned to items
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
-        loki-audit-fallback.js:1 HonestRows.tsx:0 P.tsx:0; do
+        loki-audit-fallback.js:1 HonestRows.tsx:0 P.tsx:0 \
+        TernaryFallback.tsx:1 loki-cost-waterfall-or.js:1 ArrayOfFallback.tsx:1 \
+        TernaryQBranch.tsx:1 DeclFlowsToState.tsx:1 DeclGenericUseState.tsx:1 \
+        ThisArrOnly.js:1 SetterSpanOnly.tsx:1 ArrayFromOnly.js:1 DeclPlainSetter.tsx:1 \
+        ThisFlowOnly.js:1 DeclLazyUseState.tsx:1 \
+        AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
+        ModuleTablesHonest.tsx:0 TimerHonest.tsx:0; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
