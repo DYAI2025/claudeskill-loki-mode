@@ -2800,6 +2800,17 @@ print(json.dumps(items[:5]))
     if [ "$persist_fails" = "true" ]; then persist_ok="false"; else persist_ok="true"; fi
     if [ "$auth_fails" = "true" ]; then auth_ok="false"; else auth_ok="true"; fi
     if [ "$authz_fails" = "true" ]; then authz_ok="false"; else authz_ok="true"; fi
+    # BACKLOG 61: mirror the _write_evidence_details (BACKLOG 55) fix here.
+    # $test_pass defaults to "true" and stays "true" for every inconclusive
+    # outcome (no runner, no results file, zero tests, no pass recorded), so
+    # writing it raw lets tests.pass read true when this block was triggered
+    # by a DIFFERENT axis (e.g. empty_diff) while tests never actually ran.
+    local tests_pass_json='"inconclusive"'
+    if [ "$test_fails" = "true" ]; then
+        tests_pass_json="false"
+    elif [ "$test_inconclusive" != "true" ] && [ "$test_runner" != "none" ] && [ "$test_pass" = "true" ]; then
+        tests_pass_json="true"
+    fi
     # Record WHY boot was inconclusive (no_app_runner / not_serveable / etc.) so a
     # consumer of the block report can tell a genuine boot pass from a pass-through.
     boot_reason_json=$(_R="${boot_inconclusive_reason:-}" python3 -E -s -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json,os; print(json.dumps(os.environ['_R']))" 2>/dev/null || echo '""')
@@ -2817,7 +2828,7 @@ print(json.dumps(items[:5]))
     "reason": "$reason",
     "checks": {
         "diff": {"ok": $diff_ok, "base_sha": "$base_for_json", "files_changed": $diff_files, "sources": "committed|unstaged|staged|untracked union"},
-        "tests": {"ok": $tests_ok, "runner": "$test_runner", "pass": $test_pass},
+        "tests": {"ok": $tests_ok, "runner": "$test_runner", "pass": $tests_pass_json},
         "boot": {"ok": $boot_ok, "inconclusive": $boot_inconclusive, "reason": $boot_reason_json},
         "secret": {"ok": $secret_ok},
         "nomock": {"ok": $nomock_ok, "inconclusive": $nomock_inconclusive, "reason": $nomock_reason_json},
