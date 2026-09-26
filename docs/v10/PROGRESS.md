@@ -48,6 +48,13 @@
 - Released as v9.54.0.
 - Open items the slices found: BACKLOG 61-65.
 
+### Cycle 4 (2026-09-26)
+
+- v9.54.0 release: required-ci failed once on a load-sensitive test case (BACKLOG 93; product behaved correctly), passed on rerun; full Release rerun published npm (gitHead `1dd799f9`), tag and GitHub release; Docker/Homebrew in progress at the time of writing.
+- Dev fleet (4 worktree slices): session commit never sweeps or loses a user file (BACKLOG 90 branch protection off, 85 test-gate bytecode, 74 agent self-commits); exit 0 with failures, failed_count and stale results never a pass (73, 81, 82, 89, 91); no fabricated console data and unmeasured cost never zero (P7 part 1); every console panel call reaches a real route on every FastAPI (P7 part 2; BACKLOG 27 and 29 were measurement bugs; six orphan demo-data components deleted).
+- **Moat: 2 of 9 proven (P6, P7)**; 57 registered, 38 pass, 19 pending; ratchet against v9.52.0, v9.53.0, v9.54.0.
+- Open items the slices found: BACKLOG 94-98.
+
 ## Next (after cycle 3)
 
 1. BACKLOG 90 (branch-protection-off stale snapshot: data risk), then 74 (agent self-commits bypass the snapshot), 85 (test-gate `__pycache__`), 73 (exit-0 runs with failures).

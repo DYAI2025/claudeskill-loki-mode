@@ -47,10 +47,10 @@ Status values: todo, in progress, shipped (version), parked (reason).
 
 25. **`loki ci --report` crashes on large diffs** with "Argument list too long" (`autonomy/loki:33811` passes the diff to python3 as argv; exit 126). Seen on PR #216 and a 2026-08-30 PR via the "Loki CI Quality Gate" workflow, which runs the published package. Pass the diff on stdin or a file.
 26. **Bun Parity `doctor-json` flake:** `disk.available_gb` read 94 vs 95 between the two routes on macOS (PR #216). Normalize or drop the value in the parity comparison.
-27. **Dashboard routes vanish on newer FastAPI:** a clean `requirements-test.txt` install resolves FastAPI 0.141.1 / Starlette 1.7.0, where `dashboard.server.app.routes` has 191 routes and zero `/api/v2` paths, against 218 and 24 on FastAPI 0.128.0 (slice Z measurement). Users installing today may get a dashboard missing its v2 API. Pin or fix.
+27. **(Resolved in cycle 4: a measurement bug, not a product bug. FastAPI 0.141 keeps included routers as lazy entries in `app.routes`; the routes were serving all along, `app.openapi()` is identical on both versions.) Dashboard routes vanish on newer FastAPI:** a clean `requirements-test.txt` install resolves FastAPI 0.141.1 / Starlette 1.7.0, where `dashboard.server.app.routes` has 191 routes and zero `/api/v2` paths, against 218 and 24 on FastAPI 0.128.0 (slice Z measurement). Users installing today may get a dashboard missing its v2 API. Pin or fix.
 
 28. **Moat: pending-failure fingerprints.** A pending case that starts failing for a different reason (for example its own positive control broke) stays green. Give each pending entry an expected failure reason and fail on a mismatch (council round 2).
-29. **P7 route count depends on the host** (9 missing on macOS, 21 on Linux CI) because optional routers do not mount there; tied to item 27.
+29. **(Resolved in cycle 4: the P7 matcher asks the app router directly and fails closed per router.) P7 route count depends on the host** (9 missing on macOS, 21 on Linux CI) because optional routers do not mount there; tied to item 27.
 30. **P4 results need provenance.** Once the corpus exists, a hand-written per-defect outcomes file could still pass; require a verifiable receipt per outcome.
 31. **`proof-verify.py` reads "drift unverifiable" (not a git tree, no base_sha) as 1 (tampered)**; it should be 2 (could not check). (The Bun timeout part is fixed: exits above 128 map to 2.)
 32. **Docs tell npm users to run `doctor --airgap`** (`docs/air-gapped.md:48`, `deploy/helm/README.md:413`), which the default route rejects. Note `LOKI_LEGACY_BASH=1` until `P5.airgap-audit-default-route` is fixed.
@@ -130,6 +130,14 @@ Status values: todo, in progress, shipped (version), parked (reason).
 90. **Data risk, next in line: `LOKI_BRANCH_PROTECTION=false` on a leftover `loki/session-*` branch** returns before any snapshot (`run.sh` ~9073), and `commit_session_changes` then commits with the earlier session's stale snapshot, so a file the user made since is committed and lost from disk on checkout of the base (also in v9.53.0; breaks the LOCK A1 opt-out promise). One guard: commit nothing unless this run took a snapshot, or skip the session commit when branch protection is off (cycle-3 council round 6).
 91. **Zero-test stage events:** a zero-test run still returns 0 from `enforce_test_coverage`, so the loop emits `stage_complete test_suite pass` (~24590) although the result is inconclusive.
 92. **Receipt path bases mix under a subdirectory `TARGET_DIR`:** tracked entries are repo-top-relative, untracked and `preexisting_modified` entries are cwd-relative.
+
+93. **`test-hard-deadline-confinement.sh` "zero-exit leader" case is load-sensitive:** the leader waits only 0.2s for the forked child to write its PID file, so under CI load the child PID is empty and the case fails although the product behaved correctly (rc 125, no mutation). Seen once, shard 2 at `1dd799f9` (v9.54.0 release run), passed 3/3 locally and on rerun. Wait for the PID file with a bounded, generous timeout.
+
+94. **Scope-audit tests walk `app.routes`** (`test_all_data_gets_scoped`, `test_fleet_observability`, `test_fleet_retry`, `test_memory_read_scope_auth`), so on FastAPI >= 0.141 they never see a v2 or operator route: their v2 coverage is vacuous on CI. Use the same router-matching approach as the P7 case (cycle 4, slice D).
+95. **Servers still seed unmeasured cost as 0:** `web-app/server.py` `/api/session/status` seeds `cost_usd = 0.0` (~2932) and `dashboard/registry.py` does the same, so the UI can only treat values above 0 as readings. Send null when nothing was recorded.
+96. **More fabrications in `ProjectWorkspace.tsx`:** `testCoverage={buildStatus.iteration > 2 ? 60 : 20}`, `gatePassRate={0.8}` (~1559) and hardcoded zeros for `filesModified`/`linesGenerated` passed to BuildInsights. The P7 sample-data scanner misses assignment-form fallbacks and unconditional fakes; widen it.
+97. **Register `scripts/run-webapp-admin-honesty.sh`** in `scripts/local-ci.sh` (~1850) and `tests/run-all-tests.sh` (~295) next to its sibling harnesses.
+98. **Headline vs gate listing:** the stale-results fix (82) changes the unit_tests gate listing only; the headline comes from `facts.tests`, which should get the same freshness rule. The council member vote and `_council_convergence_evidence_green` still read `pass: true` as green whatever `failed_count` says, and the Bun npm fallback still reads an exit-0 run printing "Tests: 1 failed" as passed.
 
 ## Later milestones
 
