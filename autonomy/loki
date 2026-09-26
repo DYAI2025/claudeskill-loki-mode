@@ -7809,8 +7809,16 @@ _loki_pid_looks_like_purplelab() {
         set -- $_cmd
         argv0="${1:-}"
         argv1="${2:-}"
-        case "$argv0" in
-            */[Pp]ython*|[Pp]ython*) ;;
+        # Match the BASENAME only. The prior "*/[Pp]ython*|[Pp]ython*" glob
+        # matched the WHOLE string against "any chars, then /, then
+        # python-substring, then any chars" -- not "the final path segment
+        # starts with python" -- so /opt/python-tools/bin/tail passed. Not
+        # currently exploitable on its own (argv1 exact-match + uid still
+        # gate it), but tightened per council review: a real interpreter's
+        # basename must itself start with [Pp]ython, e.g. "python3",
+        # "python3.12", or a full path ending in one of those.
+        case "${argv0##*/}" in
+            [Pp]ython*) ;;
             *) exit 1 ;;
         esac
         [ "$argv1" = "$_want" ] || exit 1
