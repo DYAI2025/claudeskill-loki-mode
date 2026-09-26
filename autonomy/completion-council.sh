@@ -1970,19 +1970,44 @@ if failed_n is None:
 # (node --test on a *.test.js with no test() calls; jest --passWithNoTests with
 # no suites) records pass:"inconclusive" + status:"no_tests_run" -- a mini
 # fake-green when read as affirmative. The pass value is then the STRING
-# "inconclusive" (not the bool True/False), so the old else-branch (PASS) would
-# have counted it as green. Route it to INCONCLUSIVE (pass-through, never a
-# block): a real runner ran but proved nothing, exactly like runner=="none".
-# Only the boolean True passes as affirmative; only the boolean False blocks.
-if runner == 'none':
+# "inconclusive" (not the bool True/False), so an else-branch of plain PASS
+# would have counted it as green.
+#
+# BACKLOG 33 rework (S-07, take 2): status=='no_tests_run' MUST be checked
+# BEFORE the runner=='none' sentinel below. A zero-test record can carry
+# runner=='none' (explicit or omitted/defaulted), and the old order let
+# runner=='none' short-circuit first, printing PASS -- a real runner having
+# run and found nothing is a WORSE signal than no test tooling applying here
+# at all, and must never read as equal-or-better. ZEROTESTS is a distinct
+# verdict token (not reused INCONCLUSIVE) so the shell dispatch below can
+# route it to reason=no_tests_executed for EVERY runner value, without
+# colliding with the parse-failure sentinel INCONCLUSIVE:none:true above or
+# the generic NO_PASS case.
+#
+# runner=='none' below is now UNCONDITIONAL again (this is the fix for the
+# prior rework's regression): the ONLY real writer of runner:"none" is
+# run.sh's enforce_test_coverage's no-test-tooling branch, which always
+# writes pass:"inconclusive" (the STRING) with status:"not_run" -- never a
+# boolean pass:true. Narrowing this branch to require passed is True (as the
+# prior, unmerged rework did) therefore caught the ENTIRE real no-test-tooling
+# population and routed it to NO_PASS/no_pass_recorded instead of
+# PASS/no_test_runner, silently defeating LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1
+# for the real shape and dropping the heuristic council's vote on genuine
+# no-test-tooling projects. runner=='none' is a distinct dimension (no
+# suite applies here) from status=='no_tests_run' (a suite ran and executed
+# nothing); checking status first is what keeps the two separate, not a
+# pass-value narrowing on top of it.
+if status == 'no_tests_run':
+    print('ZEROTESTS:%s:true' % runner)
+elif runner == 'none':
     print('PASS:none:true')
 elif passed is False or (failed_n or 0) > 0:
     print('FAIL:%s:false' % runner)
-elif status == 'no_tests_run' or passed is not True:
-    # Both are INCONCLUSIVE; NO_PASS names the second: no boolean pass was
-    # recorded at all (missing, null, or a non-boolean value), which is not a
-    # zero-test run.
-    print('%s:%s:true' % ('INCONCLUSIVE' if status == 'no_tests_run' else 'NO_PASS', runner))
+elif passed is not True:
+    # No boolean pass was recorded at all (missing, null, or a non-boolean
+    # value): not a zero-test run (status check above already excluded that),
+    # just an unrecorded outcome.
+    print('NO_PASS:%s:true' % runner)
 else:
     print('PASS:%s:true' % runner)
 PYEOF
@@ -1996,20 +2021,25 @@ PYEOF
         fi
         # INCONCLUSIVE => test_fails stays "false" => pass-through.
         # No test suite ran: a present results file that records runner=="none"
-        # is not affirmative evidence. Route to council (inconclusive), not a
-        # silent diff-alone pass. Default-on; LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1
-        # restores the old affirmative-PASS behavior.
-        if [ "$test_runner" = "none" ] && [ "${LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE:-0}" != "1" ]; then
+        # is not affirmative evidence UNLESS it is also the ZEROTESTS shape
+        # (excluded below; that reason is more specific: a suite ran and found
+        # nothing, distinct from no test tooling existing at all). Route to
+        # council (inconclusive), not a silent diff-alone pass. Default-on;
+        # LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1 restores the old affirmative-PASS
+        # behavior for this branch only -- never for ZEROTESTS below.
+        if [ "$test_runner" = "none" ] && [ "$_verdict" != "ZEROTESTS" ] && [ "${LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE:-0}" != "1" ]; then
             test_inconclusive="true"
             test_inconclusive_reason="no_test_runner"
         fi
-        # #82: a real runner that executed ZERO tests (pass:"inconclusive" +
-        # status:"no_tests_run") is INCONCLUSIVE, not affirmative. Mirror the
-        # runner=="none" pass-through so it routes to the council instead of
-        # reading as green. Honest (not a block): test_fails stays "false".
+        # #82: ZERO tests executed (pass:"inconclusive" + status:"no_tests_run")
+        # is INCONCLUSIVE, not affirmative, for EVERY runner value including
+        # none/omitted (BACKLOG 33 rework, take 2: the ZEROTESTS token from the
+        # parser above already isolates this case from the runner=="none"
+        # no-test-tooling sentinel, so this branch no longer needs to exclude
+        # runner=="none" -- doing so was the take-1 bug this rework fixes).
         # Not gated by LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE -- a zero-test run is
         # never affirmative evidence regardless of that opt-out.
-        if [ "$_verdict" = "INCONCLUSIVE" ] && [ "$test_runner" != "none" ]; then
+        if [ "$_verdict" = "ZEROTESTS" ]; then
             test_inconclusive="true"
             test_inconclusive_reason="no_tests_executed"
         fi
@@ -3615,14 +3645,26 @@ council_evaluate_member() {
     # fragile log grep. The completion route guarantees this file is written
     # before the council votes via ensure_completion_test_evidence()
     # (autonomy/run.sh): a project with a real runner records its true PASS/FAIL,
-    # and a project with no runner records {"runner":"none","pass":true}. A
-    # greenfield run with an empty .loki/ has NO such file -> no positive base ->
-    # the member stays CONTINUE.
+    # and a project with no test tooling records the shape run.sh's
+    # enforce_test_coverage's no-runner branch actually writes:
+    # {"runner":"none","pass":"inconclusive","status":"not_run",...} -- the pass
+    # value is the STRING "inconclusive", never the boolean true. A greenfield
+    # run with an empty .loki/ has NO such file -> no positive base -> the
+    # member stays CONTINUE.
     #
-    # Parse verdict mirrors council_evidence_gate: runner=="none" => PASS,
-    # pass is False => FAIL, only a boolean True (and not status no_tests_run)
-    # => PASS; a missing, null or non-boolean pass key recorded no outcome =>
-    # INCONCLUSIVE (not red, not positive). Unparseable/missing file => absent.
+    # Parse verdict mirrors council_evidence_gate (BACKLOG 33 rework, take 2):
+    # status=='no_tests_run' is checked FIRST (a real runner ran and executed
+    # ZERO tests, #82) and is always inconclusive, whatever the runner field --
+    # this must be decided before runner=='none' below, or a zero-test record
+    # with runner omitted/'none' would short-circuit into the no-tooling
+    # sentinel and print an affirmative pass, exactly the ordering bug already
+    # fixed in council_evidence_gate. runner=='none' is UNCONDITIONALLY pass
+    # (the no-test-tooling sentinel: no suite applies here at all, a distinct
+    # and BETTER signal than a suite that ran and found nothing) -- it is not
+    # narrowed to a boolean pass:true, because the real writer never produces
+    # that shape. passed is False => FAIL; a missing, null or non-boolean pass
+    # key recorded no outcome => INCONCLUSIVE (not red, not positive).
+    # Unparseable/missing file => absent.
     local tr_file="$loki_dir/quality/test-results.json"
     local test_evidence="absent"   # absent | pass | fail | inconclusive
     local test_runner_seen="none"
@@ -3638,11 +3680,14 @@ except (json.JSONDecodeError, IOError, KeyError, ValueError):
     sys.exit(0)
 runner = d.get('runner', 'none')
 passed = d.get('pass')
-if runner == 'none':
+status = d.get('status', '')
+if status == 'no_tests_run':
+    print('inconclusive:%s' % runner)
+elif runner == 'none':
     print('pass:none')
 elif passed is False:
     print('fail:%s' % runner)
-elif passed is not True or d.get('status') == 'no_tests_run':
+elif passed is not True:
     print('inconclusive:%s' % runner)
 else:
     print('pass:%s' % runner)
