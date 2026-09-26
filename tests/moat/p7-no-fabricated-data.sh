@@ -26,10 +26,12 @@
 # SOURCE, NEVER THE BUNDLE. dashboard/static/index.html is the built bundle and
 # is never scanned: a bundle scan measures the last build, not the code.
 #
-# ROUTE TABLES ARE READ, NOT GREPPED. Both route cases import the real FastAPI
-# app and read app.routes, like tests/test-verify-client-routes.sh does. Client
-# paths are parsed with the TypeScript AST (the typescript package the web-app
-# already depends on), never with a line regex.
+# ROUTES ARE MATCHED, NOT GREPPED. Both route cases import the real FastAPI
+# app and ask its own router whether each client path reaches a route, the same
+# on every FastAPI version; every included router must be proven mounted or the
+# case fails naming it (see match-routes.py). Client paths are parsed with the
+# TypeScript AST (the typescript package the web-app already depends on), never
+# with a line regex.
 #
 # Prerequisites: python3 with fastapi (the route tables), node, and
 # web-app/node_modules/typescript or dashboard-ui/node_modules/typescript
@@ -253,55 +255,99 @@ for (const file of files) {
 console.log(JSON.stringify({ files: files.length, captured: calls.length, calls, unresolved, helpers }));
 JS
 
-# Match extracted calls against a FastAPI app's real route table. Segment-wise:
-# a server {param} matches any client segment, a {x:path} param matches the
-# rest, literals must be equal. Method '*' means the extractor could not see the
-# verb (a URL built into a variable), so only the path is checked.
+# Match extracted calls against a FastAPI app with the app's OWN matcher
+# (Starlette's public route.matches(scope)), never by walking app.routes as a
+# table. app.routes is a framework detail: FastAPI >= 0.141 stores an included
+# router as ONE lazy wrapper, so a table walk saw zero /api/v2 routes on a clean
+# requirements-test.txt install while every one of them served (BACKLOG 27/29;
+# tests/dashboard/test_router_mounts_diagnostic.py). Client {p} segments are
+# sent as "1". Method '*' means the extractor could not see the verb (a URL
+# built into a variable), so only the path is checked.
+#
+# Every router the server includes must have MOUNTED: each is imported directly
+# and each of its own routes must be reachable, or the matcher refuses (exit 2)
+# and names the cause. An optional router that failed to import or mount is a
+# named failure, never a smaller route count. ROUTES is counted from top-level
+# /api routes plus each router's own routes, so it is the same on every host.
+# Extra argv entries (the positive control only) name files defining a
+# `router` that must be mounted.
 cat > "$MOAT_TMP/match-routes.py" <<'PY'
-import json, os, re, sys
-repo, modspec, calls_json = sys.argv[1], sys.argv[2], sys.argv[3]
+import importlib, importlib.util, json, os, re, sys
+repo, modspec, calls_json, extra = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 sys.path.insert(0, repo)
 if modspec == 'dashboard':
     from dashboard import server
+    expected = ['dashboard.api_v2', 'dashboard.api_operator']
 else:
     sys.path.insert(0, os.path.join(repo, 'web-app'))
     import server
-routes = []
-for r in server.app.routes:
-    p = getattr(r, 'path', None)
-    if not p or not p.startswith('/api'):
-        continue
-    m = getattr(r, 'methods', None)
-    routes.append((p.rstrip('/') or '/', set(m) if m else {'WS'}))
-if not routes:
-    print('FATAL zero /api routes read from app.routes; the comparison would be vacuous')
-    sys.exit(2)
+    expected = []
+from fastapi import APIRouter
+from starlette.routing import Match
 
-def seg_match(server_path, client_path):
-    s = server_path.split('/'); c = client_path.split('/')
-    for i, seg in enumerate(s):
-        if re.fullmatch(r'\{[^}]*:path\}', seg):
-            return len(c) > i
-        if i >= len(c):
-            return False
-        if re.fullmatch(r'\{[^}]*\}', seg):
-            continue
-        if seg != c[i]:
-            return False
-    return len(s) == len(c)
+# Only /api routes and path-less wrappers (the lazy included router) are asked,
+# so the SPA catch-all and the /lab mount can never vouch for an /api path.
+cands = [r for r in server.app.routes if getattr(r, 'path', None) is None or r.path.startswith('/api')]
+
+def scope(path, method, kind='http'):
+    return {'type': kind, 'path': path, 'root_path': '', 'method': method, 'headers': [], 'query_string': b''}
+
+def reach(path, method):
+    """'full', 'partial' (the path exists for other methods only) or None."""
+    best = None
+    for m in (['GET'] if method == '*' else [method] + (['GET'] if method == 'HEAD' else [])):
+        for r in cands:
+            got = r.matches(scope(path, m))[0]
+            if got == Match.FULL:
+                return 'full'
+            if got == Match.PARTIAL:
+                best = 'partial'
+    if any(r.matches(scope(path, 'GET', 'websocket'))[0] == Match.FULL for r in cands):
+        return 'full'
+    return 'full' if (method == '*' and best) else best
+
+concrete = lambda p: re.sub(r'\{[^}]*\}', '1', p)
+key = lambda r: (r.path.rstrip('/') or '/', frozenset(getattr(r, 'methods', None) or {'WS'}))
+table = {key(r) for r in server.app.routes if (getattr(r, 'path', None) or '').startswith('/api')}
+
+routers = []
+for name in expected:
+    try:
+        routers.append((name, importlib.import_module(name).router))
+    except Exception as exc:
+        print(f'FATAL router {name} failed to import ({type(exc).__name__}: {exc}); the server cannot have mounted its routes')
+        sys.exit(2)
+for f in extra:
+    spec = importlib.util.spec_from_file_location('moat_ctl_router', f)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    routers.append((f, mod.router))
+seen = {id(r) for _, r in routers}
+routers += [(f'server.{k}', v) for k, v in sorted(vars(server).items()) if isinstance(v, APIRouter) and id(v) not in seen]
+for name, router in routers:
+    own = [r for r in router.routes if getattr(r, 'path', None)]
+    if not own:
+        print(f'FATAL router {name} has no routes; nothing to prove mounted')
+        sys.exit(2)
+    lost = [r.path for r in own if any(reach(concrete(r.path), m) != 'full' for m in (getattr(r, 'methods', None) or ['GET']))]
+    if lost:
+        print(f'FATAL router {name}: {len(lost)} of {len(own)} routes are not reachable on the app, so it did not mount (first: {lost[0]})')
+        sys.exit(2)
+    table |= {key(r) for r in own}
+if not table:
+    print('FATAL zero /api routes found; the comparison would be vacuous')
+    sys.exit(2)
 
 data = json.load(open(calls_json))
 drift = []
 for call in data['calls']:
     path, method = call['path'], call['method']
-    hits = [ms for sp, ms in routes if seg_match(sp, path)]
-    if not hits:
+    got = reach(concrete(path), method)
+    if got is None:
         drift.append(f"{call['where']} {method} {path} -> NO ROUTE")
-        continue
-    allowed = set().union(*hits)
-    if method != '*' and 'WS' not in allowed and method not in allowed and not (method == 'HEAD' and 'GET' in allowed):
-        drift.append(f"{call['where']} {method} {path} -> route exists with methods {sorted(allowed)}")
-print(f'ROUTES {len(routes)}')
+    elif got == 'partial':
+        drift.append(f"{call['where']} {method} {path} -> route exists, but not for {method}")
+print(f'ROUTES {len(table)} (routers proven mounted: {len(routers)})')
 for d in drift:
     print('DRIFT ' + d)
 sys.exit(1 if drift else 0)
@@ -391,11 +437,19 @@ print(" ".join(sorted(c["method"]+":"+c["path"] for c in d["calls"])), "unresolv
     [ "$got" = "1" ] || { echo "extractor control: an unknown glued suffix was not reported unresolved (got $got)"; return 1; }
     printf '{"calls":[{"where":"ctl:1","path":"%s","method":"GET"}]}' "$real" > "$ctl/real.json"
     printf '{"calls":[{"where":"ctl:2","path":"/api/moat-made-up-route-7f3a","method":"GET"}]}' > "$ctl/fake.json"
-    ( cd "$MOAT_TMP" && py_server "$MOAT_TMP/match-routes.py" "$REPO_ROOT" "$mod" "$ctl/real.json" ) >/dev/null 2>&1 \
-        || { echo "matcher control: real path $real was not accepted"; return 1; }
+    ( cd "$MOAT_TMP" && py_server "$MOAT_TMP/match-routes.py" "$REPO_ROOT" "$mod" "$ctl/real.json" ) > "$ctl/real.out" 2>&1 \
+        || { echo "matcher control: real path $real was not accepted: $(grep -m1 -E '^(FATAL|DRIFT)' "$ctl/real.out" || tail -c 160 "$ctl/real.out")"; return 1; }
     local frc=0
     ( cd "$MOAT_TMP" && py_server "$MOAT_TMP/match-routes.py" "$REPO_ROOT" "$mod" "$ctl/fake.json" ) >/dev/null 2>&1 || frc=$?
     [ "$frc" = "1" ] || { echo "matcher control: a made-up path was not flagged (rc=$frc)"; return 1; }
+    # A router the app never included must be a named refusal, not a pass.
+    printf '%s\n' 'from fastapi import APIRouter' "router = APIRouter(prefix='/api/moat-ctl-unmounted-7f3a')" \
+        "router.add_api_route('/x', lambda: {}, methods=['GET'])" > "$ctl/unmounted_router.py"
+    frc=0
+    ( cd "$MOAT_TMP" && py_server "$MOAT_TMP/match-routes.py" "$REPO_ROOT" "$mod" "$ctl/real.json" "$ctl/unmounted_router.py" ) \
+        > "$ctl/unmounted.out" 2>&1 || frc=$?
+    { [ "$frc" = "2" ] && grep -q 'did not mount' "$ctl/unmounted.out"; } \
+        || { echo "matcher control: an unmounted router was not refused by name (rc=$frc)"; return 1; }
     return 0
 }
 

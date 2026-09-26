@@ -99,9 +99,17 @@ export class LokiCostWaterfall extends LokiElement {
     // Capture the api instance so a mid-flight api-url switch can be detected.
     const api = this._api;
     try {
-      const data = await api._get('/api/v2/cost/breakdown');
+      // /api/cost is the real per-phase cost reader (there was never a
+      // /api/v2/cost/breakdown route). A phase nobody measured carries
+      // cost_usd null there, and so does the total.
+      const cost = await api._get('/api/cost');
       // Drop a stale response if the api-url switched mid-flight.
       if (api !== this._api) return;
+      const data = {
+        phases: Object.entries(cost.by_phase || {}).map(([phase, v]) => ({ phase, cost_usd: v.cost_usd ?? null })),
+        budget_usd: cost.budget_limit,
+        total_usd: cost.estimated_cost_usd,
+      };
       this._phases = data.phases || [];
       this._budget = data.budget_usd || null;
       // `|| 0` inside a reduce fabricates a total: null + null is 0 in JS, so

@@ -7997,6 +7997,39 @@ async def magic_get_spec(name: str) -> JSONResponse:
     return JSONResponse(content={"name": name, "markdown": spec_path.read_text()})
 
 
+@app.get("/api/magic/components/{name}/code")
+async def magic_get_code(name: str) -> JSONResponse:
+    """Return a component's generated source, read from the paths its registry entry records."""
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_-]*$", name):
+        return JSONResponse(status_code=400, content={"error": "Invalid component name"})
+    reg_path = _magic_registry_path()
+    if not reg_path.exists():
+        return JSONResponse(status_code=404, content={"error": "no registry"})
+    try:
+        data = json.loads(reg_path.read_text())
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    comps = data.get("components", []) if isinstance(data, dict) else []
+    entry = next((c for c in comps if isinstance(c, dict) and c.get("name") == name), None)
+    if entry is None:
+        return JSONResponse(status_code=404, content={"error": "component not found"})
+    files = []
+    for target in ("react", "webcomponent"):
+        recorded = entry.get(f"{target}_path") or ""
+        if not isinstance(recorded, str) or not recorded:
+            continue
+        # registry.json is a project file an agent can write; a recorded path
+        # (or a symlink) that leaves the project is refused, never read.
+        path = _safe_resolve(Path.cwd(), recorded)
+        if path is None:
+            return JSONResponse(status_code=403, content={"error": f"{target} path is outside the project"})
+        if path.is_file():
+            files.append({"target": target, "path": recorded, "code": path.read_text(errors="replace")})
+    if not files:
+        return JSONResponse(status_code=404, content={"error": "no generated code on disk"})
+    return JSONResponse(content={"name": name, "files": files})
+
+
 @app.post("/api/magic/components/{name}/debate")
 async def magic_run_debate(name: str, req: dict = Body(default={})) -> JSONResponse:
     """Trigger a multi-persona debate on an existing component."""

@@ -7842,7 +7842,8 @@ def _compute_cost_snapshot() -> dict:
                 # AttributeError. Skip such files rather than 500 the endpoint.
                 if not isinstance(data, dict):
                     continue
-                if _record_is_measured(data):
+                measured = _record_is_measured(data)
+                if measured:
                     cost_recorded = True
 
                 inp = data.get("input_tokens", 0)
@@ -7865,19 +7866,17 @@ def _compute_cost_snapshot() -> dict:
                     cost = _calculate_model_cost(model, inp, out, cr, cw)
                 estimated_cost += cost
 
-                # Aggregate by phase
-                if phase not in by_phase:
-                    by_phase[phase] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-                by_phase[phase]["input_tokens"] += inp
-                by_phase[phase]["output_tokens"] += out
-                by_phase[phase]["cost_usd"] += cost
-
-                # Aggregate by model
-                if model not in by_model:
-                    by_model[model] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-                by_model[model]["input_tokens"] += inp
-                by_model[model]["output_tokens"] += out
-                by_model[model]["cost_usd"] += cost
+                # Aggregate by phase and model. `measured` is tracked per
+                # bucket for the same reason as cost_recorded globally: a phase
+                # whose records all carried nothing reports cost null, never a
+                # summed $0.00 beside phases that were really measured.
+                for bucket, name in ((by_phase, phase), (by_model, model)):
+                    if name not in bucket:
+                        bucket[name] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "measured": False}
+                    bucket[name]["input_tokens"] += inp
+                    bucket[name]["output_tokens"] += out
+                    bucket[name]["cost_usd"] += cost
+                    bucket[name]["measured"] = bucket[name]["measured"] or measured
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 pass
 
@@ -7913,6 +7912,8 @@ def _compute_cost_snapshot() -> dict:
                         by_model[model]["input_tokens"] += inp
                         by_model[model]["output_tokens"] += out
                         by_model[model]["cost_usd"] += cost
+                        # Observed tokens from the tracker (cost_recorded above).
+                        by_model[model]["measured"] = True
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 pass
 
@@ -7955,12 +7956,12 @@ def _compute_cost_snapshot() -> dict:
         "by_phase": {k: {
             "input_tokens": v["input_tokens"],
             "output_tokens": v["output_tokens"],
-            "cost_usd": round(v["cost_usd"], 6),
+            "cost_usd": round(v["cost_usd"], 6) if v["measured"] else None,
         } for k, v in by_phase.items()},
         "by_model": {k: {
             "input_tokens": v["input_tokens"],
             "output_tokens": v["output_tokens"],
-            "cost_usd": round(v["cost_usd"], 6),
+            "cost_usd": round(v["cost_usd"], 6) if v["measured"] else None,
         } for k, v in by_model.items()},
         "budget_limit": budget_limit,
         "budget_used": round(budget_used, 6) if budget_limit is not None else None,
@@ -8863,6 +8864,16 @@ async def update_notification_triggers(request: Request):
 @app.post("/api/notifications/{notification_id}/acknowledge", dependencies=[Depends(auth.require_scope("control"))])
 async def acknowledge_notification(notification_id: str):
     """Mark a notification as acknowledged."""
+    return _set_notification_acknowledged(notification_id, True)
+
+
+@app.post("/api/notifications/{notification_id}/unacknowledge", dependencies=[Depends(auth.require_scope("control"))])
+async def unacknowledge_notification(notification_id: str):
+    """Mark a notification as unread again (the notification center's 'mark unread')."""
+    return _set_notification_acknowledged(notification_id, False)
+
+
+def _set_notification_acknowledged(notification_id: str, acknowledged: bool) -> dict:
     loki_dir = _get_loki_dir()
     active_file = loki_dir / "notifications" / "active.json"
 
@@ -8878,7 +8889,7 @@ async def acknowledge_notification(notification_id: str):
     found = False
     for n in notifications:
         if n.get("id") == notification_id:
-            n["acknowledged"] = True
+            n["acknowledged"] = acknowledged
             found = True
             break
 
