@@ -5348,6 +5348,8 @@ except Exception:
 # it. Loki's own trusted GitHub calls get it back for the one command:
 #   - direct `gh ...` calls, through the gh() wrapper defined below;
 #   - _loki_with_github_tokens <cmd...>, for the post-session push/PR paths.
+# LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 (exact value) restores the old inheritance
+# and prints one stderr warning that the agent holds the token.
 # This is hygiene against a naive injection, not an isolation boundary: code
 # running as the same user can still read the parent's environment block
 # (/proc/<pid>/environ on Linux, sudo on a hosted runner). The boundary is a
@@ -5365,7 +5367,16 @@ _loki_with_github_tokens() {
 }
 
 _loki_withhold_github_tokens() {
-    local _v
+    local _v _held=""
+    # Operator opt-out (exact value 1): keep the earlier behavior, where the
+    # agent inherits the token. That is a Rule of Two exposure, so say so.
+    if [ "${LOKI_ALLOW_AGENT_GITHUB_TOKEN:-}" = "1" ]; then
+        for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+            [ -n "${!_v:-}" ] && _held="${_held:+$_held }$_v"
+        done
+        [ -z "$_held" ] || printf '%s\n' "WARNING: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the agent session holds the GitHub token ($_held); an injected prompt can push with it (Rule of Two exposure)." >&2
+        return 0
+    fi
     for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
         [ -n "${!_v:-}" ] || continue
         export -n "${_v?}"
@@ -28301,7 +28312,9 @@ main() {
     # then advise the user how to open a PR. Both are no-ops when no agent branch
     # was set up (LOKI_BRANCH_PROTECTION=false) or nothing changed.
     commit_session_changes
-    create_session_pr
+    # Trusted post-session step: it gets the GitHub token main() withheld from
+    # agent sessions (its push may authenticate through the env token).
+    _loki_with_github_tokens create_session_pr
     audit_agent_action "session_stop" "Session ended" "result=$result,iterations=$ITERATION_COUNT"
 
     # The first terminal summary is written before session changes are committed.

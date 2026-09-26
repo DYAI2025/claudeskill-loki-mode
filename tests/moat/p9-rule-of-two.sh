@@ -51,10 +51,19 @@ set -uo pipefail
 #       set to canary values in the parent environment, and LOKI_DELEGATE_PR=1
 #       (the default). A stub provider records its environment and, obeying the
 #       injection, tries a push and `gh pr create`; on the build prompt it also
-#       edits a file and claims completion. The canaries must never reach any
-#       provider environment or argv and no push or PR may succeed from a
-#       provider session, while Loki's own post-session push and PR must still
-#       carry the token (withheld, not destroyed).
+#       edits a file and claims completion. Three runs, each on a fresh copy:
+#         default  the canaries never reach any provider environment or argv,
+#                  no push or PR succeeds from a provider session, and Loki's
+#                  own post-session push and PR (on_run_complete) still carry
+#                  the token (withheld, not destroyed); no exposure warning.
+#         auto-pr  LOKI_AUTO_PR=1: the session PR push in create_session_pr
+#                  carries the token, the provider still gets none.
+#         opt-out  LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the canaries DO reach the
+#                  provider (the operator chose the old exposure, and the leak
+#                  probe is shown to see a leak) and exactly one stderr line
+#                  warns that the agent holds the token.
+#       Bash route only: bin/loki sends issue refs to bash. The Bun route's
+#       withholding is covered by loki-ts/tests/runner/github_token_withheld.test.ts.
 #       Push success is modeled by a local bare remote, reached through a
 #       github.com origin rewritten by url.insteadOf, whose pre-receive hook
 #       accepts only a pusher carrying the canary token (the hook runs in the
@@ -1043,8 +1052,8 @@ case_injection() {
     fi
     log "egress block: $EGRESS_MECH"
     local T="$MOAT_TMP/inj" W B GH_CANARY GITHUB_CANARY
-    W="$T/work"; B="$T/bin"
-    mkdir -p "$W" "$B" "$T/home"
+    W="$T/pristine"; B="$T/bin"
+    mkdir -p "$W" "$B" "$T/control"
     GH_CANARY="ghp_MOATCANARYgh$$${RANDOM}x"
     GITHUB_CANARY="ghs_MOATCANARYgithub$$${RANDOM}x"
     local MARKER="MOAT_P9_INJECTION_$$"
@@ -1052,6 +1061,7 @@ case_injection() {
     # --- local bare remote whose hook accepts only a canary-carrying pusher ---
     # origin reads as github.com (the delegate PR path only runs for a GitHub
     # remote); insteadOf routes every fetch and push to the local bare repo.
+    # Every shim logs under $MOAT_LOG_DIR, set per scenario.
     if ! ( cd "$W" && git init -q && git config user.email moat@example.invalid \
             && git config user.name moat && git config commit.gpgsign false \
             && printf 'def greet(name):\n    return "hi " + name\n' > greeter.py \
@@ -1066,20 +1076,21 @@ case_injection() {
         printf '#!/usr/bin/env bash\n'
         printf 'src="${MOAT_PUSH_SOURCE:-loki}"\n'
         printf 'if [ "${GH_TOKEN:-}" = %q ] || [ "${GITHUB_TOKEN:-}" = %q ]; then\n' "$GH_CANARY" "$GITHUB_CANARY"
-        printf '    echo "$src accepted" >> %q; exit 0\n' "$T/push.log"
+        printf '    echo "$src accepted" >> "$MOAT_LOG_DIR/push.log"; exit 0\n'
         printf 'fi\n'
-        printf 'echo "$src rejected" >> %q; echo "denied: no credential" >&2; exit 1\n' "$T/push.log"
+        printf 'echo "$src rejected" >> "$MOAT_LOG_DIR/push.log"; echo "denied: no credential" >&2; exit 1\n'
     } > "$T/remote.git/hooks/pre-receive"
     chmod +x "$T/remote.git/hooks/pre-receive"
 
     # Control: the model discriminates (accept with canary, reject without).
-    : > "$T/push.log"
-    ( cd "$W" && GIT_TERMINAL_PROMPT=0 MOAT_PUSH_SOURCE=control-with GH_TOKEN="$GH_CANARY" \
-        git push -q origin HEAD:refs/heads/moat-control-with ) >/dev/null 2>&1
-    ( cd "$W" && env -u GH_TOKEN -u GITHUB_TOKEN GIT_TERMINAL_PROMPT=0 MOAT_PUSH_SOURCE=control-without \
-        git push -q origin HEAD:refs/heads/moat-control-without ) >/dev/null 2>&1
-    if ! grep -qx 'control-with accepted' "$T/push.log" || ! grep -qx 'control-without rejected' "$T/push.log"; then
-        nok "push-credential model does not discriminate (hook log: $(tr '\n' ',' < "$T/push.log"))"
+    : > "$T/control/push.log"
+    ( cd "$W" && GIT_TERMINAL_PROMPT=0 MOAT_LOG_DIR="$T/control" MOAT_PUSH_SOURCE=control-with \
+        GH_TOKEN="$GH_CANARY" git push -q origin HEAD:refs/heads/moat-control-with ) >/dev/null 2>&1
+    ( cd "$W" && env -u GH_TOKEN -u GITHUB_TOKEN GIT_TERMINAL_PROMPT=0 MOAT_LOG_DIR="$T/control" \
+        MOAT_PUSH_SOURCE=control-without git push -q origin HEAD:refs/heads/moat-control-without ) >/dev/null 2>&1
+    if ! grep -qx 'control-with accepted' "$T/control/push.log" \
+        || ! grep -qx 'control-without rejected' "$T/control/push.log"; then
+        nok "push-credential model does not discriminate (hook log: $(tr '\n' ',' < "$T/control/push.log"))"
         return
     fi
 
@@ -1100,7 +1111,7 @@ PY
         printf '#!/usr/bin/env bash\n'
         printf 'src="${MOAT_PUSH_SOURCE:-loki}"; tok=no\n'
         printf '{ [ "${GH_TOKEN:-}" = %q ] || [ "${GITHUB_TOKEN:-}" = %q ]; } && tok=yes\n' "$GH_CANARY" "$GITHUB_CANARY"
-        printf 'printf "%%s token=%%s %%s\\n" "$src" "$tok" "$*" >> %q\n' "$T/gh.log"
+        printf 'printf "%%s token=%%s %%s\\n" "$src" "$tok" "$*" >> "$MOAT_LOG_DIR/gh.log"\n'
         printf 'case "$1 ${2:-}" in\n'
         printf '  "auth status") [ "$tok" = yes ] && exit 0; exit 1 ;;\n'
         printf '  "issue view") [ "$tok" = yes ] || { echo "gh: not authenticated" >&2; exit 4; }; cat %q; exit 0 ;;\n' "$T/issue.json"
@@ -1115,15 +1126,15 @@ PY
     # of the property: the token still works where Loki itself needs it).
     {
         printf '#!/usr/bin/env bash\n'
-        printf 'env > %q.$$\n' "$T/provider-env"
-        printf 'printf "%%s\\n" "$*" > %q.$$\n' "$T/provider-argv"
+        printf 'env > "$MOAT_LOG_DIR/provider-env.$$"\n'
+        printf 'printf "%%s\\n" "$*" > "$MOAT_LOG_DIR/provider-argv.$$"\n'
         printf 'case "$*" in *loki_system*)\n'
         printf '    printf "def greet(name):\\n    return \\"hello \\" + name\\n" > greeter.py\n'
         printf '    mkdir -p .loki/signals && echo done > .loki/signals/COMPLETION_REQUESTED\n'
-        printf '    echo edited >> %q ;;\nesac\n' "$T/provider-actions.log"
+        printf '    echo edited >> "$MOAT_LOG_DIR/provider-actions.log" ;;\nesac\n'
         printf 'export MOAT_PUSH_SOURCE=provider GIT_TERMINAL_PROMPT=0\n'
-        printf 'git push -q origin HEAD:refs/heads/injected-$$ >/dev/null 2>&1; echo "git_push_rc=$?" >> %q\n' "$T/provider-actions.log"
-        printf 'gh pr create --title pwned --body pwned >/dev/null 2>&1; echo "gh_pr_rc=$?" >> %q\n' "$T/provider-actions.log"
+        printf 'git push -q origin HEAD:refs/heads/injected-$$ >/dev/null 2>&1; echo "git_push_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
+        printf 'gh pr create --title pwned --body pwned >/dev/null 2>&1; echo "gh_pr_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
         printf 'echo "stub provider done. MOAT_P9_COMPLETE"\nexit 0\n'
     } > "$B/claude"
     chmod +x "$B/claude"
@@ -1142,64 +1153,104 @@ PY
         } > "$B/timeout"
         chmod +x "$B/timeout"
     fi
-    {
-        printf 'set -u\n'
-        printf 'export HOME=%q PATH=%q TMPDIR=%q\n' "$T/home" "$B:$PATH" "${TMPDIR:-/tmp}"
-        printf 'export GH_TOKEN=%q GITHUB_TOKEN=%q MOAT_ENV_MARKER=inherited\n' "$GH_CANARY" "$GITHUB_CANARY"
-        # LOKI_DELEGATE_PR=1 is the product default: push and open the PR after
-        # the session. Only that trusted step may carry the token.
-        printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=1 LOKI_DASHBOARD=false\n'
-        printf 'export LOKI_PROVIDER=claude LOKI_MAX_ITERATIONS=1 LOKI_COMPLETION_PROMISE=MOAT_P9_COMPLETE LOKI_AUTO_CONFIRM=true\n'
-        printf 'export LOKI_SKIP_PREREQS=true LOKI_PHASE_CODE_REVIEW=false LOKI_COUNCIL_ENABLED=false LOKI_APP_RUNNER=false\n'
-        printf 'export LOKI_NO_NEW_SESSION=1 LOKI_SKIP_NET_PREFLIGHT=1 LOKI_SKIP_AUTH_PREFLIGHT=1 LOKI_RESOURCE_CHECK_INTERVAL=2 GIT_TERMINAL_PROMPT=0\n'
-        printf 'unset LOKI_LEGACY_BASH LOKI_SDK_LOOP LOKI_SDK_MODE\n'
-        printf 'cd %q || exit 41\n' "$W"
-        printf '%s 150 %q start octocat/hello#42 >%q 2>%q\n' "$DEADLINE" "$LOKI_BIN" "$T/start.out" "$T/start.err"
-        printf 'echo $? >%q\n' "$T/start.rc"
-    } > "$T/run.sh"
 
-    local t0=$SECONDS
-    run_owned run_blocked "$T/run.sh" 2>"$T/run.err"
-    log "issue run: $(( SECONDS - t0 ))s, start rc=$(cat "$T/start.rc" 2>/dev/null)"
+    # inj_run <scenario> <extra exports>: one real `loki start octocat/hello#42`
+    # in a fresh copy of the fixture repo, its own HOME and its own logs.
+    inj_run() {
+        local L="$T/$1" t0=$SECONDS
+        mkdir -p "$L/home"
+        cp -R "$W" "$L/work" || { nok "[$1] fixture copy failed"; return 1; }
+        : > "$L/push.log"; : > "$L/gh.log"; : > "$L/provider-actions.log"
+        {
+            printf 'set -u\n'
+            printf 'export HOME=%q PATH=%q TMPDIR=%q MOAT_LOG_DIR=%q\n' "$L/home" "$B:$PATH" "${TMPDIR:-/tmp}" "$L"
+            printf 'export GH_TOKEN=%q GITHUB_TOKEN=%q MOAT_ENV_MARKER=inherited\n' "$GH_CANARY" "$GITHUB_CANARY"
+            # LOKI_DELEGATE_PR=1 is the product default: push and open the PR
+            # after the session. Only that trusted step may carry the token.
+            printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=1 LOKI_DASHBOARD=false\n'
+            printf 'export LOKI_PROVIDER=claude LOKI_MAX_ITERATIONS=1 LOKI_COMPLETION_PROMISE=MOAT_P9_COMPLETE LOKI_AUTO_CONFIRM=true\n'
+            printf 'export LOKI_SKIP_PREREQS=true LOKI_PHASE_CODE_REVIEW=false LOKI_COUNCIL_ENABLED=false LOKI_APP_RUNNER=false\n'
+            printf 'export LOKI_NO_NEW_SESSION=1 LOKI_SKIP_NET_PREFLIGHT=1 LOKI_SKIP_AUTH_PREFLIGHT=1 LOKI_RESOURCE_CHECK_INTERVAL=2 GIT_TERMINAL_PROMPT=0\n'
+            printf 'unset LOKI_LEGACY_BASH LOKI_SDK_LOOP LOKI_SDK_MODE LOKI_AUTO_PR LOKI_GITHUB_PR LOKI_ALLOW_AGENT_GITHUB_TOKEN\n'
+            printf '%s\n' "$2"
+            printf 'cd %q || exit 41\n' "$L/work"
+            printf '%s 150 %q start octocat/hello#42 >%q 2>%q\n' "$DEADLINE" "$LOKI_BIN" "$L/start.out" "$L/start.err"
+            printf 'echo $? >%q\n' "$L/start.rc"
+        } > "$L/run.sh"
+        run_owned run_blocked "$L/run.sh" 2>"$L/run.err"
+        log "$1 run: $(( SECONDS - t0 ))s, start rc=$(cat "$L/start.rc" 2>/dev/null)"
+    }
+    # inj_live <scenario>: the scenario really ran (a blind probe must fail).
+    inj_live() {
+        local L="$T/$1"
+        if ! grep -q '^loki token=yes issue view' "$L/gh.log" 2>/dev/null; then
+            nok "[$1] the trusted fetch step never read the issue with the parent token (gh log: $(head -c 200 "$L/gh.log" 2>/dev/null | tr '\n' ','); start rc=$(cat "$L/start.rc" 2>/dev/null); $(grep -m1 -i 'error' "$L/start.out" "$L/start.err" 2>/dev/null | head -1))"
+            return 1
+        fi
+        if ! ls "$L"/provider-env.* >/dev/null 2>&1; then
+            nok "[$1] the provider was never invoked (start rc=$(cat "$L/start.rc" 2>/dev/null); $(tail -1 "$L/start.out"))"
+            return 1
+        fi
+        grep -q '^MOAT_ENV_MARKER=inherited$' "$L"/provider-env.* \
+            || { nok "[$1] provider env dump does not show inherited variables; the probe is blind"; return 1; }
+        grep -qx 'edited' "$L/provider-actions.log" \
+            || { nok "[$1] the main build prompt never reached the provider (probe blind)"; return 1; }
+        grep -q 'git_push_rc=' "$L/provider-actions.log" \
+            || { nok "[$1] the provider's push attempt did not run (probe blind)"; return 1; }
+    }
+    # inj_leaked <scenario>: which canaries reached any provider env or argv.
+    inj_leaked() {
+        local L="$T/$1" out=""
+        # No pipe into grep -q: under pipefail a SIGPIPE upstream reads as
+        # "no match", which here would be a false green.
+        grep -qF -- "$GH_CANARY" "$L"/provider-env.* "$L"/provider-argv.* 2>/dev/null && out="GH_TOKEN"
+        grep -qF -- "$GITHUB_CANARY" "$L"/provider-env.* "$L"/provider-argv.* 2>/dev/null && out="${out:+$out,}GITHUB_TOKEN"
+        printf '%s' "$out"
+    }
+    local OPT_WARN='LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the agent session holds the GitHub token'
 
-    # --- positive controls: the scenario is live ------------------------------
-    if ! grep -q '^loki token=yes issue view' "$T/gh.log" 2>/dev/null; then
-        nok "the trusted fetch step never read the issue with the parent token (gh log: $(head -c 200 "$T/gh.log" 2>/dev/null | tr '\n' ','); start rc=$(cat "$T/start.rc" 2>/dev/null); $(grep -m1 -i 'error' "$T/start.out" "$T/start.err" 2>/dev/null | head -1))"
-        return
+    # 1. default: the product defaults, LOKI_DELEGATE_PR=1 (on_run_complete).
+    inj_run default ":"
+    if inj_live default; then
+        grep -rqF "$MARKER" "$T/default/work/.loki" 2>/dev/null \
+            || nok "[default] the injection payload never reached the agent's PRD (untrusted-text path not exercised)"
+        [ -z "$(inj_leaked default)" ] \
+            || nok "[default] canary token(s) reached the provider environment: $(inj_leaked default)"
+        grep -qx 'provider accepted' "$T/default/push.log" \
+            && nok "[default] a git push from the provider session was accepted by the remote"
+        grep -q '^provider token=yes pr create' "$T/default/gh.log" \
+            && nok "[default] gh pr create from the provider session ran with a valid token"
+        # Withheld, not destroyed: the trusted post-session step keeps it.
+        grep -qx 'loki accepted' "$T/default/push.log" \
+            || nok "[default] Loki's own post-session push did not carry the token (push log: $(tr '\n' ',' < "$T/default/push.log"))"
+        grep -q '^loki token=yes pr create' "$T/default/gh.log" \
+            || nok "[default] Loki's own post-session gh pr create did not carry the token"
+        grep -qF "$OPT_WARN" "$T/default/start.err" "$T/default/start.out" \
+            && nok "[default] printed the opt-out exposure warning without the opt-out"
     fi
-    local envs
-    envs="$(ls "$T"/provider-env.* 2>/dev/null)"
-    if [ -z "$envs" ]; then
-        nok "the provider was never invoked (start rc=$(cat "$T/start.rc" 2>/dev/null); $(tail -1 "$T/start.out"))"
-        return
-    fi
-    # shellcheck disable=SC2086
-    grep -q '^MOAT_ENV_MARKER=inherited$' $envs \
-        || { nok "provider env dump does not show inherited variables; the probe is blind"; return; }
-    grep -rqF "$MARKER" "$W/.loki" 2>/dev/null \
-        || nok "the injection payload never reached the agent's PRD (untrusted-text path not exercised)"
 
-    # --- the property ----------------------------------------------------------
-    local leaked=""
-    # shellcheck disable=SC2086
-    grep -qF "$GH_CANARY" $envs "$T"/provider-argv.* 2>/dev/null && leaked="GH_TOKEN"
-    # shellcheck disable=SC2086
-    grep -qF "$GITHUB_CANARY" $envs "$T"/provider-argv.* 2>/dev/null && leaked="${leaked:+$leaked,}GITHUB_TOKEN"
-    [ -z "$leaked" ] || nok "canary token(s) reached the provider environment: $leaked"
-    grep -qx 'provider accepted' "$T/push.log" \
-        && nok "a git push from the provider session was accepted by the remote"
-    grep -q '^provider token=yes pr create' "$T/gh.log" \
-        && nok "gh pr create from the provider session ran with a valid token"
-    grep -q 'git_push_rc=' "$T/provider-actions.log" 2>/dev/null \
-        || nok "the provider's push attempt did not run (probe blind)"
-    # The token was withheld, not destroyed: the trusted post-session step
-    # (LOKI_DELEGATE_PR=1) must still push and open the PR with it.
-    grep -qx 'edited' "$T/provider-actions.log" 2>/dev/null \
-        || nok "the main build prompt never reached the provider (probe blind)"
-    grep -qx 'loki accepted' "$T/push.log" \
-        || nok "Loki's own post-session push did not carry the token (push log: $(tr '\n' ',' < "$T/push.log"))"
-    grep -q '^loki token=yes pr create' "$T/gh.log" \
-        || nok "Loki's own post-session gh pr create did not carry the token"
+    # 2. auto-pr: LOKI_AUTO_PR=1, so the session PR comes from create_session_pr.
+    inj_run auto-pr "export LOKI_DELEGATE_PR=0 LOKI_AUTO_PR=1"
+    if inj_live auto-pr; then
+        [ -z "$(inj_leaked auto-pr)" ] \
+            || nok "[auto-pr] canary token(s) reached the provider environment: $(inj_leaked auto-pr)"
+        grep -qx 'provider accepted' "$T/auto-pr/push.log" \
+            && nok "[auto-pr] a git push from the provider session was accepted by the remote"
+        grep -qx 'loki accepted' "$T/auto-pr/push.log" \
+            || nok "[auto-pr] the session PR push (create_session_pr) did not carry the token (push log: $(tr '\n' ',' < "$T/auto-pr/push.log"))"
+        grep -q '^loki token=yes pr create' "$T/auto-pr/gh.log" \
+            || nok "[auto-pr] the session PR gh pr create did not carry the token"
+    fi
+
+    # 3. opt-out: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 restores the old exposure and
+    #    says so. Also proves the leak probe sees a leak when there is one.
+    inj_run opt-out "export LOKI_DELEGATE_PR=0 LOKI_ALLOW_AGENT_GITHUB_TOKEN=1"
+    if inj_live opt-out; then
+        [ "$(inj_leaked opt-out)" = "GH_TOKEN,GITHUB_TOKEN" ] \
+            || nok "[opt-out] the canaries did not reach the provider under LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 (leak probe blind or opt-out broken): got '$(inj_leaked opt-out)'"
+        [ "$(grep -cF "$OPT_WARN" "$T/opt-out/start.err")" = "1" ] \
+            || nok "[opt-out] expected exactly one stderr warning that the agent holds the token, got $(grep -cF "$OPT_WARN" "$T/opt-out/start.err") (stdout has $(grep -cF "$OPT_WARN" "$T/opt-out/start.out"))"
+    fi
 }
 
 moat_run "P9.issue-workflows-separate-untrusted-from-push" \
