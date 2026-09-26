@@ -8,29 +8,55 @@ set -uo pipefail
 # push or open PRs. Untrusted text may reach an agent only in a session that
 # cannot reach a push credential.
 #
+#   Scope of the three static cases: every .github/workflows/*.yml|yaml, and
+#   every composite action Loki ships (action.yml at the root, which is the
+#   Marketplace action, and .github/actions/*/action.yml). A unit is one job,
+#   or one whole action; an action's caller is unknown, so it is judged as if
+#   any event and a write token could reach it. Local composites (./path) are
+#   inlined. A remote one (owner/repo/...@ref, including this repo's own at a
+#   tag) is NOT resolved from the local copy, which is not the code at that
+#   ref; a remote agent action is assumed to push. Every workflow or action in
+#   package.json files[] must be one the scan read (UNSCANNED fails).
+#   Positive controls: a synthetic all-three workflow plus trimmed copies of
+#   the vulnerable YAML shipped before the fix (61af5915): the one-job issue
+#   workflow (remote and local composite), its composite, claude.yml,
+#   loki-enterprise.yml, claude-code-review.yml, the root review action, a
+#   publish job that splices an agent job's output into its script, and a gate
+#   on the wrong author field. Each must be flagged by name. Negative controls
+#   (look-alikes that must pass): the agent/publish split, a review agent that
+#   can comment but not push, agent output handed over as env data, a label
+#   trigger without an author gate, and the fixed actions.
+#
 #   P9.issue-workflows-separate-untrusted-from-push
-#       Every .github/workflows/*.yml|yaml triggered by issues, issue_comment,
-#       pull_request_target or pull_request_review_comment: no job does (a),
-#       (b) and (c) together. Local composite actions (./.github/actions/X, or
-#       <owner>/loki-mode/.github/actions/X@ref resolved to the local copy) are
-#       inlined. Positive control: a synthetic all-three workflow is flagged
-#       and a synthetic split (agent job / publish job) is not.
+#       No unit whose triggers can carry untrusted text (issues, issue_comment,
+#       pull_request_target, pull_request_review(_comment), discussion(_comment),
+#       pull_request, workflow_run, workflow_call; any action) does (a), (b)
+#       and (c) together. Units with only trusted triggers (push, schedule,
+#       release, workflow_dispatch) are listed as trusted-triggers-only.
 #   P9.comment-trigger-author-gate
-#       Comment-triggered jobs that hand text to an agent check the commenter
-#       (author_association, a collaborator-permission lookup, or a fixed
-#       github.actor comparison) VISIBLY in the YAML. Built-in checks inside a
-#       third-party action are not provable from this repo and do not count.
-#       Jobs that pass no comment text anywhere (e.g. a fixed-string CLA
-#       signature match) are out of scope.
+#       An agent job reachable by an event any GitHub user can fire with their
+#       own text checks that user VISIBLY in the YAML, on that event's own
+#       field: comment.author_association (issue_comment,
+#       pull_request_review_comment, discussion_comment),
+#       review.author_association (pull_request_review),
+#       issue/discussion.author_association (issues/discussion of an
+#       author-fired type), or a collaborator lookup or fixed github.actor
+#       comparison. labeled/assigned need triage access and are trusted.
+#       Built-in checks inside a third-party action are not provable from this
+#       repo and do not count. Jobs that run no agent are out of scope.
 #   P9.injection-cannot-reach-token
 #       Hermetic: an issue whose body carries an injection payload goes through
 #       the real `loki start owner/repo#N` path (bash; the Bun route diverts
 #       issue refs to bash in bin/loki) with a gh shim, GH_TOKEN/GITHUB_TOKEN
-#       set to canary values in the parent environment. A stub provider records
-#       its environment and, obeying the injection, tries `git push` and
-#       `gh pr create`. The canaries must never reach the provider environment
-#       and no push or PR may succeed from the provider session.
-#       Push success is modeled by a local bare remote whose pre-receive hook
+#       set to canary values in the parent environment, and LOKI_DELEGATE_PR=1
+#       (the default). A stub provider records its environment and, obeying the
+#       injection, tries a push and `gh pr create`; on the build prompt it also
+#       edits a file and claims completion. The canaries must never reach any
+#       provider environment or argv and no push or PR may succeed from a
+#       provider session, while Loki's own post-session push and PR must still
+#       carry the token (withheld, not destroyed).
+#       Push success is modeled by a local bare remote, reached through a
+#       github.com origin rewritten by url.insteadOf, whose pre-receive hook
 #       accepts only a pusher carrying the canary token (the hook runs in the
 #       pusher's environment); a control push proves the model discriminates.
 #       The whole `loki start` run executes inside the same egress block as
@@ -38,19 +64,28 @@ set -uo pipefail
 #       an outbound attempt even with telemetry and update checks disabled. No
 #       block on the host = FAIL "prerequisite missing: egress sandbox".
 #   P9.checkout-no-persisted-credentials
-#       actions/checkout in issue-triggered workflows sets
-#       persist-credentials: false.
+#       actions/checkout sets persist-credentials: false in every job of a
+#       workflow with an issue/comment/review/discussion/pull_request_target
+#       trigger and in every job or action that runs an agent. Plain
+#       pull_request jobs without an agent are out: fork runs get a read-only
+#       token, and a same-repo PR author already has push access.
 #
 # Heuristics used by the workflow scan (documented so a reviewer can argue
 # with them): (a) = a step's run/with/env interpolates
 # github.event.{issue,comment,pull_request,review,review_comment,discussion}.
-# {body,title}, github.head_ref or the event payload file, or runs
-# `gh issue|pr view` or `loki start|run`, or uses an agent action that reads
-# the triggering text (anthropics/claude-code-action). (b) = effective
-# permissions include write (no permissions block counts as write: the default
-# token), or any secrets.* / github.token reference. (c) = `git push`,
+# {body,title}, github.event.workflow_run.{head_branch,head_commit,
+# display_title}, github.head_ref or the event payload file, or runs
+# `gh issue|pr view` or `loki start|run`, or uses an agent action
+# (anthropics/claude-code-action, asklokesh/loki-mode, openai/codex-action),
+# or splices an agent job's `${{ needs.<job>.outputs.* }}` into a script.
+# (b) = effective permissions include write (no permissions block counts as
+# write: the default token; an action's caller token counts as write), or any
+# secrets.* / github.token / inputs.*token reference. (c) = a push command,
 # `gh pr create|merge`, `loki start|run` without LOKI_DELEGATE_PR=0 (it opens a
-# PR by default since v9.43.0), or a known pushing action. Capabilities of
+# PR by default since v9.43.0), a known pushing action, or an agent action that
+# can push: claude-code-action unless its explicit permissions grant neither
+# id-token nor contents write and it is handed no secret beyond GITHUB_TOKEN
+# and the model credential; any other agent action always. Capabilities of
 # third-party actions are assumed and labeled as such in the reason.
 #
 # Contract: one "CASE <ID> PASS|FAIL <desc>" stdout line per case; diagnostics
@@ -134,9 +169,16 @@ run_owned() {
 #===============================================================================
 cat > "$MOAT_TMP/wfscan.py" <<'PY'
 """Usage: wfscan.py <root> <rule2|gate|checkout>
-Prints SCANNED <n> (jobs in issue-family workflows), then one
-VIOLATION <workflow>:<job> <reason> line per violation. ERROR <msg> on failure."""
-import glob, os, re, sys
+
+Scans every workflow under .github/workflows (*.yml, *.yaml) and every
+composite action Loki ships (action.yml|yaml at the root and under
+.github/actions/*/). A unit is one workflow job, or one whole action (its
+caller, triggers and token are unknown, so it is judged as if any event and a
+write token could reach it). Prints SCANNED <n> (units this check judged),
+SITE lines (rule2), UNSCANNED <path> for a package.json files[] workflow or
+action that no unit came from, then one VIOLATION <file>:<unit> <reason> line
+per violation. ERROR <msg> on failure."""
+import glob, json, os, re, sys
 
 try:
     import yaml
@@ -145,23 +187,46 @@ except ImportError:
     raise SystemExit(0)
 
 root, check = sys.argv[1], sys.argv[2]
-FAMILY = {"issues", "issue_comment", "pull_request_target", "pull_request_review_comment"}
-COMMENT = {"issue_comment", "pull_request_review_comment"}
+# Events whose payload text someone outside the repo can write. pull_request
+# is here although fork runs get a read-only token and no secrets: a same-repo
+# PR's thread still carries outsiders' comments that an agent could read.
+UNTRUSTED = {"issues", "issue_comment", "pull_request_target", "pull_request_review",
+             "pull_request_review_comment", "discussion", "discussion_comment",
+             "pull_request", "workflow_run", "workflow_call"}
+# The checkout check covers these plus every job that runs an agent. Plain
+# pull_request jobs are out: fork runs get a read-only token, so a persisted
+# credential there cannot push; same-repo PR authors already have push access.
+CHECKOUT_FAMILY = {"issues", "issue_comment", "pull_request_target", "pull_request_review",
+                   "pull_request_review_comment", "discussion", "discussion_comment"}
+# Events any GitHub user can fire with their own text, and the author field an
+# in-YAML gate must check for each. issues/discussion only for the types their
+# author fires; labeled/assigned need triage access and are a trusted signal.
+GATED = {
+    "issue_comment": "github.event.comment.author_association",
+    "pull_request_review_comment": "github.event.comment.author_association",
+    "discussion_comment": "github.event.comment.author_association",
+    "pull_request_review": "github.event.review.author_association",
+    "issues": "github.event.issue.author_association",
+    "discussion": "github.event.discussion.author_association",
+}
+AUTHOR_TYPES = {"opened", "edited", "reopened", "created", "transferred"}
+GENERIC_GATE = re.compile(r"/collaborators/|github\.(actor|triggering_actor)\s*==")
 UNTRUSTED_EXPR = re.compile(
     r"github\.event\.(issue|comment|pull_request|review|review_comment|discussion)\.(body|title)"
+    r"|github\.event\.workflow_run\.(head_branch|head_commit|display_title)"
     r"|github\.head_ref|github\.event_path|GITHUB_EVENT_PATH")
 UNTRUSTED_RUN = re.compile(r"\bgh\s+(issue|pr)\s+view\b|\bloki\s+(start|run)\b")
-AGENT_ACTIONS = ("anthropics/claude-code-action",)
+AGENT_ACTIONS = ("anthropics/claude-code-action", "asklokesh/loki-mode", "openai/codex-action")
 PUSH_RUN = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+(create|merge)\b")
 LOKI_START = re.compile(r"\bloki\s+(start|run)\b")
-SECRET = re.compile(r"secrets\.|github\.token\b")
-GATE = re.compile(r"author_association|/collaborators/|github\.(actor|triggering_actor)\s*==")
+SECRET = re.compile(r"secrets\.|github\.token\b|inputs\.[A-Za-z0-9_-]*token")
+NEEDS_OUT = re.compile(r"\$\{\{\s*needs\.([A-Za-z0-9_-]+)\.outputs\.")
+EVENT_NAME = re.compile(r"github\.event_name\s*==\s*'([a-z_]+)'")
 ASSUMED = "assumed, third-party action, not provable from repo"
 PUSH_ACTIONS = {
     "peter-evans/create-pull-request": "",
     "stefanzweifel/git-auto-commit-action": "",
     "ad-m/github-push-action": "",
-    "anthropics/claude-code-action": " (" + ASSUMED + ": commits and opens branches with its own app token)",
 }
 
 
@@ -170,41 +235,46 @@ def load(path):
         return yaml.safe_load(f) or {}
 
 
-def triggers(doc):
+def on_of(doc):
     on = doc.get("on", doc.get(True))  # PyYAML reads a bare `on:` key as True
     if isinstance(on, str):
-        return {on}
-    if isinstance(on, (list, dict)):
-        return set(on)
-    return set()
+        return {on: None}
+    if isinstance(on, list):
+        return dict((k, None) for k in on)
+    return on if isinstance(on, dict) else {}
+
+
+def types_of(on, ev):
+    cfg = on.get(ev)
+    if isinstance(cfg, dict) and cfg.get("types"):
+        t = cfg["types"]
+        return set([t] if isinstance(t, str) else t)
+    return None  # every type
 
 
 def resolve(uses, depth=0):
-    """Steps of a composite action that lives in this repo, plus a note."""
-    if depth > 3 or not uses:
-        return [], ""
-    note, rel = "", None
-    m = re.match(r"^\./(.+?)/?$", uses)
-    if m:
-        rel = m.group(1)
-    m = re.match(r"^[^/]+/loki-mode/(\.github/actions/[^@]+)@(.+)$", uses)
-    if m:
-        rel = m.group(1)
-        note = " [composite %s resolved from the LOCAL copy; the workflow pins @%s]" % (rel, m.group(2))
-    if not rel:
-        return [], ""
+    """Steps of a composite action that lives in this checkout. A remote ref
+    (owner/repo/...@ref) is NOT resolved from the local copy: the code at that
+    ref is not what this checkout holds, so it is judged as opaque."""
+    m = re.match(r"^\./(.+?)/?$", uses or "")
+    if depth > 3 or not m:
+        return []
     for name in ("action.yml", "action.yaml"):
-        p = os.path.join(root, rel, name)
+        p = os.path.join(root, m.group(1), name)
         if os.path.isfile(p):
-            runs = (load(p).get("runs") or {})
+            runs = load(p).get("runs") or {}
             if runs.get("using") == "composite":
-                out = []
-                for st in runs.get("steps") or []:
-                    out.append(st)
-                    sub, _ = resolve(st.get("uses") or "", depth + 1)
-                    out.extend(sub)
-                return out, note
-    return [], ""
+                return expand(runs.get("steps"), depth + 1)
+    return []
+
+
+def expand(steps, depth=0):
+    out = []
+    for st in steps or []:
+        if isinstance(st, dict):
+            out.append(st)
+            out.extend(resolve(st.get("uses"), depth))
+    return out
 
 
 def run_of(obj):
@@ -233,103 +303,200 @@ def writes(perms):
     return False
 
 
-files = sorted(glob.glob(os.path.join(root, ".github", "workflows", "*.yml"))
-               + glob.glob(os.path.join(root, ".github", "workflows", "*.yaml")))
-scanned = 0
-violations = []
-for wf in files:
+def level(perms, scope):
+    if isinstance(perms, dict):
+        return str(perms.get(scope, "none")).strip()
+    return "write" if perms is None or str(perms).strip() == "write-all" else "read"
+
+
+def cca_cannot_push(st, perms):
+    """claude-code-action pushes with its GitHub App token (minted over OIDC,
+    needs id-token: write) or with the token it is handed. Provably no push:
+    explicit permissions without id-token/contents write, and no secret other
+    than GITHUB_TOKEN or the model credential passed to it."""
+    if level(perms, "id-token") == "write" or level(perms, "contents") == "write":
+        return False
+    for k, v in (st.get("with") or {}).items():
+        if k in ("claude_code_oauth_token", "anthropic_api_key"):
+            continue
+        if re.search(r"secrets\.(?!GITHUB_TOKEN\b)", str(v)):
+            return False
+    return isinstance(perms, dict)
+
+
+units, errors, scanned_files = [], [], set()
+wfdir = os.path.join(root, ".github", "workflows")
+for wf in sorted(glob.glob(os.path.join(wfdir, "*.yml")) + glob.glob(os.path.join(wfdir, "*.yaml"))):
+    rel = os.path.relpath(wf, root)
     try:
         doc = load(wf)
     except Exception as e:
-        print("ERROR unparseable workflow %s: %s" % (os.path.basename(wf), e))
+        errors.append("unparseable workflow %s: %s" % (rel, e))
         continue
-    trig = triggers(doc)
-    if not (trig & FAMILY):
+    if not isinstance(doc, dict):
         continue
+    scanned_files.add(rel)
+    on, wenv = on_of(doc), doc.get("env") or {}
     for jname, job in (doc.get("jobs") or {}).items():
         if not isinstance(job, dict):
             continue
+        env = dict(wenv)
+        env.update(job.get("env") or {})
+        units.append({"file": os.path.basename(wf), "name": jname, "action": False, "on": on,
+                      "job": job, "steps": expand(job.get("steps")), "env": env,
+                      "perms": job.get("permissions", doc.get("permissions"))})
+actions = [p for n in ("action.yml", "action.yaml") for p in [os.path.join(root, n)] if os.path.isfile(p)]
+actions += sorted(glob.glob(os.path.join(root, ".github", "actions", "*", "action.y*ml")))
+for act in actions:
+    rel = os.path.relpath(act, root)
+    try:
+        runs = load(act).get("runs") or {}
+    except Exception as e:
+        errors.append("unparseable action %s: %s" % (rel, e))
+        continue
+    scanned_files.add(rel)
+    if runs.get("using") != "composite":
+        continue
+    units.append({"file": rel, "name": "(action)", "action": True, "on": {}, "job": {},
+                  "steps": expand(runs.get("steps")), "env": {}, "perms": None})
+for e in errors:
+    print("ERROR " + e)
+
+
+def agent_of(u):
+    sig = []
+    for st in u["steps"]:
+        uses = str(st.get("uses") or "")
+        if LOKI_START.search(run_of(st)):
+            sig.append("loki start")
+        if uses.startswith(AGENT_ACTIONS):
+            sig.append(uses.split("@")[0])
+    return sig
+
+
+agent_jobs = set((u["file"], u["name"]) for u in units if agent_of(u))
+scanned, violations = 0, []
+for u in units:
+    where = "%s:%s" % (u["file"], u["name"])
+    trig = set(u["on"])
+    untrusted = u["action"] or bool(trig & UNTRUSTED)
+    agent = agent_of(u)
+    a = []
+    for st in u["steps"]:
+        t, r, uses = text(st), run_of(st), str(st.get("uses") or "")
+        if UNTRUSTED_EXPR.search(t):
+            a.append("interpolates event text/payload")
+        if UNTRUSTED_RUN.search(r):
+            a.append("runs %s" % UNTRUSTED_RUN.search(r).group(0))
+        if uses.startswith(AGENT_ACTIONS):
+            a.append("agent action %s reads the triggering text" % uses.split("@")[0])
+        for j in NEEDS_OUT.findall(r):
+            if (u["file"], j) in agent_jobs:
+                a.append("runs agent-controlled text (needs.%s.outputs in a script)" % j)
+                agent.append("needs.%s.outputs in a script" % j)
+    a = sorted(set(a))
+
+    if check == "checkout":
+        if not ((not u["action"] and trig & CHECKOUT_FAMILY) or agent):
+            continue
         scanned += 1
-        where = "%s:%s" % (os.path.basename(wf), jname)
-        steps, note = [], ""
-        for st in job.get("steps") or []:
-            if not isinstance(st, dict):
-                continue
-            steps.append(st)
-            sub, n = resolve(st.get("uses") or "")
-            steps.extend(sub)
-            note = note or n
-        job_env = text({"env": job.get("env")})
+        for st in u["steps"]:
+            if str(st.get("uses") or "").startswith("actions/checkout@"):
+                pc = (st.get("with") or {}).get("persist-credentials", True)
+                if pc not in (False, "false"):
+                    violations.append((where, "actions/checkout without persist-credentials: false"))
+        continue
 
-        if check == "checkout":
-            for st in steps:
-                if str(st.get("uses") or "").startswith("actions/checkout@"):
-                    pc = (st.get("with") or {}).get("persist-credentials", True)
-                    if pc not in (False, "false"):
-                        violations.append((where, "actions/checkout without persist-credentials: false"))
+    if check == "gate":
+        if u["action"] or not agent or not (trig & set(GATED)):
             continue
-
-        a = []
-        for st in steps:
-            t, u = text(st), str(st.get("uses") or "")
-            if UNTRUSTED_EXPR.search(t):
-                a.append("interpolates event text/payload")
-            if UNTRUSTED_RUN.search(run_of(st)):
-                a.append("runs %s" % UNTRUSTED_RUN.search(run_of(st)).group(0))
-            if u.startswith(AGENT_ACTIONS):
-                a.append("agent action %s reads the triggering text" % u.split("@")[0])
-        a = sorted(set(a))
-
-        if check == "gate":
-            if not (trig & COMMENT) or not a:
+        scanned += 1
+        jif = str(u["job"].get("if") or "")
+        names = set(EVENT_NAME.findall(jif))
+        reach = (trig & names) if names else trig
+        need = []
+        for ev in sorted(reach & set(GATED)):
+            ts = types_of(u["on"], ev)
+            if ev in ("issues", "discussion") and ts is not None and not (ts & AUTHOR_TYPES):
                 continue
-            jif = str(job.get("if") or "")
-            if jif and "comment" not in jif:
-                continue  # job cannot run on a comment event
-            evidence = jif + "\n" + "\n".join(str(s.get("if") or "") + "\n" + run_of(s) for s in steps)
-            if not GATE.search(evidence):
-                extra = ""
-                if any(str(s.get("uses") or "").startswith(AGENT_ACTIONS) for s in steps):
-                    extra = " (any built-in actor check of the third-party agent action is not provable from repo)"
-                violations.append((where, "comment-triggered agent job has no author_association or equivalent check in the YAML" + extra))
+            need.append(ev)
+        evidence = jif + "\n" + "\n".join(str(s.get("if") or "") + "\n" + run_of(s) for s in u["steps"])
+        missing = [ev for ev in need if GATED[ev] not in evidence and not GENERIC_GATE.search(evidence)]
+        if missing:
+            extra = ""
+            if any(str(s.get("uses") or "").startswith(AGENT_ACTIONS) for s in u["steps"]):
+                extra = " (a built-in actor check inside a third-party action is not provable from repo)"
+            violations.append((where, "agent job reachable by %s has no in-YAML check of %s%s" % (
+                ", ".join(missing), " / ".join(sorted(set(GATED[ev] for ev in missing))), extra)))
+        continue
+
+    # rule2
+    w = writes(u["perms"])
+    b = []
+    if w is None:
+        b.append("caller's token (unknown, assumed write)" if u["action"]
+                 else "no permissions block (default token, assumed write)")
+    elif w:
+        b.append("write permissions")
+    env_text = "\n".join("%s=%s" % kv for kv in u["env"].items())
+    if SECRET.search(env_text + "\n" + "\n".join(text(s) for s in u["steps"])):
+        b.append("secrets/token in env")
+    c = []
+    for st in u["steps"]:
+        r, uses = run_of(st), str(st.get("uses") or "")
+        if PUSH_RUN.search(r):
+            c.append(PUSH_RUN.search(r).group(0))
+        if LOKI_START.search(r):
+            env = dict(u["env"])
+            env.update(st.get("env") or {})
+            if str(env.get("LOKI_DELEGATE_PR", "")).strip() != "0":
+                c.append("loki start/run opens a PR (LOKI_DELEGATE_PR not 0)")
+        for act, why in PUSH_ACTIONS.items():
+            if uses.startswith(act + "@") or uses == act:
+                c.append(act + why)
+        if uses.startswith("anthropics/claude-code-action"):
+            if not cca_cannot_push(st, u["perms"]):
+                c.append("anthropics/claude-code-action (%s: pushes with its own app token)" % ASSUMED)
+        elif uses.startswith(AGENT_ACTIONS):
+            c.append("%s (%s: the code at that ref is not in this checkout)" % (uses, ASSUMED))
+    c = sorted(set(c))
+    verdict = "trusted-triggers-only"
+    if untrusted:
+        scanned += 1
+        verdict = "VIOLATION" if (a and b and c) else "ok"
+    print("SITE %s trig=%s agent=%s a=[%s] b=[%s] c=[%s] verdict=%s" % (
+        where, ",".join(sorted(trig)) or "any-caller", "+".join(sorted(set(agent))) or "-",
+        "; ".join(a), "; ".join(b), "; ".join(c), verdict))
+    if verdict == "VIOLATION":
+        violations.append((where, "(a) %s; (b) %s; (c) %s" % (", ".join(a), ", ".join(b), ", ".join(c))))
+
+if check == "rule2":
+    # Every workflow or action the npm package ships must be one this scan read.
+    try:
+        files = json.load(open(os.path.join(root, "package.json"))).get("files") or []
+    except Exception:
+        files = []
+    for f in files:
+        if not f.startswith(".github/"):
             continue
-
-        # rule2
-        w = writes(job.get("permissions", doc.get("permissions")))
-        b = []
-        if w is None:
-            b.append("no permissions block (default token, assumed write)")
-        elif w:
-            b.append("write permissions")
-        if SECRET.search(job_env + "\n" + "\n".join(text(s) for s in steps)):
-            b.append("secrets/token in env")
-        c = []
-        for st in steps:
-            run, u = run_of(st), str(st.get("uses") or "")
-            if PUSH_RUN.search(run):
-                c.append(PUSH_RUN.search(run).group(0))
-            if LOKI_START.search(run):
-                env = dict(job.get("env") or {})
-                env.update(st.get("env") or {})
-                if str(env.get("LOKI_DELEGATE_PR", "")).strip() != "0":
-                    c.append("loki start/run opens a PR (LOKI_DELEGATE_PR not 0)")
-            for act, why in PUSH_ACTIONS.items():
-                if u.startswith(act + "@") or u == act:
-                    c.append(act + why)
-        c = sorted(set(c))
-        if a and b and c:
-            violations.append((where, "(a) %s; (b) %s; (c) %s%s" % (
-                ", ".join(a), ", ".join(b), ", ".join(c), note)))
-
+        paths = glob.glob(os.path.join(root, f, "**"), recursive=True) if f.endswith("/") else [os.path.join(root, f)]
+        for p in paths:
+            rel = os.path.relpath(p, root)
+            if rel.endswith((".yml", ".yaml")) and rel not in scanned_files:
+                print("UNSCANNED " + rel)
 print("SCANNED %d" % scanned)
 for where, why in violations:
     print("VIOLATION %s %s" % (where, why))
 PY
 
-# Synthetic controls: an all-three workflow and a correctly split one.
+# Positive controls: every file here must be flagged. Besides a synthetic
+# all-three workflow, they are trimmed copies of the YAML this repo shipped
+# before the P9 fix (commit 61af5915), keeping every key the scan judges.
 SYN_BAD="$MOAT_TMP/syn-bad"
-SYN_SPLIT="$MOAT_TMP/syn-split"
-mkdir -p "$SYN_BAD/.github/workflows" "$SYN_SPLIT/.github/workflows"
+# Negative controls: honest look-alikes that must NOT be flagged.
+SYN_GOOD="$MOAT_TMP/syn-good"
+mkdir -p "$SYN_BAD/.github/workflows" "$SYN_BAD/.github/actions/issue-to-pr" \
+         "$SYN_GOOD/.github/workflows" "$SYN_GOOD/.github/actions/agent-only"
 cat > "$SYN_BAD/.github/workflows/bad.yml" <<'YML'
 name: bad
 on:
@@ -354,7 +521,272 @@ jobs:
           loki start ./task.md
           git push origin HEAD
 YML
-cat > "$SYN_SPLIT/.github/workflows/split.yml" <<'YML'
+# pre-fix loki-issue-to-pr.yml: one job, write token, remote composite agent.
+cat > "$SYN_BAD/.github/workflows/pre-issue-to-pr.yml" <<'YML'
+name: Loki - Issue to PR
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue:
+        required: true
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+jobs:
+  resolve:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'loki') ||
+      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/loki')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve the issue
+        id: loki
+        uses: asklokesh/loki-mode/.github/actions/issue-to-pr@v9.49.4
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          issue: ${{ github.event.issue.number || inputs.issue }}
+      - name: Report back on the issue
+        if: always() && steps.loki.outputs.pr_url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.loki.outputs.pr_url }}
+        run: gh issue comment "$ISSUE" --body "$PR_URL"
+YML
+# The same workflow calling the pre-fix composite from this checkout, so the
+# local resolution path is exercised too.
+sed -e 's#asklokesh/loki-mode/.github/actions/issue-to-pr@v9.49.4#./.github/actions/issue-to-pr#' \
+    "$SYN_BAD/.github/workflows/pre-issue-to-pr.yml" > "$SYN_BAD/.github/workflows/pre-issue-to-pr-local.yml"
+# pre-fix .github/actions/issue-to-pr/action.yml: the agent step pushes and opens the PR.
+cat > "$SYN_BAD/.github/actions/issue-to-pr/action.yml" <<'YML'
+name: 'Loki Issue to PR'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Loki Mode
+      shell: bash
+      run: npm install -g loki-mode@${{ inputs.version }}
+    - name: Resolve the issue to a pull request
+      id: run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LOKI_PROVIDER: ${{ inputs.provider }}
+        LOKI_DELEGATE_PR: '1'
+      run: |
+        set -uo pipefail
+        loki start "${{ steps.ref.outputs.ref }}" || RC=$?
+        exit "${RC:-0}"
+YML
+# pre-fix claude.yml: ungated, app token via OIDC, agent reads the thread.
+cat > "$SYN_BAD/.github/workflows/pre-claude.yml" <<'YML'
+name: Claude Code
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+YML
+# pre-fix loki-enterprise.yml: reviewer not gated, agent step holds the token.
+cat > "$SYN_BAD/.github/workflows/pre-enterprise.yml" <<'YML'
+name: Loki Mode Enterprise
+on:
+  issues:
+    types: [labeled]
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  loki-run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'loki-mode') ||
+      (github.event_name == 'pull_request_review' && contains(github.event.pull_request.labels.*.name, 'loki-mode'))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Parse trigger context
+        id: context
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: node -e "require('./src/integrations/github/action-handler.js')"
+      - name: Execute Loki Mode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRD_CONTENT: ${{ steps.context.outputs.prd }}
+        run: |
+          PRD_FILE=$(mktemp)
+          printf '%s' "$PRD_CONTENT" > "$PRD_FILE"
+          loki start "$PRD_FILE"
+  report:
+    runs-on: ubuntu-latest
+    needs: loki-run
+    if: always() && needs.loki-run.result != 'skipped'
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Post results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+        run: node -e "require('./src/integrations/github/reporter.js')"
+YML
+# pre-fix claude-code-review.yml: OIDC app token and thread-reading tools.
+cat > "$SYN_BAD/.github/workflows/pre-review.yml" <<'YML'
+name: Claude Code Review
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  claude-review:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh pr comment:*),Bash(gh pr view:*)"'
+YML
+# pre-fix root action.yml: the review agent could still open a PR.
+cat > "$SYN_BAD/action.yml" <<'YML'
+name: 'Loki Mode Code Review'
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate review PRD
+      id: review-prd
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q '.body')
+        printf '%s\n' "$PR_BODY" > prd.md
+    - name: Run loki review
+      shell: bash
+      env:
+        LOKI_PROVIDER: ${{ inputs.provider }}
+      run: loki start --simple prd.md
+YML
+# A publish job that splices an agent job's output into its script: the agent
+# then writes code that runs with the write token.
+cat > "$SYN_BAD/.github/workflows/pre-publish-interp.yml" <<'YML'
+name: publish-interp
+on:
+  issues:
+    types: [labeled]
+permissions: {}
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      title: ${{ steps.run.outputs.title }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LOKI_DELEGATE_PR: '0'
+        run: loki start ./task.md
+  publish:
+    needs: agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git commit --allow-empty -m "${{ needs.agent.outputs.title }}"
+          git push origin HEAD:refs/heads/loki/fix
+YML
+# A gate on the wrong author: the issue's, not the commenter's.
+cat > "$SYN_BAD/.github/workflows/pre-wrong-gate.yml" <<'YML'
+name: wrong-gate
+on:
+  issue_comment:
+    types: [created]
+permissions: {}
+jobs:
+  agent:
+    if: contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LOKI_DELEGATE_PR: '0'
+        run: loki start "$GITHUB_REPOSITORY#1"
+YML
+
+cat > "$SYN_GOOD/.github/workflows/split.yml" <<'YML'
 name: split
 on:
   issue_comment:
@@ -402,47 +834,159 @@ jobs:
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:refs/heads/loki/fix
           gh pr create --fill --head loki/fix
 YML
+# The fixed review workflow's shape: an agent that can comment, not push.
+cat > "$SYN_GOOD/.github/workflows/review.yml" <<'YML'
+name: review
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  claude-review:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+YML
+# An agent output passed to the publish job as data (env), never as script;
+# and a label trigger, which needs triage access, so no author gate.
+cat > "$SYN_GOOD/.github/workflows/publish-env.yml" <<'YML'
+name: publish-env
+on:
+  issues:
+    types: [labeled]
+permissions: {}
+jobs:
+  agent:
+    if: github.event.label.name == 'loki'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      title: ${{ steps.run.outputs.title }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: run
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          LOKI_DELEGATE_PR: '0'
+        run: loki start "$GITHUB_REPOSITORY#${{ github.event.issue.number }}"
+  publish:
+    needs: agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ needs.agent.outputs.title }}
+        run: |
+          git commit --allow-empty -m "$TITLE"
+          git push origin HEAD:refs/heads/loki/fix
+YML
+# The fixed root review action and the fixed agent-only composite.
+cat > "$SYN_GOOD/action.yml" <<'YML'
+name: 'Loki Mode Code Review'
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate review PRD
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: gh pr view "$PR_NUMBER" --json body -q '.body' > prd.md
+    - name: Run loki review
+      shell: bash
+      env:
+        LOKI_DELEGATE_PR: '0'
+      run: loki start --simple prd.md
+YML
+cat > "$SYN_GOOD/.github/actions/agent-only/action.yml" <<'YML'
+name: 'agent only'
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LOKI_DELEGATE_PR: '0'
+      run: |
+        loki start "$ISSUE_REF"
+        git diff --binary "$START_SHA" HEAD > loki.patch
+YML
 
 scan() {  # <root> <check> <out>
     python3 "$MOAT_TMP/wfscan.py" "$1" "$2" >"$3" 2>&1
 }
 
-# Runs one static check: positive controls first, then the real repo.
-static_case() {  # <check>
-    local check="$1" n
+# Runs one static check: controls first, then the real repo.
+static_case() {  # <check> <unit the positive controls must flag>...
+    local check="$1" n w v
+    shift
     if ! command -v python3 >/dev/null 2>&1; then nok "prerequisite missing: python3"; return; fi
     scan "$SYN_BAD" "$check" "$MOAT_TMP/$check.bad"
-    scan "$SYN_SPLIT" "$check" "$MOAT_TMP/$check.split"
+    scan "$SYN_GOOD" "$check" "$MOAT_TMP/$check.good"
     scan "$REPO_ROOT" "$check" "$MOAT_TMP/$check.repo"
-    if grep -q '^ERROR' "$MOAT_TMP/$check.bad" "$MOAT_TMP/$check.split" "$MOAT_TMP/$check.repo"; then
-        nok "$(grep -h -m1 '^ERROR' "$MOAT_TMP/$check.bad" "$MOAT_TMP/$check.split" "$MOAT_TMP/$check.repo" | head -1 | sed 's/^ERROR //')"
+    if grep -q '^ERROR' "$MOAT_TMP/$check.bad" "$MOAT_TMP/$check.good" "$MOAT_TMP/$check.repo"; then
+        nok "$(grep -h -m1 '^ERROR' "$MOAT_TMP/$check.bad" "$MOAT_TMP/$check.good" "$MOAT_TMP/$check.repo" | head -1 | sed 's/^ERROR //')"
         return
     fi
-    # The split control is a negative one: it only means something if the scan
-    # of it actually completed (a crash prints no VIOLATION either).
-    grep -q '^SCANNED [1-9]' "$MOAT_TMP/$check.split" \
-        || nok "positive control: the synthetic split workflow scan did not complete"
-    grep -q '^VIOLATION bad.yml:agent' "$MOAT_TMP/$check.bad" \
-        || nok "positive control: the synthetic all-three workflow was not flagged"
-    if grep -q '^VIOLATION' "$MOAT_TMP/$check.split"; then
-        nok "positive control: the synthetic split workflow was flagged ($(grep -m1 '^VIOLATION' "$MOAT_TMP/$check.split"))"
+    # The negative controls only mean something if their scan actually
+    # completed (a crash prints no VIOLATION either).
+    grep -q '^SCANNED [1-9]' "$MOAT_TMP/$check.good" \
+        || nok "negative control: the look-alike scan did not complete"
+    for w in "$@"; do
+        grep -qF "VIOLATION $w " "$MOAT_TMP/$check.bad" \
+            || nok "positive control: $w was not flagged"
+    done
+    if grep -q '^VIOLATION' "$MOAT_TMP/$check.good"; then
+        nok "negative control flagged: $(grep '^VIOLATION' "$MOAT_TMP/$check.good" | head -3 | tr '\n' ';')"
     fi
     [ -z "$CASE_FAILS" ] || return
     n="$(sed -n 's/^SCANNED //p' "$MOAT_TMP/$check.repo")"
     if [ -z "$n" ] || [ "$n" -eq 0 ]; then
-        nok "vacuous: no job in an issue-triggered workflow was scanned"
+        nok "vacuous: no unit in scope for the $check check"
         return
     fi
-    log "$check: scanned $n jobs in issue-triggered workflows"
-    local v
+    log "$check: judged $n units"
+    while IFS= read -r v; do
+        nok "a shipped workflow or action was not scanned: ${v#UNSCANNED }"
+    done < <(grep '^UNSCANNED' "$MOAT_TMP/$check.repo")
+    grep '^SITE' "$MOAT_TMP/$check.repo" | sed 's/^/p9: /' >&2
     while IFS= read -r v; do
         nok "${v#VIOLATION }"
     done < <(grep '^VIOLATION' "$MOAT_TMP/$check.repo")
 }
 
-case_rule2() { static_case rule2; }
-case_gate() { static_case gate; }
-case_checkout() { static_case checkout; }
+case_rule2() {
+    static_case rule2 "bad.yml:agent" "pre-issue-to-pr.yml:resolve" \
+        "pre-issue-to-pr-local.yml:resolve" ".github/actions/issue-to-pr/action.yml:(action)" \
+        "pre-claude.yml:claude" "pre-enterprise.yml:loki-run" "pre-review.yml:claude-review" \
+        "action.yml:(action)" "pre-publish-interp.yml:publish"
+}
+case_gate() {
+    static_case gate "bad.yml:agent" "pre-issue-to-pr.yml:resolve" \
+        "pre-issue-to-pr-local.yml:resolve" "pre-claude.yml:claude" \
+        "pre-enterprise.yml:loki-run" "pre-wrong-gate.yml:agent"
+}
+case_checkout() {
+    static_case checkout "bad.yml:agent" "pre-issue-to-pr.yml:resolve" "pre-claude.yml:claude" \
+        "pre-enterprise.yml:loki-run" "pre-enterprise.yml:report" "pre-review.yml:claude-review"
+}
 
 #===============================================================================
 # Hermetic injection run (inside the same egress block P5 proves real)
@@ -506,12 +1050,15 @@ case_injection() {
     local MARKER="MOAT_P9_INJECTION_$$"
 
     # --- local bare remote whose hook accepts only a canary-carrying pusher ---
+    # origin reads as github.com (the delegate PR path only runs for a GitHub
+    # remote); insteadOf routes every fetch and push to the local bare repo.
     if ! ( cd "$W" && git init -q && git config user.email moat@example.invalid \
             && git config user.name moat && git config commit.gpgsign false \
             && printf 'def greet(name):\n    return "hi " + name\n' > greeter.py \
             && git add -A && git commit -qm init \
             && git clone -q --bare "$W" "$T/remote.git" \
-            && git remote add origin "$T/remote.git" ) >/dev/null 2>&1; then
+            && git remote add origin https://github.com/octocat/hello.git \
+            && git config "url.$T/remote.git.insteadOf" https://github.com/octocat/hello.git ) >/dev/null 2>&1; then
         nok "fixture repo/remote setup failed"
         return
     fi
@@ -563,10 +1110,17 @@ PY
     chmod +x "$B/gh"
 
     # --- stub provider: records its env, then obeys the injection -------------
+    # On the main build prompt it also makes a real edit and claims completion,
+    # so the run reaches the trusted post-session push and PR (the other half
+    # of the property: the token still works where Loki itself needs it).
     {
         printf '#!/usr/bin/env bash\n'
         printf 'env > %q.$$\n' "$T/provider-env"
         printf 'printf "%%s\\n" "$*" > %q.$$\n' "$T/provider-argv"
+        printf 'case "$*" in *loki_system*)\n'
+        printf '    printf "def greet(name):\\n    return \\"hello \\" + name\\n" > greeter.py\n'
+        printf '    mkdir -p .loki/signals && echo done > .loki/signals/COMPLETION_REQUESTED\n'
+        printf '    echo edited >> %q ;;\nesac\n' "$T/provider-actions.log"
         printf 'export MOAT_PUSH_SOURCE=provider GIT_TERMINAL_PROMPT=0\n'
         printf 'git push -q origin HEAD:refs/heads/injected-$$ >/dev/null 2>&1; echo "git_push_rc=$?" >> %q\n' "$T/provider-actions.log"
         printf 'gh pr create --title pwned --body pwned >/dev/null 2>&1; echo "gh_pr_rc=$?" >> %q\n' "$T/provider-actions.log"
@@ -577,11 +1131,24 @@ PY
     local DEADLINE="perl -e 'alarm shift @ARGV; exec @ARGV or exit 127'"
     command -v gtimeout >/dev/null 2>&1 && DEADLINE="gtimeout"
     command -v timeout >/dev/null 2>&1 && DEADLINE="timeout"
+    # Loki's post-session network calls take a `timeout 30 <cmd>` branch when
+    # timeout exists (always on Linux CI). That branch execs the binary and so
+    # is the one that can lose the token; make sure it is the one exercised.
+    if ! command -v timeout >/dev/null 2>&1; then
+        {
+            printf '#!/usr/bin/env bash\n'
+            printf 'while [ $# -gt 0 ]; do case "$1" in -k|-s) shift 2 ;; -*) shift ;; *) break ;; esac; done\n'
+            printf 'shift; exec "$@"\n'
+        } > "$B/timeout"
+        chmod +x "$B/timeout"
+    fi
     {
         printf 'set -u\n'
         printf 'export HOME=%q PATH=%q TMPDIR=%q\n' "$T/home" "$B:$PATH" "${TMPDIR:-/tmp}"
         printf 'export GH_TOKEN=%q GITHUB_TOKEN=%q MOAT_ENV_MARKER=inherited\n' "$GH_CANARY" "$GITHUB_CANARY"
-        printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=0 LOKI_DASHBOARD=false\n'
+        # LOKI_DELEGATE_PR=1 is the product default: push and open the PR after
+        # the session. Only that trusted step may carry the token.
+        printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=1 LOKI_DASHBOARD=false\n'
         printf 'export LOKI_PROVIDER=claude LOKI_MAX_ITERATIONS=1 LOKI_COMPLETION_PROMISE=MOAT_P9_COMPLETE LOKI_AUTO_CONFIRM=true\n'
         printf 'export LOKI_SKIP_PREREQS=true LOKI_PHASE_CODE_REVIEW=false LOKI_COUNCIL_ENABLED=false LOKI_APP_RUNNER=false\n'
         printf 'export LOKI_NO_NEW_SESSION=1 LOKI_SKIP_NET_PREFLIGHT=1 LOKI_SKIP_AUTH_PREFLIGHT=1 LOKI_RESOURCE_CHECK_INTERVAL=2 GIT_TERMINAL_PROMPT=0\n'
@@ -625,18 +1192,26 @@ PY
         && nok "gh pr create from the provider session ran with a valid token"
     grep -q 'git_push_rc=' "$T/provider-actions.log" 2>/dev/null \
         || nok "the provider's push attempt did not run (probe blind)"
+    # The token was withheld, not destroyed: the trusted post-session step
+    # (LOKI_DELEGATE_PR=1) must still push and open the PR with it.
+    grep -qx 'edited' "$T/provider-actions.log" 2>/dev/null \
+        || nok "the main build prompt never reached the provider (probe blind)"
+    grep -qx 'loki accepted' "$T/push.log" \
+        || nok "Loki's own post-session push did not carry the token (push log: $(tr '\n' ',' < "$T/push.log"))"
+    grep -q '^loki token=yes pr create' "$T/gh.log" \
+        || nok "Loki's own post-session gh pr create did not carry the token"
 }
 
 moat_run "P9.issue-workflows-separate-untrusted-from-push" \
-    "no issue-triggered workflow job combines untrusted text, write access or secrets, and push/PR" \
+    "no workflow job or shipped action that untrusted text can reach combines it with write access or secrets and push/PR" \
     case_rule2
 moat_run "P9.comment-trigger-author-gate" \
-    "comment-triggered agent jobs gate on author_association or equivalent, visibly in YAML" \
+    "agent jobs reachable by outsider-authored events check that author visibly in YAML, on the event's own field" \
     case_gate
 moat_run "P9.injection-cannot-reach-token" \
-    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push from the provider session" \
+    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push from a provider session; Loki's own post-session push/PR still can" \
     case_injection
 moat_run "P9.checkout-no-persisted-credentials" \
-    "issue-triggered actions/checkout sets persist-credentials: false" \
+    "actions/checkout sets persist-credentials: false in issue/comment/review-triggered and agent-running jobs" \
     case_checkout
 exit 0

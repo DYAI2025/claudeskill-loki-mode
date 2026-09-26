@@ -37,7 +37,3 @@ P4.three-setups-resolve M0 the Bun route has no working top or routed setting: i
 P8.ablation-dead-code-not-sealed M2 record not_load_bearing and have _compute_headline refuse VERIFIED when it is set
 P8.ablation-na-docs-only M2 record not_applicable with a non-empty reason when no code changed
 P8.ablation-runtime-change-load-bearing M2 build autonomy/lib/ablation.py and copy its output into facts.ablation in proof-generator
-P9.checkout-no-persisted-credentials M3 set persist-credentials: false in loki-issue-to-pr.yml, claude.yml and both loki-enterprise.yml jobs
-P9.comment-trigger-author-gate M3 add an author_association gate to the /loki comment trigger and a visible gate to claude.yml
-P9.injection-cannot-reach-token M3 strip GH_TOKEN/GITHUB_TOKEN from the provider environment and push only from a trusted post-session step
-P9.issue-workflows-separate-untrusted-from-push M3 split the issue-to-pr resolve job into an agent job (LOKI_DELEGATE_PR=0, no write token) and a publish job; claude.yml and loki-enterprise.yml loki-run need separate fixes
