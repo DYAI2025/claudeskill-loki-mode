@@ -515,6 +515,7 @@ run_test "Enforcement claims in buyer-facing docs are scoped" "$SCRIPT_DIR/test-
 run_test "loki logs reads the log the runner writes" "$SCRIPT_DIR/test-logs-command.sh"
 run_test "report cost agrees with its own budget state file" "$SCRIPT_DIR/test-report-cost-budget.sh"
 run_test "loki stop is bounded regardless of provider timeout" "$SCRIPT_DIR/test-stop-latency.sh"
+run_test "kill_provider_child never signals outside its own process group" "$SCRIPT_DIR/test-kill-provider-child-scoping.sh"
 run_test "audit chain claims match what the chain proves" "$SCRIPT_DIR/test-audit-chain-honesty.sh"
 run_test "audit subsystem Node suites (witness, manifest, crosslink)" "$SCRIPT_DIR/test-audit-js-suites.sh"
 # Moat P7 at the pixel: the real cost components and cost.html render an

@@ -171,6 +171,13 @@ declare -a _FAST_KEEP=(
   # class of bug that prompted the fix. Measured 2s (no provider call: the
   # suite stubs the classifier and pins the non-interactive path).
   "tests/cli/test-quickstart-brownfield.sh"
+  # Guards a severe, live product bug (D14/D15): kill_provider_child ran an
+  # unscoped `pkill -f` on every normal signal-driven session end (a
+  # supervisor signal, double Ctrl+C, Ctrl+C in perpetual mode), killing
+  # unrelated Claude Code sessions on the same machine. A check that guards
+  # the shipped product's own signal-cleanup path must run in the fast tier;
+  # CI has no equivalent.
+  "tests/test-kill-provider-child-scoping.sh"
   # Proves every web-app client path resolves to a real FastAPI route. Ten
   # client calls had drifted onto URLs no route served (/github/runs against a
   # server serving /github/actions/runs), so the CI/CD and deploy panels were
@@ -1243,6 +1250,7 @@ run_check "tests/test-playwright-verify-as-evidence.sh (playwright pass/fail dis
 run_check "tests/test-enforce-mutation-integrity.sh (mutation-integrity HIGH block)" "bash tests/test-enforce-mutation-integrity.sh 2>&1 | tail -3"
 run_check "tests/test-start-bash-diversion.sh (T3 loop-flip: orchestration flags divert to bash)" "bash tests/test-start-bash-diversion.sh 2>&1 | tail -3"
 run_check "tests/test-checklist-gate-failclosed.sh (council checklist gate fail-closed on corrupt results)" "bash tests/test-checklist-gate-failclosed.sh 2>&1 | tail -3"
+run_check "tests/test-kill-provider-child-scoping.sh (kill_provider_child never signals outside its own process group)" "bash tests/test-kill-provider-child-scoping.sh 2>&1 | tail -3"
 run_check "tests/test-council-aggregate-votes.sh (council completion tally threshold + stdout hygiene)" "bash tests/test-council-aggregate-votes.sh 2>&1 | tail -3"
 run_check "tests/test-checklist-determine-item-status.py (item-status aggregator: inconclusive never verified)" "python3 -m pytest tests/test-checklist-determine-item-status.py -q 2>&1 | tail -3"
 run_check "tests/test-checklist-run-check-arms.py (http_check never True on error + 4 arms)" "python3 -m pytest tests/test-checklist-run-check-arms.py -q 2>&1 | tail -3"

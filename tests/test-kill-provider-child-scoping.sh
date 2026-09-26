@@ -56,6 +56,36 @@
 # process argv, and every decoy's argv carries a unique per-run token so no
 # assertion can ever be satisfied by matching a real, unrelated process.
 #
+# ROUND 2 OF REVIEW FOUND A FIFTH INSTANCE OF THE SAME BUG CLASS, this time
+# in the test's OWN ISOLATION, not its decoy-selection logic: once the
+# decoys were fixed, the test still calls the REAL kill_provider_child in
+# whatever process group it happens to inherit from its caller. That
+# function's pgid sweep SIGTERMs every "claude"/"codex"/"aider"/"cline"
+# process sharing the CALLER's pgid -- including a process this test never
+# launched and never recorded, if one happens to already be running in that
+# pgid (a sibling test-runner lane that doesn't detach its subprocesses, a
+# CI step that backgrounds `claude -p` before running the suite, an agent
+# harness with no job control). Reproduced: `perl -e '$0="claude
+# --outside-victim-$$"; sleep 30' &` in the SAME shell that then runs this
+# test terminates the victim even though the test reports "6 passed, 0
+# failed" -- proof itself is not what killed it, the FUNCTION UNDER TEST is,
+# reached exactly the way a real caller would reach it.
+#
+# Fixed by putting the WHOLE TEST in its own new session before anything
+# else runs, so the only processes ever in its process group are its own.
+# The fork happens before setsid so this also works when the test is
+# already a process group leader (an interactive terminal).
+if [ -z "${LOKI_KPC_ISOLATED:-}" ] && command -v perl >/dev/null 2>&1; then
+    LOKI_KPC_ISOLATED=1 exec perl -e '
+        use POSIX ();
+        my $p = fork();
+        die "fork: $!" unless defined $p;
+        if ($p) { waitpid($p, 0); exit(($? >> 8)); }
+        POSIX::setsid() != -1 or die "setsid: $!";
+        exec { $ENV{BASH} // "bash" } @ARGV or die "exec: $!";
+    ' "${BASH:-bash}" "$0" "$@"
+fi
+
 # See docs/v10/DECISIONS.md D14/D15/D16 and
 # feedback-pkill-f-substring-killed-the-session,
 # feedback-a-test-can-reintroduce-the-bug-it-guards-against (project memory).
@@ -108,6 +138,19 @@ source "$FN_FILE"
 # A per-run token so no decoy's argv can ever collide with a real process on
 # this machine. Never use a real CLI invocation string as a test fixture.
 TOKEN="lokikpctest-$$-$RANDOM-$(date +%s 2>/dev/null || echo 0)"
+
+# Tripwire, defense in depth: if a future regression reintroduces a bare
+# pkill/killall inside kill_provider_child, this test would otherwise still
+# report PASS as long as it happened not to hit anything in the run right
+# now. Shadow both commands so any call other than THIS test's own (which
+# never calls them directly) is caught, logged, and fails the run instead of
+# silently reaching a real process. kill_provider_child's fixed sweep does
+# not call pkill/killall at all -- it uses pgrep plus per-pid `kill`.
+PKILL_TRIPWIRE_LOG="$WORK/pkill-tripwire.log"
+# shellcheck disable=SC2317  # invoked indirectly if kill_provider_child ever calls it
+pkill()   { echo "TRIPWIRE: pkill $*" >> "$PKILL_TRIPWIRE_LOG"; return 1; }
+# shellcheck disable=SC2317
+killall() { echo "TRIPWIRE: killall $*" >> "$PKILL_TRIPWIRE_LOG"; return 1; }
 
 wait_for_pidfile() { # wait_for_pidfile <pidfile> -> prints the pid once written
     local pidfile="$1" i=0
@@ -226,6 +269,12 @@ fi
 # Cleanup: only the exact recorded PIDs from this run, never a pattern.
 [ -n "$SAME_PID" ] && kill -9 "$SAME_PID" 2>/dev/null || true
 [ -n "$OTHER_PID" ] && kill -9 "$OTHER_PID" 2>/dev/null || true
+
+if [ -s "$PKILL_TRIPWIRE_LOG" ]; then
+    bad "kill_provider_child called pkill/killall directly -- a regression to the exact bug class this test guards against: $(cat "$PKILL_TRIPWIRE_LOG")"
+else
+    ok "kill_provider_child never calls pkill/killall directly (per-pid kill only)"
+fi
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"
