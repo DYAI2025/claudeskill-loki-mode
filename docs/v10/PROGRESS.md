@@ -127,3 +127,26 @@ found the first fix had missed the actual crash site; round 2 unanimous
 APPROVE with the real crash reproduced and fixed. Both regression tests
 registered in `tests/run-all-tests.sh` (`test-ci-json-argmax.sh` is slow,
 about 2 minutes, kept out of the fast tier deliberately).
+
+## docs/v10/BOARD.md accidentally emptied and recovered (2026-09-26)
+
+A python3 heredoc committed `docs/v10/BOARD.md` as 0 bytes (`de3a8503`),
+destroying all in-flight slice status. Caught when the next scripted edit
+against it failed its own guard because there was no content left to
+match. Recovered from the last known-good commit and pushed (`53d3adea`).
+See `docs/v10/DECISIONS.md` D18 for the root cause and the changed editing
+discipline (Read then Edit for hot coordination files, never a bare
+python3 write with only an assert as its guard).
+
+## CI Tests failure on push, fixed forward (2026-09-26)
+
+The push carrying S-01/S-03/S-12 and the BOARD.md recovery (`322eee77`,
+`53d3adea`) broke `Tests` (shard 0/4) with two failures, neither a product
+regression: `tests/test-bugfix-audit.sh`'s BUG-CMD-002/003 assertions
+locked in the exact exported-env-var pattern S-03 correctly removed
+(retargeted to `test_source_absent`, matching how BUG-CLI-003 was already
+handled); `tests/test-ci-json-argmax.sh`'s fixture was sized for this
+Mac's ~1 MiB `ARG_MAX` and silently under-shot the GitHub Actions ubuntu
+runner's ~4 MiB `ARG_MAX`, so the crash the test exists to catch went
+unexercised there. `FINDING_COUNT` is now derived from the measured
+`ARG_MAX` at runtime, never a fixed constant. Fixed forward in `5c9d4373`.
