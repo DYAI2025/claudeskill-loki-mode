@@ -71,3 +71,26 @@
 
 1. Cycle 2: BACKLOG 15 (untracked files swept into the session commit: data risk), 37 (Bun passes an inconclusive test result) and 43 (inline Python on council verdict paths importable from the agent repo): honest-verdict and data-risk items first.
 2. Then P7 (no fabricated data) and P9 (Rule of Two), the moat gaps with the smallest fix, and M0 measurement (catalog + seeded-defect corpus).
+
+## Session interrupted and recovered (2026-09-26)
+
+The CLI process terminated unexpectedly three times between 11:26 and 11:50
+EDT, each time while a HIGH-tier council review (4 parallel agents) was
+running against the main checkout. Root cause found and fixed: `D14`,
+`61547203`. `tests/test-backend-floor.sh` used `pkill -f "index.mjs"` with no
+scoping, which kills any process on the machine whose argv contains that
+substring; in a shared process namespace with concurrent worktree agents and
+the harness's own process tree, this could hit an unrelated process,
+including plausibly this session itself. Reproduced with a decoy process,
+fixed to kill only the PID actually listening on the target port
+(`lsof -ti tcp:<port> -sTCP:LISTEN`), verified the test still passes 6/6.
+
+Reconciliation on resume: `git status` clean, nothing to stash; the only
+commits since `036458df` were the fix itself; all three remaining worktrees
+(P5, P9, P4) intact at their recorded SHAs, matching `BOARD.md` exactly,
+nothing orphaned (the already-merged GF-5 worktree was removed); `VERSION`,
+the latest tag, and npm `latest` all agree at 9.54.0, gitHead `1dd799f9` --
+no release was mid-flight; the two dashboard-server processes noticed
+earlier in the session are unowned by any PID this session recorded, so left
+running per the never-kill-by-name rule. No data or work was lost across the
+three restarts: everything durable was already committed or in a worktree.
