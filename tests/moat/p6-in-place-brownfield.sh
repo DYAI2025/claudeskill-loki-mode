@@ -1058,8 +1058,69 @@ if [ -z "$why" ]; then
         why="${why}could not switch back to main: $(head -c 160 "$T/log/self-checkout.err" | tr '\n' ' '); "
     fi
 fi
+# Stale-base leg (fifth fixture, one session): .loki/state still names the
+# base and session branch of an earlier session run from feature/x, both since
+# deleted. The session minted from main must record main as its base, so the
+# agent's own commit of the user's untracked PRECIOUS.txt comes off the tip and
+# a checkout of main keeps it.
+B="$T/stalebase/repo"
+gb() { git -C "$B" "$@"; }
+SENTINEL5="moat-p6-stale-base-$$-${RANDOM}${RANDOM}"
+{
+    mkdir -p "$B" && git init -q "$B" \
+    && gb symbolic-ref HEAD refs/heads/main \
+    && gb config user.email moat@example.invalid \
+    && gb config user.name "moat p6" \
+    && gb config commit.gpgsign false \
+    && printf 'def hello():\n    return "hi"\n' > "$B/main.py" \
+    && gb add main.py && gb commit -qm "c1: app" \
+    && gb branch feature/x \
+    && mkdir -p "$B/.loki/state" && printf '*\n' > "$B/.loki/.gitignore" \
+    && printf 'feature/x\n' > "$B/.loki/state/base-branch.txt" \
+    && printf 'loki/session-1-1\n' > "$B/.loki/state/agent-branch.txt" \
+    && gb branch -q -D feature/x \
+    && printf 'precious\n%s\n' "$SENTINEL5" > "$B/PRECIOUS.txt" \
+    && cp "$B/PRECIOUS.txt" "$T/stalebase/PRECIOUS.before"
+} >"$T/log/stale-fixture.log" 2>&1 || why="${why}stale-base fixture setup failed: $(tr '\n' ' ' < "$T/log/stale-fixture.log" | cut -c1-200); "
+# Vacuity guards: the base recorded before the run is stale and unresolvable.
+[ "$(cat "$B/.loki/state/base-branch.txt" 2>/dev/null)" = feature/x ] \
+    || why="${why}vacuous: the stale-base fixture does not record feature/x as the base; "
+gb rev-parse --verify -q feature/x >/dev/null 2>&1 \
+    && why="${why}vacuous: feature/x still resolves in the stale-base fixture; "
+STALE_LOG="$T/log/stale-stub.log"
+: > "$STALE_LOG"
 if [ -z "$why" ]; then
-    pass "$id" "the agent's own git add -A commit put the user's untracked and ignored files on $SELF_BRANCH; the session took them off the branch tip (feature.py kept), warned naming them, and all three are byte-identical after checkout of main"
+    run_pipeline stalebase "$STALE_LOG" selfcommit "$B"
+    rc=$?
+    echo "INFO P6 stale-base session run.sh rc=$rc"
+    kill_leftovers
+    [ "$(awk -F'\t' '$1 == "build" {n++} END {print n + 0}' "$STALE_LOG")" -ge 1 ] \
+        || why="${why}vacuous: the stale-base session never reached the provider build step (run.sh rc=$rc); "
+    STALE_BRANCH="$(gb symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)"
+    case "$STALE_BRANCH" in loki/session-*) ;; *) why="${why}stale-base: not on a minted session branch ($STALE_BRANCH); " ;; esac
+    STALE_SHA="$(cat "$T/log/stale-stub.agent-commit" 2>/dev/null)"
+    if [ -z "$STALE_SHA" ]; then
+        why="${why}vacuous: the stale-base stub's own git commit did not happen; "
+    else
+        gb show "$STALE_SHA:PRECIOUS.txt" 2>/dev/null | grep -qF "$SENTINEL5" \
+            || why="${why}vacuous: the stale-base agent commit does not hold PRECIOUS.txt; "
+    fi
+    [ "$(cat "$B/.loki/state/base-branch.txt" 2>/dev/null)" = main ] \
+        || why="${why}stale-base: the mint from main recorded base '$(cat "$B/.loki/state/base-branch.txt" 2>/dev/null)'; "
+    gb ls-tree -r --name-only HEAD > "$T/log/stale-head-tree.txt" 2>/dev/null
+    grep -qx 'feature.py' "$T/log/stale-head-tree.txt" \
+        || why="${why}stale-base: the agent's feature.py is not on the branch tip; "
+    grep -qx 'PRECIOUS.txt' "$T/log/stale-head-tree.txt" \
+        && why="${why}stale-base: PRECIOUS.txt is still on the branch tip ($STALE_BRANCH); "
+    if gb checkout -q main 2>"$T/log/stale-checkout.err"; then
+        cmp -s "$B/PRECIOUS.txt" "$T/stalebase/PRECIOUS.before" \
+            || why="${why}stale-base: PRECIOUS.txt is gone or changed after checkout of main; "
+    else
+        why="${why}stale-base: could not switch back to main: $(head -c 160 "$T/log/stale-checkout.err" | tr '\n' ' '); "
+    fi
+fi
+if [ -z "$why" ]; then
+    pass "$id" "the agent's own git add -A commit put the user's untracked and ignored files on $SELF_BRANCH; the session took them off the branch tip (feature.py kept), warned naming them, and all three are byte-identical after checkout of main; with a base left by an earlier session from a deleted feature/x, the mint recorded main and the user's PRECIOUS.txt came off the tip of $STALE_BRANCH and is byte-identical after checkout of main"
 else
     fail "$id" "$why"
 fi

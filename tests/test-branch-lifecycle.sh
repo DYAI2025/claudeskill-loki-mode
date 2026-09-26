@@ -1406,6 +1406,207 @@ else
 fi
 
 # =============================================================================
+# Test T-stale-base-agent-self-commit (council S): session 1 runs from
+# feature/x, so base-branch.txt says feature/x. The user goes back to develop
+# and deletes feature/x and session 1's branch, then makes precious.txt. Session
+# 2 is minted from develop and its agent runs `git add -A && git commit`. A base
+# kept from session 1 made the untrack step warn and commit on that tip anyway,
+# and a checkout of develop then deleted precious.txt. Every mint must record
+# its own base and start commit; a resume (here from feature/z) keeps both.
+# =============================================================================
+echo "Test T-stale-base-agent-self-commit (council S): a base left by an earlier session never lets a base checkout delete a user file"
+RSB="$(make_repo tstalebase)"
+outsb="$(
+    cd "$RSB" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    git checkout -q -b feature/x
+    setup_agent_branch >/dev/null 2>&1
+    s1="$(git rev-parse --abbrev-ref HEAD)"
+    printf 'agent 1\n' > work1.js
+    commit_session_changes >/dev/null 2>&1
+    stale="$(cat .loki/state/base-branch.txt 2>/dev/null)"
+    git checkout -q develop
+    git branch -q -D feature/x "$s1"
+    printf 'precious\n' > precious.txt
+    setup_agent_branch >/dev/null 2>&1
+    base2="$(cat .loki/state/base-branch.txt 2>/dev/null)"
+    start2="$(cat .loki/state/session-start-sha 2>/dev/null)"
+    start_ok="$( [ "$start2" = "$(git rev-parse develop)" ] && echo yes || echo no )"
+    printf 'print(2)\n' > work2.py
+    git add -A && git commit -qm "agent checkpoint"
+    swept="$(git cat-file -e HEAD:precious.txt 2>/dev/null && echo yes || echo no)"
+    msg="$(commit_session_changes 2>&1)"
+    in_head="$(git cat-file -e HEAD:precious.txt 2>/dev/null && echo yes || echo no)"
+    agent="$(git cat-file -e HEAD:work2.py 2>/dev/null && echo yes || echo no)"
+    named="$(printf '%s' "$msg" | grep 'The agent committed your pre-existing' | grep -q 'precious.txt' && echo yes || echo no)"
+    s2="$(git rev-parse --abbrev-ref HEAD)"
+    git checkout -q develop 2>/dev/null
+    intact="$( [ "$(cat precious.txt 2>/dev/null)" = precious ] && echo yes || echo no )"
+    git checkout -q -b feature/z
+    setup_agent_branch >/dev/null 2>&1
+    resumed="$( [ "$(git rev-parse --abbrev-ref HEAD)" = "$s2" ] && echo yes || echo no )"
+    kept="$( [ "$(cat .loki/state/base-branch.txt 2>/dev/null)" = develop ] \
+        && [ "$(cat .loki/state/session-start-sha 2>/dev/null)" = "$start2" ] && echo yes || echo no )"
+    printf 'STALE=%s BASE2=%s START2=%s SWEPT=%s INHEAD=%s AGENT=%s NAMED=%s INTACT=%s RESUMED=%s KEPT=%s' \
+        "$stale" "$base2" "$start_ok" "$swept" "$in_head" "$agent" "$named" "$intact" "$resumed" "$kept"
+)"
+if [ "$outsb" = "STALE=feature/x BASE2=develop START2=yes SWEPT=yes INHEAD=no AGENT=yes NAMED=yes INTACT=yes RESUMED=yes KEPT=yes" ]; then
+    pass "stale base: the mint recorded develop and its start commit; precious.txt off the tip, named, intact after the develop checkout; a resume kept both"
+else
+    fail "a base left by an earlier session let the agent's commit of a user file through (or a resume rewrote the base)" "got: $outsb"
+fi
+
+# Base branch deleted after the mint: the recorded start commit is the fork.
+echo "Test T-stale-base-start-sha-fallback: base branch gone mid-session -> the recorded start commit still finds the swept file"
+RSF="$(make_repo tstalebasestart)"
+outsf="$(
+    cd "$RSF" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    git checkout -q -b feature/y
+    printf 'precious\n' > precious.txt
+    setup_agent_branch >/dev/null 2>&1
+    start="$(git rev-parse feature/y)"
+    git branch -q -D feature/y
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    swept="$(git cat-file -e HEAD:precious.txt 2>/dev/null && echo yes || echo no)"
+    commit_session_changes >/dev/null 2>&1
+    in_head="$(git cat-file -e HEAD:precious.txt 2>/dev/null && echo yes || echo no)"
+    agent="$(git cat-file -e HEAD:work.py 2>/dev/null && echo yes || echo no)"
+    git checkout -q --detach "$start" 2>/dev/null
+    intact="$( [ "$(cat precious.txt 2>/dev/null)" = precious ] && echo yes || echo no )"
+    printf 'SWEPT=%s INHEAD=%s AGENT=%s INTACT=%s' "$swept" "$in_head" "$agent" "$intact"
+)"
+if [ "$outsf" = "SWEPT=yes INHEAD=no AGENT=yes INTACT=yes" ]; then
+    pass "start-sha fallback: precious.txt off the tip and intact after a checkout of the fork; the agent's work kept"
+else
+    fail "with the base branch gone, the agent's commit of a user file stayed on the tip (or lost it)" "got: $outsf"
+fi
+
+# Neither the base nor a start commit resolves (a session an older Loki minted):
+# no session commit on a tip that may hold user files, and the strong warning.
+echo "Test T-stale-base-fails-closed: no base and no start commit -> no session commit, strong warning, files on disk"
+RSX="$(make_repo tstalebaseclosed)"
+outsx="$(
+    cd "$RSX" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    git checkout -q -b feature/w
+    printf 'precious\n' > precious.txt
+    setup_agent_branch >/dev/null 2>&1
+    git branch -q -D feature/w
+    rm -f .loki/state/session-start-sha
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    agent_head="$(git rev-parse HEAD)"
+    printf 'print(2)\n' > later.py
+    msg="$(commit_session_changes 2>&1)"
+    same="$( [ "$(git rev-parse HEAD)" = "$agent_head" ] && echo yes || echo no )"
+    ondisk="$( [ "$(cat precious.txt 2>/dev/null)" = precious ] && [ -f later.py ] && echo yes || echo no )"
+    warned="$(printf '%s' "$msg" | grep 'git rm --cached' | grep -q 'no session commit' && echo yes || echo no)"
+    printf 'SAME=%s ONDISK=%s WARNED=%s' "$same" "$ondisk" "$warned"
+)"
+if [ "$outsx" = "SAME=yes ONDISK=yes WARNED=yes" ]; then
+    pass "unresolvable fork: no session commit, the git rm --cached warning, precious.txt and the work on disk"
+else
+    fail "with no base and no start commit, the session committed on a tip that may hold user files (or said nothing)" "got: $outsx"
+fi
+
+# The check itself fails (here the coverage step): same fail-closed contract.
+echo "Test T-untrack-check-fails-closed: a failed check -> no session commit, strong warning"
+RSK="$(make_repo tuntrackcheckfail)"
+outsk="$(
+    cd "$RSK" || exit 1
+    source "$PREAMBLE"
+    _loki_covered_paths() { return 1; }
+    ITERATION_COUNT=1
+    result=0
+    printf 'precious\n' > precious.txt
+    setup_agent_branch >/dev/null 2>&1
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    agent_head="$(git rev-parse HEAD)"
+    printf 'print(2)\n' > later.py
+    msg="$(commit_session_changes 2>&1)"
+    same="$( [ "$(git rev-parse HEAD)" = "$agent_head" ] && echo yes || echo no )"
+    warned="$(printf '%s' "$msg" | grep 'git rm --cached' | grep -q 'no session commit' && echo yes || echo no)"
+    printf 'SAME=%s WARNED=%s' "$same" "$warned"
+)"
+if [ "$outsk" = "SAME=yes WARNED=yes" ]; then
+    pass "failed check: no session commit and the git rm --cached warning"
+else
+    fail "a failed untrack check still let the session commit" "got: $outsk"
+fi
+
+# Greenfield: the branch is minted unborn. The base is the branch name, not the
+# literal HEAD, and the empty tree is the fork, so a user file the agent commits
+# comes off the tip.
+echo "Test T-greenfield-agent-self-commit: unborn mint -> base named, the user's file off the tip"
+RGS="$WORKROOT/tgreenselfcommit"
+mkdir -p "$RGS"
+outgs="$(
+    cd "$RGS" || exit 1
+    git init -q
+    git config user.email "test@loki.local"
+    git config user.name "Loki Test"
+    git config commit.gpgsign false
+    git checkout -q -b develop
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'mine\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    base="$(tr '\n' ' ' < .loki/state/base-branch.txt 2>/dev/null)"
+    printf 'print(1)\n' > app.py
+    git add -A && git commit -qm "agent checkpoint"
+    swept="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    commit_session_changes >/dev/null 2>&1
+    in_head="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    agent="$(git cat-file -e HEAD:app.py 2>/dev/null && echo yes || echo no)"
+    ondisk="$( [ "$(cat notes.txt 2>/dev/null)" = mine ] && echo yes || echo no )"
+    printf 'BASE=[%s] SWEPT=%s INHEAD=%s AGENT=%s ONDISK=%s' "$base" "$swept" "$in_head" "$agent" "$ondisk"
+)"
+if [ "$outgs" = "BASE=[develop ] SWEPT=yes INHEAD=no AGENT=yes ONDISK=yes" ]; then
+    pass "greenfield: base-branch.txt names develop; notes.txt off the tip and on disk; the agent's app.py kept"
+else
+    fail "greenfield mint recorded a bad base or left the user's file on the tip" "got: $outgs"
+fi
+
+# Greenfield where the agent commits nothing itself: the branch is still unborn
+# at the untrack step, which has nothing to check, so the session commit runs.
+echo "Test T-greenfield-preexisting-unborn: unborn branch at session end -> session commit made, user file left out"
+RGU="$WORKROOT/tgreenunborn"
+mkdir -p "$RGU"
+outgu="$(
+    cd "$RGU" || exit 1
+    git init -q
+    git config user.email "test@loki.local"
+    git config user.name "Loki Test"
+    git config commit.gpgsign false
+    git checkout -q -b develop
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    printf 'mine\n' > notes.txt
+    setup_agent_branch >/dev/null 2>&1
+    printf 'print(1)\n' > app.py
+    commit_session_changes >/dev/null 2>&1
+    agent="$(git cat-file -e HEAD:app.py 2>/dev/null && echo yes || echo no)"
+    in_head="$(git cat-file -e HEAD:notes.txt 2>/dev/null && echo yes || echo no)"
+    printf 'AGENT=%s INHEAD=%s' "$agent" "$in_head"
+)"
+if [ "$outgu" = "AGENT=yes INHEAD=no" ]; then
+    pass "greenfield, unborn at session end: app.py committed, the user's notes.txt not"
+else
+    fail "greenfield session with a pre-existing user file made no session commit (or swept the file)" "got: $outgu"
+fi
+
+# =============================================================================
 # MUTATION CHECK (non-vacuity proof for T-nested-secret-file).
 # Disable ONLY _commit_path_looks_secret (the path heuristic) AFTER sourcing
 # BRANCH_LIB, leaving the content scan intact, re-run the SAME nested-secret

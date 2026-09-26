@@ -9091,8 +9091,10 @@ setup_agent_branch() {
     [ -f .loki/.gitignore ] || printf '*\n' > .loki/.gitignore 2>/dev/null || true
 
     # Capture the ref Loki was run from. Detached HEAD yields the literal "HEAD".
+    # symbolic-ref also names an unborn branch (fresh `git init`), where
+    # rev-parse printed "HEAD" and failed, recording "HEAD" twice as the base.
     local cur=""
-    cur="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    cur="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo HEAD)"
 
     # Detached HEAD: do NOT branch, do NOT fabricate a base (LOCK A2/A6).
     if [ "$cur" = "HEAD" ]; then
@@ -9135,15 +9137,13 @@ setup_agent_branch() {
         fi
     fi
 
-    # Fresh run: persist the base branch (fresh-run-only) BEFORE branching, then
-    # mint and check out the feature branch (LOCK A2).
+    # Fresh run: mint and check out the feature branch, then persist its base
+    # (fresh-run-only, LOCK A2).
     local timestamp
     timestamp=$(date +%s)
     local branch_name="loki/session-${timestamp}-$$"
 
     mkdir -p .loki/state 2>/dev/null || true
-    # Persist the base only once per run tree; never overwrite an existing base.
-    [ ! -s .loki/state/base-branch.txt ] && printf '%s\n' "$cur" > .loki/state/base-branch.txt 2>/dev/null
 
     log_info "Branch protection enabled - creating agent branch: $branch_name (base: $cur)"
 
@@ -9171,6 +9171,15 @@ setup_agent_branch() {
     fi
     rm -f .loki/state/session-created.z 2>/dev/null
     if [ "$snap_ok" = 1 ]; then _LOKI_SNAPSHOT_THIS_RUN=1; fi
+
+    # Every mint (a refused resume included) records its own base and the
+    # commit it starts at (the empty tree when unborn); the resume paths above
+    # keep both. A base left by an earlier session can name a branch deleted
+    # since, and _loki_untrack_agent_committed_user_files then could not find
+    # the user files the agent commits.
+    printf '%s\n' "$cur" > .loki/state/base-branch.txt 2>/dev/null
+    { git rev-parse --verify -q HEAD || git hash-object -t tree /dev/null; } \
+        > .loki/state/session-start-sha 2>/dev/null
 
     # Store the branch name for later use (PR creation, cleanup)
     printf '%s\n' "$branch_name" > .loki/state/agent-branch.txt 2>/dev/null
@@ -9408,26 +9417,41 @@ os.replace(out + ".tmp", out)' "$@" 2>/dev/null
 # on its own, before the session commit: it adds no content, and no later exit
 # (a secret abort, a failed unstage) can put the files back on the branch tip.
 # Records this session's removals in .loki/state/agent-committed-user-files.z
-# and warns that the branch history still holds them. Non-zero only when the
-# removal could not be committed: the caller then makes no session commit,
-# whose `git add -A` would stage the files again.
+# and warns that the branch history still holds them. The fork is the merge
+# base with the recorded base branch, else the session's recorded start commit
+# (.loki/state/session-start-sha). Non-zero when the removal could not be
+# committed, or when neither fork resolves or the check fails (the tip may hold
+# user files): the caller then makes no session commit, whose `git add -A`
+# would stage the files again.
 _loki_untrack_agent_committed_user_files() {
     local snap=".loki/state/preexisting-untracked.z" rec=".loki/state/agent-committed-user-files.z"
-    local base="" fork="" top="" names=""
+    local base="" fork="" start="" top="" names=""
+    local unchecked="Before switching branches, run git rm --cached on each of your files the agent committed and commit, or a checkout of the base deletes them. Left uncommitted: no session commit."
     [ -s "$snap" ] || return 0
+    # No commit on the branch yet: the agent committed nothing.
+    git rev-parse --verify -q HEAD >/dev/null 2>&1 || return 0
     [ -s .loki/state/base-branch.txt ] && base="$(cat .loki/state/base-branch.txt 2>/dev/null)"
-    if ! top="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "$base" ] \
-       || ! fork="$(git merge-base HEAD "$base" 2>/dev/null)"; then
-        log_warn "Could not check whether the agent committed your pre-existing untracked files (base branch '${base:-unknown}' not found). Review $1 before pushing it."
-        return 0
+    if [ -n "$base" ]; then fork="$(git merge-base HEAD "$base" 2>/dev/null)" || fork=""; fi
+    if [ -z "$fork" ] && [ -s .loki/state/session-start-sha ]; then
+        start="$(cat .loki/state/session-start-sha 2>/dev/null)"
+        # A commit on this branch, or the empty tree of an unborn mint.
+        if git merge-base --is-ancestor "$start" HEAD 2>/dev/null \
+           || [ "$(git cat-file -t "$start" 2>/dev/null)" = tree ]; then
+            fork="$start"
+        fi
+    fi
+    if [ -z "$fork" ]; then
+        log_warn "Could not check whether the agent committed your pre-existing untracked files on $1: base branch '${base:-unknown}' not found and the recorded session start commit is missing or not on this branch. ${unchecked}"
+        return 1
     fi
     # --no-renames: a user file swept in beside a deleted tracked file must
     # read as added, not as a rename of that file.
-    if ! git -C "$top" diff --name-only -z --no-renames --diff-filter=A "$fork" HEAD > "$rec.added" 2>/dev/null \
+    if ! top="$(git rev-parse --show-toplevel 2>/dev/null)" \
+       || ! git -C "$top" diff --name-only -z --no-renames --diff-filter=A "$fork" HEAD > "$rec.added" 2>/dev/null \
        || ! _loki_covered_paths "$rec.added" "$snap" "$top" "$rec.new"; then
         rm -f "$rec.added" "$rec.new" "$rec.new.tmp"
-        log_warn "Could not check whether the agent committed your pre-existing untracked files. Review $1 before pushing it."
-        return 0
+        log_warn "Could not check whether the agent committed your pre-existing untracked files on $1. ${unchecked}"
+        return 1
     fi
     rm -f "$rec.added"
     if [ ! -s "$rec.new" ]; then
