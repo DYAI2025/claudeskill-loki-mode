@@ -78,7 +78,7 @@ _kill "loadgen"         "loadgen (the 2026-08-01 runaway)"
 # extension point obvious.
 # shellcheck disable=SC2043
 for port in 57374; do
-    pids="$(lsof -ti:"$port" 2>/dev/null || true)"
+    pids="$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)"
     if [ -n "$pids" ]; then
         if [ "$MODE" != "aggressive" ]; then
             echo "  FOUND (not freed): port $port -- re-run with --aggressive to free"

@@ -55,6 +55,11 @@ if echo "$PORT_BLOCK" | grep -q 'ps -o uid='; then
 else
     bad "port sweep does not verify uid before killing a port holder"
 fi
+if echo "$PORT_BLOCK" | grep -qE 'lsof -ti:"\$port" -sTCP:LISTEN'; then
+    ok "port sweep filters lsof to -sTCP:LISTEN (round 3 hardening)"
+else
+    bad "port sweep lsof call does not filter to -sTCP:LISTEN"
+fi
 
 # --- T2: behavioral -- a decoy matching a known-name substring survives -----
 # a default-mode (non-aggressive) run.
