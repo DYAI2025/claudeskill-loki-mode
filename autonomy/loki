@@ -34094,7 +34094,10 @@ for t in tests:
             # Generate GitHub-format report for comment
             local comment_body
             comment_body=$("$0" ci --pr --format github 2>/dev/null || echo "Loki CI report generation failed.")
-            gh pr comment "$ci_pr_number" --body "$comment_body" 2>/dev/null && \
+            # Body goes through stdin (--body-file -), never as an argv element:
+            # a large diff produces a large findings list, and a report body
+            # passed via --body overflows ARG_MAX (exit 126) instead of posting.
+            printf '%s' "$comment_body" | gh pr comment "$ci_pr_number" --body-file - 2>/dev/null && \
                 echo -e "${GREEN}Posted review comment to PR #$ci_pr_number${NC}" >&2 || \
                 echo -e "${YELLOW}Warning: Failed to post PR comment${NC}" >&2
         else
