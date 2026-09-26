@@ -57,3 +57,38 @@ One entry per decision: context, choice, why, how to reverse. Newest last.
 - Choice: remove them (or relabel them as browser-only) in a v9.x minor. A control that had no effect is a fabrication, not a feature a user depends on.
 - Why: moat property P7. Before v10.0.0 releases are additive, and deleting something that never worked adds honesty without taking away a capability.
 - Reverse: restore from `0afb6e2c^`, wired to a real endpoint.
+
+## D9. 2026-09-26: a security or sovereignty default may tighten in a v9.x minor only with an opt-out that restores the old behavior and is itself reported
+
+- Context: cycle 5 found two defaults that send data or power where the user did not choose: engine side steps sent prompts to the claude CLI when another provider was selected (P5), and the provider process inherited GH_TOKEN/GITHUB_TOKEN (P9).
+- Choice: tighten the default now. `LOKI_ALLOW_CLAUDE_SIDECALLS=1` restores claude side steps (and `doctor --airgap` reports it as required egress); `LOKI_ALLOW_AGENT_GITHUB_TOKEN=1` restores the token to the agent (and `loki start` warns). The exact value `1` is required.
+- Why: the vision's P5 says data leaves only to endpoints the user chooses; P9 says untrusted text never shares a step with the power to push. The opt-out keeps every v9.x minor additive for a user who relied on the old behavior.
+- Reverse: default the two variables to `1`.
+
+## D10. 2026-09-26: keep sonnet defaults; top, floor and routed are opt-in spellings until v10.0.0
+
+- Context: since v7.104.0 every Claude tier defaults to sonnet, so `high` and `small` dispatch sonnet on both routes. The Bun route rejected `--session-model opus` and ignored `LOKI_CLAUDE_MODEL_*`. `docs/environment-variables.md` still says high is an Opus model.
+- Choice: add `claude-opus-5-5` to the catalog (confirmed by a real CLI call) and make top, floor and routed reachable on both routes through the existing opt-in spellings (`--session-model opus`, `small` with `--allow-haiku`, `LOKI_CLAUDE_MODEL_*`). Defaults do not change.
+- Why: before v10.0.0 releases are additive, and changing what `high` or `small` dispatches changes every existing user's cost. The docs contradict each other, so this is not simply a documented-behavior bug.
+- Reverse: remove the alias values from `VALID_TIERS` in `loki-ts/src/commands/start.ts` and the opus-pin branch in `claudeModelFor`. At v10.0.0, decide whether `high`/`small` dispatch the catalog tier model.
+
+## D11. 2026-09-26: the @claude bot workflow is deleted; the issue composite is agent-only
+
+- Context: `.github/workflows/claude.yml` fed the whole issue or PR thread, including outsiders' text, to an agent holding an app token that can push; an author gate on the trigger does not remove the untrusted thread. The issue-to-pr composite action combined the agent and the push.
+- Choice: delete `claude.yml` (repo-internal, last successful run February 2026). Split `loki-issue-to-pr.yml` into an agent job (read-only token, no persisted credential) and a publish job (write token, no agent); the composite runs only the agent and refuses a persisted push token.
+- Why: moat property P9. Copied workflows pin a version tag, so existing users are unaffected until they re-pin; re-pinning without re-copying fails closed with a clear message.
+- Reverse: `git revert` the deletion; restore the PR step in `.github/actions/issue-to-pr`.
+
+## D12. 2026-09-26: council review needs unanimous APPROVE; a vote count never overrides a reproduced blocking finding
+
+- Context: a swarm proposal for cycle 5 onward would have scored HIGH-tier review as "3 of 4 approve" and let one CONCERN with a reproduction be outvoted. CLAUDE.md's SDLC fleet pattern requires unanimous APPROVE and a full council re-run on any CONCERN or REJECT. Cycle-4 round 3 was itself APPROVE, APPROVE, CONCERN, and the concern (a false PROVEN on P7) was real; a 2-of-3 or 3-of-4 count would have shipped it.
+- Choice: every review round still needs unanimous APPROVE. A HIGH-tier round may add a fourth adversarial reviewer for extra recall, but any reviewer's blocking finding with a working reproduction blocks the slice regardless of how many others voted APPROVE, and the whole council re-runs after a fix. A vote count only ever settles dissent that comes with no reproduction, and even then the default is to re-run, not to override.
+- Why: moat property P2 and the honest-verdict discipline generally. A reviewer count is exactly the kind of aggregate "looks good" the moat exists to refuse; three agreeing votes are not evidence against one reproduced defect.
+- Reverse: adopt a quorum threshold for HIGH-tier review and drop the mandatory full re-run after a CONCERN.
+
+## D13. 2026-09-26: every council or review agent pins its model explicitly
+
+- Context: cycle-4 council round 4 was launched with two of three lenses left to inherit the session model. The session model changed mid-conversation (Opus 5.5 to Sonnet 5) between launching the workflow and its lenses resolving, so a round meant to run 2 Opus + 1 Sonnet in fact ran 3 Sonnet-5 lenses. It was killed before completing and re-run correctly.
+- Choice: every council, review or HIGH-tier agent call sets `model` explicitly in the workflow script. None inherit the session model. Composition (for example "2 Opus + 1 Sonnet") is enforced by the script, not assumed from context.
+- Why: an unpinned model silently changes what was reviewed by what, and a session model change is invisible to a running workflow unless it is checked.
+- Reverse: drop the explicit `model` fields and rely on a documented session-model convention instead.
