@@ -139,111 +139,193 @@ else
     bad "web-stop smoke: foreign build killed by web stop [$T2] (want: FOREIGN_ALIVE)"
 fi
 
-# --- T3: static -- the web-app/server.py and dashboard argv-sweep kills must
-# verify process IDENTITY (cwd or argv) before killing, not just enumerate by
-# pgrep -f pattern and kill every match. Prior to this fix, cmd_web_stop
-# killed ANY "web-app/server.py" or "dashboard.server"/"dashboard/server"
-# process on the machine, in any project, with no verification -- exactly the
-# D14/D15/D16 class this file's T1 already guards for the loki-run- pattern,
-# left open here.
-if echo "$WEBSTOP_BODY" | grep -q 'this_webapp_dir'; then
-    ok "cmd_web_stop verifies cwd before killing a web-app/server.py candidate"
+# --- T3: static -- every remaining kill site in cmd_web_stop must verify
+# candidate identity through _loki_pid_looks_like_purplelab (anchored
+# interpreter + exact server_py path + uid), not a substring re-test of the
+# same pattern pgrep already matched on.
+#
+# THE CORE DEFECT THIS REPLACES (found by a 4-reviewer council, all four
+# independently): the previous "argv identity check" on the dashboard branch
+# re-tested the SAME substrings ("dashboard.server"/"dashboard/server"/
+# "uvicorn") that `pgrep -f "dashboard.server\|dashboard/server"` had already
+# matched on -- every candidate pgrep found automatically passed that check,
+# and the SIGKILL loop afterward walked the entire UNFILTERED pgrep list with
+# no check at all. A decoy `python3 <foreign>/dashboard/server.py` from an
+# unrelated directory was killed. The prior regression test's dashboard decoy
+# only "survived" because macOS's BSD pgrep treats `\|` as a literal pipe and
+# the pattern never matched anything on that platform -- a false green from a
+# platform quirk, not evidence the fix worked; on Linux procps it would kill
+# the decoy.
+#
+# Fix: the dashboard argv-sweep in cmd_web_stop was DELETED, not hardened --
+# cmd_dashboard_stop (PID-file authoritative, called before cmd_web_stop by
+# cmd_web()'s "stop" case) is the single source of truth for "our" dashboard,
+# and no argv-derived check can ever prove more than "this is A loki
+# dashboard", never "the one THIS session started". The three remaining kill
+# sites (PID-file branch, port branch, web-app/server.py orphan sweep) all now
+# route through the shared _loki_pid_looks_like_purplelab helper, which
+# collects only a verified PID before any kill loop runs.
+if echo "$WEBSTOP_CODE" | grep -qE 'pgrep -f "dashboard\.server'; then
+    bad "cmd_web_stop still runs the deleted dashboard argv-sweep pgrep (the vacuous-check regression)"
 else
-    bad "cmd_web_stop still kills any web-app/server.py machine-wide (no cwd check)"
+    ok "cmd_web_stop no longer runs a dashboard argv-sweep pgrep (deleted, not hardened)"
 fi
-if echo "$WEBSTOP_BODY" | grep -qE 'dpid_argv|dash_port_argv'; then
-    ok "cmd_web_stop verifies argv identity before killing a dashboard candidate"
+LOKI_BODY_ALL=$(cat "$LOKI")
+if echo "$LOKI_BODY_ALL" | grep -q '^_loki_pid_looks_like_purplelab()'; then
+    ok "autonomy/loki defines a shared _loki_pid_looks_like_purplelab identity helper"
 else
-    bad "cmd_web_stop still kills any dashboard.server/port holder machine-wide (no argv check)"
+    bad "autonomy/loki does not define _loki_pid_looks_like_purplelab"
 fi
-if echo "$WEBSTOP_BODY" | grep -q 'port_pid_cmd'; then
-    ok "cmd_web_stop verifies process identity before killing the Purple Lab port holder"
+# Every one of the three remaining kill sites must call the shared helper --
+# count occurrences inside the function body, not just check for one.
+HELPER_CALLS=$(echo "$WEBSTOP_BODY" | grep -c '_loki_pid_looks_like_purplelab "')
+if [ "$HELPER_CALLS" -ge 3 ]; then
+    ok "cmd_web_stop calls _loki_pid_looks_like_purplelab at all 3 remaining kill sites ($HELPER_CALLS calls)"
 else
-    bad "cmd_web_stop still kills whoever holds the Purple Lab port unverified"
+    bad "cmd_web_stop calls _loki_pid_looks_like_purplelab fewer than 3 times ($HELPER_CALLS) -- a kill site is unverified"
+fi
+# The helper itself must anchor on argv[1] EXACTLY equal to server_py, not a
+# substring -- `case "$argv1" in *server.py*)` would still be vacuous (matches
+# vim/tail/grep on the same path).
+HELPER_BODY=$(echo "$LOKI_BODY_ALL" | awk '/^_loki_pid_looks_like_purplelab\(\) \{/,/^\}/')
+if echo "$HELPER_BODY" | grep -qE '\[ "\$argv1" = "\$_want" \]'; then
+    ok "_loki_pid_looks_like_purplelab requires argv[1] EXACTLY equal to server_py (not a substring)"
+else
+    bad "_loki_pid_looks_like_purplelab does not require exact argv[1] equality -- still substring-vacuous"
+fi
+if echo "$HELPER_BODY" | grep -q '_p_uid.*=.*_my_uid'; then
+    ok "_loki_pid_looks_like_purplelab requires uid match (shared SKILL_DIR install path)"
+else
+    bad "_loki_pid_looks_like_purplelab does not require a uid match"
 fi
 
-# --- T3 behavioral: a foreign, unrelated web-app/server.py and dashboard
-# process (distinct cwd, distinct port, no relationship to this run except a
-# matching argv substring) must SURVIVE `loki web stop`. Each decoy records
-# its own PID immediately after backgrounding -- never derived from a pattern
-# match against real process argv -- and carries a unique per-run token so no
-# assertion can ever be satisfied by matching a real, unrelated process.
-T3=$(
+# --- T3 behavioral, part A: a FOREIGN web-app/server.py -- one that WOULD
+# match the old pgrep -f "web-app/server.py" pattern, launched with a REAL
+# python3 interpreter (so argv[0] passes the interpreter-token check too) but
+# at a path under a DIFFERENT, foreign SKILL_DIR than this test's own
+# REPO_ROOT -- must SURVIVE `loki web stop`. This is the exact shape the
+# council reproduced killing pre-fix: a decoy that satisfies every substring
+# the old code checked, differing only in the one thing identity actually
+# requires (the exact server_py path). The decoy records its own PID
+# immediately after backgrounding -- never derived from a pattern match
+# against real process argv.
+T3A=$(
   set -u
-  SBX_HOME=$(mktemp -d "${TMPDIR:-/tmp}/loki-webstop3-home-XXXXXX")
-  FOREIGN_CWD=$(mktemp -d "${TMPDIR:-/tmp}/loki-webstop3-foreign-XXXXXX")
-  TOKEN="webstop3-$$-${RANDOM}-$(date +%s 2>/dev/null || echo 0)"
+  SBX_HOME=$(mktemp -d "${TMPDIR:-/tmp}/loki-webstop3a-home-XXXXXX")
+  FOREIGN_SKILL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/loki-webstop3a-foreign-XXXXXX")
+  mkdir -p "$FOREIGN_SKILL_DIR/web-app"
+  # A real, syntactically valid server.py at the foreign path so `python3
+  # <path>` is a genuine, sustained process (matches argv[0]=python AND
+  # argv[1]=<the foreign path> exactly), not a decoy that merely mentions the
+  # string in a comment or argument.
+  cat > "$FOREIGN_SKILL_DIR/web-app/server.py" <<'PYEOF'
+import time
+time.sleep(30)
+PYEOF
+  PY_BIN="$(command -v python3.12 || command -v python3)"
+  "$PY_BIN" "$FOREIGN_SKILL_DIR/web-app/server.py" &
+  FOREIGN_PID=$!
+  sleep 0.4
 
-  # cmd_dashboard_stop() (called by `loki web stop` BEFORE cmd_web_stop, under
-  # this file's set -euo pipefail) does `exit 0` -- not `return` -- the instant
-  # $HOME/.loki/dashboard/dashboard.pid is absent, which would terminate the
-  # whole process before cmd_web_stop's kills ever run and make this
-  # behavioral check pass vacuously regardless of the fix under test. Seed a
-  # live, harmless PID (a throwaway sleep, never touched by the assertions
-  # below) so cmd_dashboard_stop takes its normal kill-and-continue path
-  # instead of the early exit, and control genuinely reaches cmd_web_stop.
-  mkdir -p "$SBX_HOME/.loki/dashboard"
-  sleep 60 & DASH_PLACEHOLDER_PID=$!
-  echo "$DASH_PLACEHOLDER_PID" > "$SBX_HOME/.loki/dashboard/dashboard.pid"
-
-  # Decoy A: mimics "web-app/server.py" in argv, from an unrelated cwd. Uses
-  # perl (not python3) so it cannot BE the real dashboard/web-app process, and
-  # writes its own pid to a file right after $0 rewrite.
-  WEBAPP_PIDFILE="$FOREIGN_CWD/webapp.pid"
-  ( cd "$FOREIGN_CWD" && perl -e '
-      open(my $f, ">", $ARGV[0]) or die $!;
-      print $f $$;
-      close $f;
-      $0 = $ARGV[1];
-      sleep 30;
-  ' "$WEBAPP_PIDFILE" "perl web-app/server.py --loki-test-$TOKEN" >/dev/null 2>&1 & )
-  i=0
-  while [ $i -lt 30 ]; do [ -s "$WEBAPP_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
-  WEBAPP_PID=$(cat "$WEBAPP_PIDFILE" 2>/dev/null || true)
-
-  # Decoy B: mimics "dashboard.server"/"uvicorn" in argv, from an unrelated
-  # cwd and an unrelated port.
-  DASH_PIDFILE="$FOREIGN_CWD/dash.pid"
-  ( cd "$FOREIGN_CWD" && perl -e '
-      open(my $f, ">", $ARGV[0]) or die $!;
-      print $f $$;
-      close $f;
-      $0 = $ARGV[1];
-      sleep 30;
-  ' "$DASH_PIDFILE" "perl dashboard.server --loki-test-$TOKEN" >/dev/null 2>&1 & )
-  i=0
-  while [ $i -lt 30 ]; do [ -s "$DASH_PIDFILE" ] && break; sleep 0.1; i=$((i+1)); done
-  DASH_PID=$(cat "$DASH_PIDFILE" 2>/dev/null || true)
-
-  if [ -z "$WEBAPP_PID" ] || ! kill -0 "$WEBAPP_PID" 2>/dev/null || \
-     [ -z "$DASH_PID" ] || ! kill -0 "$DASH_PID" 2>/dev/null; then
-    echo "DECOYS_DID_NOT_START"
+  if [ -z "$FOREIGN_PID" ] || ! kill -0 "$FOREIGN_PID" 2>/dev/null; then
+    echo "DECOY_DID_NOT_START"
+  elif ! pgrep -f "web-app/server.py" 2>/dev/null | grep -qx "$FOREIGN_PID"; then
+    echo "POSITIVE_CONTROL_FAILED"
   else
+    mkdir -p "$SBX_HOME/.loki/dashboard"
+    sleep 60 & DASH_PLACEHOLDER_PID=$!
+    echo "$DASH_PLACEHOLDER_PID" > "$SBX_HOME/.loki/dashboard/dashboard.pid"
     TBIN=""
     command -v timeout >/dev/null 2>&1 && TBIN="timeout 20"
     command -v gtimeout >/dev/null 2>&1 && [ -z "$TBIN" ] && TBIN="gtimeout 20"
+    # SKILL_DIR is THIS test's own repo root, deliberately different from
+    # FOREIGN_SKILL_DIR where the decoy's server.py actually lives -- proving
+    # the identity check is path-exact, not "any web-app/server.py".
     ( cd "$SBX_HOME" && HOME="$SBX_HOME" LOKI_DIR="$SBX_HOME/.loki" \
         SKILL_DIR="$REPO_ROOT" LOKI_DASHBOARD_PORT=59992 \
         $TBIN bash "$LOKI" web stop >/dev/null 2>&1 )
     sleep 0.6
-    if kill -0 "$WEBAPP_PID" 2>/dev/null && kill -0 "$DASH_PID" 2>/dev/null; then
-      echo "BOTH_ALIVE"
-    elif ! kill -0 "$WEBAPP_PID" 2>/dev/null; then
-      echo "WEBAPP_KILLED"
+    if kill -0 "$FOREIGN_PID" 2>/dev/null; then
+      echo "FOREIGN_ALIVE"
     else
-      echo "DASH_KILLED"
+      echo "FOREIGN_KILLED"
     fi
+    kill -9 "$DASH_PLACEHOLDER_PID" 2>/dev/null || true
   fi
 
-  kill -9 "$WEBAPP_PID" 2>/dev/null || true
-  kill -9 "$DASH_PID" 2>/dev/null || true
-  kill -9 "$DASH_PLACEHOLDER_PID" 2>/dev/null || true
-  rm -rf "$SBX_HOME" "$FOREIGN_CWD"
+  kill -9 "$FOREIGN_PID" 2>/dev/null || true
+  rm -rf "$SBX_HOME" "$FOREIGN_SKILL_DIR"
 )
-if [ "$T3" = "BOTH_ALIVE" ]; then
-    ok "foreign web-app/server.py and dashboard decoys survive 'loki web stop' (identity-checked)"
+case "$T3A" in
+    FOREIGN_ALIVE)
+        ok "foreign web-app/server.py (matches old pattern, wrong SKILL_DIR) survives 'loki web stop'"
+        ;;
+    POSITIVE_CONTROL_FAILED)
+        bad "positive control failed: pgrep cannot even enumerate the foreign decoy on this platform -- a FOREIGN_ALIVE result would be vacuous"
+        ;;
+    DECOY_DID_NOT_START)
+        bad "foreign decoy did not start (test setup broken, not the function under test)"
+        ;;
+    *)
+        bad "web-stop identity check: foreign web-app/server.py decoy killed [$T3A] (want: FOREIGN_ALIVE) -- the bug is still present"
+        ;;
+esac
+
+# --- T3 behavioral, part B: cmd_web_stop must still kill ITS OWN, genuine
+# Purple Lab server (proving the fix did not just delete all kill logic). A
+# real python3 process is launched at THIS repo's own web-app/server.py path
+# (argv[1] exactly matches what _loki_pid_looks_like_purplelab expects for
+# SKILL_DIR=$REPO_ROOT), its pid recorded in the PID file cmd_web_stop reads.
+T3B=$(
+  set -u
+  SBX_HOME=$(mktemp -d "${TMPDIR:-/tmp}/loki-webstop3b-home-XXXXXX")
+  # Do NOT actually import/run the real web-app/server.py (a FastAPI/uvicorn
+  # app -- it could bind the real Purple Lab port or crash on a missing
+  # dependency, both wrong for a unit test). Instead use perl's $0 rewrite
+  # (portable, already proven in decoy A above) to present EXACTLY the real
+  # server_py path as argv[1] on a harmless sleep -- `ps` (what the identity
+  # helper reads) sees the identical command line python3 would produce for a
+  # genuine launch, but nothing actually imports the app.
+  PY_BIN="$(command -v python3.12 || command -v python3)"
+  perl -e '
+      $0 = "'"$PY_BIN"' '"$REPO_ROOT"'/web-app/server.py";
+      sleep 30;
+  ' &
+  OWN_PID=$!
+  sleep 0.4
+
+  if [ -z "$OWN_PID" ] || ! kill -0 "$OWN_PID" 2>/dev/null; then
+    echo "OWN_SERVER_DID_NOT_START"
+  else
+    mkdir -p "$SBX_HOME/.loki/purple-lab"
+    echo "$OWN_PID" > "$SBX_HOME/.loki/purple-lab/purple-lab.pid"
+    mkdir -p "$SBX_HOME/.loki/dashboard"
+    sleep 60 & DASH_PLACEHOLDER_PID=$!
+    echo "$DASH_PLACEHOLDER_PID" > "$SBX_HOME/.loki/dashboard/dashboard.pid"
+    TBIN=""
+    command -v timeout >/dev/null 2>&1 && TBIN="timeout 20"
+    command -v gtimeout >/dev/null 2>&1 && [ -z "$TBIN" ] && TBIN="gtimeout 20"
+    ( cd "$SBX_HOME" && HOME="$SBX_HOME" LOKI_DIR="$SBX_HOME/.loki" \
+        SKILL_DIR="$REPO_ROOT" LOKI_DASHBOARD_PORT=59993 \
+        $TBIN bash "$LOKI" web stop >/dev/null 2>&1 )
+    sleep 1
+    if kill -0 "$OWN_PID" 2>/dev/null; then
+      echo "OWN_SERVER_SURVIVED"
+    else
+      echo "OWN_SERVER_KILLED"
+    fi
+    kill -9 "$DASH_PLACEHOLDER_PID" 2>/dev/null || true
+  fi
+
+  kill -9 "$OWN_PID" 2>/dev/null || true
+  rm -rf "$SBX_HOME"
+)
+if [ "$T3B" = "OWN_SERVER_KILLED" ]; then
+    ok "cmd_web_stop still kills ITS OWN genuine Purple Lab server (identity check does not just refuse everything)"
+elif [ "$T3B" = "OWN_SERVER_DID_NOT_START" ]; then
+    bad "own-server test setup broken (not the function under test): $T3B"
 else
-    bad "web-stop identity check: foreign decoy(s) killed [$T3] (want: BOTH_ALIVE) -- the bug is still present"
+    bad "cmd_web_stop failed to kill its own genuine Purple Lab server [$T3B] -- identity check is over-restrictive, not just fixed"
 fi
 
 # --- T4 hygiene: no em dashes in changed files -----------------------------

@@ -7773,6 +7773,51 @@ PURPLE_LAB_DEFAULT_HOST="127.0.0.1"
 PURPLE_LAB_STATE_DIR="${HOME}/.loki/purple-lab"
 PURPLE_LAB_PID_FILE="${PURPLE_LAB_STATE_DIR}/purple-lab.pid"
 
+# Is this pid positively identified as THIS installation's Purple Lab server
+# (cmd_web_start launches exactly `$DASHBOARD_PYTHON $SKILL_DIR/web-app/server.py`
+# at :8078), rather than a recycled pid, a decoy that merely mentions the path
+# in an argument, or another installation's server.py at a different SKILL_DIR?
+#
+# A substring match on the path is NOT identity: `vim server.py`, `tail -f
+# server.py`, or `grep server.py x` in the exact web-app dir would all pass a
+# naive `case "$cmd" in *server.py*)`. This instead tokenizes the full command
+# line and requires: (1) argv[0] is an (optionally path-qualified) python
+# interpreter -- covers "python3", "/usr/bin/python3.12", and the macOS
+# Python.app framework binary; (2) argv[1] is EXACTLY this installation's
+# absolute web-app/server.py path, not a substring of it; (3) the process is
+# owned by this user (SKILL_DIR is frequently a shared global install path, so
+# uid alone rules out a same-path process started by someone else).
+# Fails closed: an absent/unreadable `ps` result, or anything this cannot
+# positively parse, returns "not a match" -- never signal on ambiguity.
+_loki_pid_looks_like_purplelab() {
+    local _p="$1" _cmd _want _my_uid _p_uid
+    case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_p" -gt 1 ] 2>/dev/null || return 1
+    _want="${SKILL_DIR}/web-app/server.py"
+    [ -f "$_want" ] || return 1
+    _cmd="$(ps -o command= -p "$_p" 2>/dev/null)"
+    [ -n "$_cmd" ] || return 1
+    _my_uid="$(id -u 2>/dev/null)" || return 1
+    _p_uid="$(ps -o uid= -p "$_p" 2>/dev/null | tr -d ' ')"
+    [ -n "$_p_uid" ] && [ "$_p_uid" = "$_my_uid" ] || return 1
+    # Tokenize without glob expansion or command substitution (bash 3.2 safe):
+    # `set -f` in this function's own subshell-free scope would leak, so do it
+    # in a nested subshell and echo the verdict back.
+    (
+        set -f
+        # shellcheck disable=SC2086
+        set -- $_cmd
+        argv0="${1:-}"
+        argv1="${2:-}"
+        case "$argv0" in
+            */[Pp]ython*|[Pp]ython*) ;;
+            *) exit 1 ;;
+        esac
+        [ "$argv1" = "$_want" ] || exit 1
+        exit 0
+    )
+}
+
 cmd_web() {
     local subcommand="${1:-start}"
 
@@ -8044,25 +8089,35 @@ cmd_web_start() {
         fi
     fi
 
-    # Check if port is already in use -- try to clean up orphaned processes
+    # Check if port is already in use -- try to clean up orphaned processes.
+    # Only kill it if it is positively identified as THIS installation's own
+    # Purple Lab server (never a bare "it's listening on our port" guess): an
+    # unrelated process bound to the same port, or another installation's
+    # server, must never be signaled.
     if lsof -i:"$port" -sTCP:LISTEN &> /dev/null; then
         local blocking_pid
         blocking_pid=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
         if [ -n "$blocking_pid" ]; then
-            echo -e "${YELLOW}Port $port in use by PID $blocking_pid -- stopping it...${NC}"
-            kill "$blocking_pid" 2>/dev/null
-            sleep 1
-            if kill -0 "$blocking_pid" 2>/dev/null; then
-                kill -9 "$blocking_pid" 2>/dev/null
+            if _loki_pid_looks_like_purplelab "$blocking_pid"; then
+                echo -e "${YELLOW}Port $port in use by PID $blocking_pid -- stopping it...${NC}"
+                kill "$blocking_pid" 2>/dev/null
                 sleep 1
-            fi
-            # Verify port is now free
-            if lsof -i:"$port" -sTCP:LISTEN &> /dev/null; then
-                echo -e "${RED}Error: Could not free port $port${NC}"
-                echo "Use --port to specify a different port, or manually kill the process."
+                if kill -0 "$blocking_pid" 2>/dev/null; then
+                    kill -9 "$blocking_pid" 2>/dev/null
+                    sleep 1
+                fi
+                # Verify port is now free
+                if lsof -i:"$port" -sTCP:LISTEN &> /dev/null; then
+                    echo -e "${RED}Error: Could not free port $port${NC}"
+                    echo "Use --port to specify a different port, or manually kill the process."
+                    exit 1
+                fi
+                echo -e "${GREEN}Port $port freed.${NC}"
+            else
+                echo -e "${RED}Error: Port $port is in use by PID $blocking_pid, which is not this installation's Purple Lab server.${NC}"
+                echo "Use --port to specify a different port, or manually stop that process."
                 exit 1
             fi
-            echo -e "${GREEN}Port $port freed.${NC}"
         fi
     fi
 
@@ -8149,7 +8204,11 @@ cmd_web_stop() {
     curl -s --max-time 3 -X POST "http://127.0.0.1:${port}/api/session/stop" >/dev/null 2>&1 || true
     sleep 1
 
-    # Try PID file first (check global location, then local)
+    # Try PID file first (check global location, then local). Identity is
+    # verified with _loki_pid_looks_like_purplelab (anchored interpreter +
+    # exact server_py path + uid match), not a loose comm-name substring: a
+    # decoy or another installation's process merely named "python" would
+    # otherwise pass the old check.
     local pid_file="$PURPLE_LAB_PID_FILE"
     if [ ! -f "$pid_file" ]; then
         pid_file="${LOKI_DIR}/purple-lab/purple-lab.pid"
@@ -8158,10 +8217,7 @@ cmd_web_stop() {
         local pid
         pid=$(cat "$pid_file" 2>/dev/null)
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            # Verify the PID belongs to a Purple Lab/Python process (PID recycling guard)
-            local pid_cmd
-            pid_cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-            if [[ "$pid_cmd" == *python* ]] || [[ "$pid_cmd" == *uvicorn* ]] || [[ "$pid_cmd" == *Purple* ]]; then
+            if _loki_pid_looks_like_purplelab "$pid"; then
                 kill "$pid" 2>/dev/null
                 sleep 1
                 if kill -0 "$pid" 2>/dev/null; then
@@ -8170,23 +8226,19 @@ cmd_web_stop() {
                 echo -e "${GREEN}Purple Lab stopped (PID: $pid)${NC}"
                 stopped=true
             else
-                echo -e "${YELLOW}PID $pid is not a Purple Lab process (found: $pid_cmd), skipping${NC}"
+                echo -e "${YELLOW}PID $pid is not this installation's Purple Lab process, skipping${NC}"
             fi
         fi
         rm -f "$PURPLE_LAB_PID_FILE"
     fi
 
     # Also kill any process on the port (catches orphans without PID file).
-    # Verify process IDENTITY first (same comm-name guard as the PID-file
-    # branch above) so this never kills an unrelated process that merely
-    # happens to be listening on the same port (D14/D15/D16 class: a
-    # port/pattern-derived PID must be verified as OURS before it is signaled).
+    # Same identity check as above: a port/pattern-derived PID must be
+    # positively identified as OURS before it is signaled (D14/D15/D16 class).
     local port_pid
     port_pid=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
     if [ -n "$port_pid" ]; then
-        local port_pid_cmd
-        port_pid_cmd=$(ps -p "$port_pid" -o comm= 2>/dev/null || true)
-        if [[ "$port_pid_cmd" == *python* ]] || [[ "$port_pid_cmd" == *uvicorn* ]] || [[ "$port_pid_cmd" == *Purple* ]]; then
+        if _loki_pid_looks_like_purplelab "$port_pid"; then
             kill "$port_pid" 2>/dev/null
             sleep 1
             if kill -0 "$port_pid" 2>/dev/null; then
@@ -8197,31 +8249,23 @@ cmd_web_stop() {
             fi
             stopped=true
         else
-            echo -e "${YELLOW}Port $port is held by a non-Purple-Lab process (found: $port_pid_cmd), leaving it alone${NC}"
+            echo -e "${YELLOW}Port $port is held by a process that is not this installation's Purple Lab server, leaving it alone${NC}"
         fi
     fi
 
     # Also kill any orphan web-app/server.py processes (catches processes from
     # other CWDs). pgrep -f only ENUMERATES candidates by argv substring; each
-    # candidate's cwd must equal THIS project's web-app dir before it is
-    # killed, or this reaps an unrelated project's web-app/server.py anywhere
-    # on the machine (the exact bug class fixed in FIX-563 below for
-    # loki-run-*, never closed here).
-    local orphan_pids this_webapp_dir
-    this_webapp_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../web-app" 2>/dev/null && pwd -P || true)"
+    # candidate must then pass _loki_pid_looks_like_purplelab before being
+    # killed. (The previous cwd-equality check here was dead in practice --
+    # server.py never calls chdir, so its cwd is whatever launched it, not the
+    # web-app dir -- and even when it matched, cwd alone is not identity: an
+    # unrelated python process merely launched FROM that directory would also
+    # pass. argv identity via the shared helper covers both gaps.)
+    local orphan_pids
     orphan_pids=$(pgrep -f "web-app/server.py" 2>/dev/null || true)
-    if [ -n "$orphan_pids" ] && [ -n "$this_webapp_dir" ]; then
+    if [ -n "$orphan_pids" ]; then
         for opid in $orphan_pids; do
-            if kill -0 "$opid" 2>/dev/null; then
-                local opid_cwd=""
-                if [ -r "/proc/$opid/cwd" ]; then
-                    opid_cwd="$(cd "/proc/$opid/cwd" 2>/dev/null && pwd -P || true)"
-                else
-                    opid_cwd="$(lsof -a -p "$opid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
-                fi
-                if [ "$opid_cwd" != "$this_webapp_dir" ]; then
-                    continue
-                fi
+            if kill -0 "$opid" 2>/dev/null && _loki_pid_looks_like_purplelab "$opid"; then
                 kill "$opid" 2>/dev/null
                 sleep 1
                 if kill -0 "$opid" 2>/dev/null; then
@@ -8265,55 +8309,28 @@ cmd_web_stop() {
         rm -f "$pids_file" 2>/dev/null || true
     fi
 
-    # Companion cleanup: stop the dashboard server that the web UI runs
-    # alongside. Scoped to the dashboard, NOT to every loki process: the
-    # documented intent of "loki web stop" is to stop the Purple Lab web UI
-    # session, not to reap unrelated builds.
-
-    # Kill any dashboard server (by process name and by port). pgrep -f and
-    # lsof -ti only ENUMERATE candidates by argv substring / port ownership;
-    # each candidate's own argv must actually mention "dashboard.server" or
-    # "uvicorn" before it is killed, or this reaps ANY unrelated process an
-    # attacker-free but unlucky argv match happens to catch machine-wide, or
-    # whoever else is listening on the dashboard port -- the same D14/D15/D16
-    # class this function's own FIX-563 comment below claims to have avoided.
-    local dash_port="${LOKI_DASHBOARD_PORT:-57374}"
-    local dash_pids
-    dash_pids=$(pgrep -f "dashboard.server\|dashboard/server" 2>/dev/null || true)
-    if [ -n "$dash_pids" ]; then
-        for dpid in $dash_pids; do
-            local dpid_argv
-            dpid_argv=$(ps -p "$dpid" -o args= 2>/dev/null || true)
-            case "$dpid_argv" in
-                *dashboard.server*|*dashboard/server*|*uvicorn*) ;;
-                *) continue ;;
-            esac
-            kill "$dpid" 2>/dev/null || true
-        done
-        sleep 1
-        for dpid in $dash_pids; do
-            kill -0 "$dpid" 2>/dev/null && kill -9 "$dpid" 2>/dev/null || true
-        done
-        echo "Loki Dashboard stopped"
-    fi
-    # Also kill by port, but only after confirming the port's owner is
-    # actually a dashboard process (same argv check as above).
-    local dash_port_pid
-    dash_port_pid=$(lsof -ti:"$dash_port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-    if [ -n "$dash_port_pid" ]; then
-        local dash_port_argv
-        dash_port_argv=$(ps -p "$dash_port_pid" -o args= 2>/dev/null || true)
-        case "$dash_port_argv" in
-            *dashboard.server*|*dashboard/server*|*uvicorn*)
-                kill "$dash_port_pid" 2>/dev/null || true
-                sleep 1
-                kill -0 "$dash_port_pid" 2>/dev/null && kill -9 "$dash_port_pid" 2>/dev/null || true
-                ;;
-            *)
-                echo -e "${YELLOW}Port $dash_port is held by a non-dashboard process, leaving it alone${NC}"
-                ;;
-        esac
-    fi
+    # Companion cleanup: the dashboard server that the web UI runs alongside
+    # is already stopped by cmd_dashboard_stop, called before this function by
+    # cmd_web()'s "stop" case -- that path is PID-file-authoritative and is the
+    # single source of truth for "our" dashboard. KNOWN GAP: cmd_dashboard_stop
+    # (this file) verifies only liveness (`kill -0`), not process identity --
+    # unlike autonomy/run.sh's loki_mark_project_stopped_and_maybe_kill_shared_dashboard,
+    # which additionally calls _loki_pid_looks_like_dashboard to guard against a
+    # recycled PID now naming something else. That hardening is not ported
+    # here; out of scope for this fix, noted for a follow-up.
+    #
+    # A former dashboard-argv pgrep/port sweep here was DELETED rather than
+    # hardened: any identity check reachable from argv alone (anchoring on
+    # "-m dashboard.server", the module form cmd_dashboard_start launches) can
+    # only prove "this is A loki dashboard process", never "this is the
+    # dashboard THIS session started" -- a dashboard launched from a different
+    # worktree, a different SKILL_DIR, or a concurrent CI shard passes that
+    # check identically. Re-killing "a" dashboard here duplicates
+    # cmd_dashboard_stop's job with a strictly weaker identity guarantee and
+    # was, before this fix, actually vacuous (the case-statement re-tested the
+    # exact same substrings pgrep had already matched on, and the SIGKILL pass
+    # walked the raw unfiltered pgrep list with no check at all) -- see
+    # docs/v10/DECISIONS.md D14/D15/D16.
 
     # FIX-563 (v7.30.0): do NOT blanket-kill loki-run-* orchestrators here.
     # The prior unscoped `pgrep -f "loki-run-..."` reaped EVERY orchestrator on
