@@ -829,6 +829,12 @@ loki_remote_attestation_status() {
     [ -n "$url" ] || { printf ''; return 0; }
     command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
     local tok
+    # jq's `//` treats JSON false the same as null/missing, which is exactly
+    # the semantics wanted here: `attestation: false` reads as "no attestation
+    # present" (UNSIGNED/absent), not as a malformed token. Kept as a bash-level
+    # short circuit for the unreachable-JWKS-avoidance case; the Python copy
+    # below carries the same `is False` guard so the two never diverge if this
+    # jq pre-filter is ever removed.
     tok="$(jq -r '.verification.attestation // empty' "$pj" 2>/dev/null)"
     [ -n "$tok" ] || { printf ''; return 0; }
     python3 -E - "$pj" "$url" "${_LOKI_SCRIPT_DIR}" <<'PY' 2>/dev/null || printf ''
@@ -846,7 +852,11 @@ except ImportError:
     sys.exit(1)          # -> "" : cannot check, never a verdict
 proof = json.load(open(sys.argv[1]))
 tok = (proof.get("verification") or {}).get("attestation")
-if tok is None or tok == "":
+# `attestation: false` is "no attestation present", the same fact as a missing
+# or empty-string field -- never a malformed token. `is False` only, never
+# `== False`, because `0 == False` in Python and a numeric attestation field
+# is a different (still malformed) shape that must still read as TAMPERED.
+if tok is None or tok == "" or tok is False:
     sys.exit(1)
 try:
     with urllib.request.urlopen(
@@ -854,14 +864,17 @@ try:
         jwks = json.loads(r.read())
 except Exception:
     sys.exit(1)          # unreachable JWKS is UNCHECKED, not a failure
-# A key set that is not {"keys": [{...}, ...]} is a key-set problem: UNCHECKED,
-# never an accusation against the receipt. Checked BEFORE anything below can
-# print "bad", so a bad key set can never read as TAMPERED.
+# A key set that is not {"keys": [{...}, ...]} -- INCLUDING an empty list -- is
+# a key-set problem: UNCHECKED, never an accusation against the receipt. An
+# empty keyset is an inability to check (no key was published to check
+# against), not evidence of tampering. Checked BEFORE anything below can print
+# "bad", so a bad or empty key set can never read as TAMPERED.
 _keys = jwks.get("keys") if isinstance(jwks, dict) else None
-if not isinstance(_keys, list) or not all(isinstance(k, dict) for k in _keys):
+if not isinstance(_keys, list) or not _keys or not all(isinstance(k, dict) for k in _keys):
     sys.exit(1)
 # The receipt's builder controls the token. An attestation that is not a JWT
-# string is a malformed receipt: TAMPERED, decided without any crypto.
+# string (and not the "no attestation" `false` handled above) is a malformed
+# receipt: TAMPERED, decided without any crypto.
 if not isinstance(tok, str):
     print("bad"); sys.exit(0)
 # Without `cryptography`, verify_attestation returns False and this would print
@@ -931,7 +944,12 @@ try:
 except Exception:
     sys.exit(1)
 tok = (proof.get("verification") or {}).get("attestation")
-if tok is None or tok == "":
+# `attestation: false` is "no attestation present", the same fact as a missing
+# or empty-string field -- never a malformed token. `is False` only, never
+# `== False`, because `0 == False` in Python and a numeric attestation field
+# is a different (still malformed) shape that must still read as FAILED. Same
+# guard in loki_remote_attestation_status above -- change both.
+if tok is None or tok == "" or tok is False:
     print("none"); sys.exit(0)       # a FACT about the receipt, not an error
 src = sys.argv[2]
 try:
@@ -946,15 +964,18 @@ try:
             jwks = json.loads(r.read())
 except Exception:
     sys.exit(1)                      # "" : unreachable/unreadable, no verdict
-# A key set that is not {"keys": [{...}, ...]} is a key-set problem: NOT
-# CHECKED, never an accusation. Checked BEFORE anything below can print "bad",
-# so a bad key set can never read as FAILED. Same order in
-# loki_remote_attestation_status above -- change both.
+# A key set that is not {"keys": [{...}, ...]} -- INCLUDING an empty list -- is
+# a key-set problem: NOT CHECKED, never an accusation. An empty keyset is an
+# inability to check (no key was published to check against), not evidence of
+# tampering. Checked BEFORE anything below can print "bad", so a bad or empty
+# key set can never read as FAILED. Same order in loki_remote_attestation_status
+# above -- change both.
 _keys = jwks.get("keys") if isinstance(jwks, dict) else None
-if not isinstance(_keys, list) or not all(isinstance(k, dict) for k in _keys):
+if not isinstance(_keys, list) or not _keys or not all(isinstance(k, dict) for k in _keys):
     sys.exit(1)                      # "" : cannot check
 # The receipt's builder controls the token. An attestation that is not a JWT
-# string is a malformed receipt: FAILED, decided without any crypto.
+# string (and not the "no attestation" `false` handled above) is a malformed
+# receipt: FAILED, decided without any crypto.
 if not isinstance(tok, str):
     print("bad"); sys.exit(0)
 # receipt_jwt imports without `cryptography`, and verify_attestation then

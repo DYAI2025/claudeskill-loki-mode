@@ -297,6 +297,7 @@ forms = {
     "g1hdr": b([1]) + "." + b({"receipt_sha256": "x"}) + "." + b("sig"),
     "g1dict": {"alg": "EdDSA", "kid": "k"},
     "g1num": 7,
+    "g1boolfalse": False,
 }
 for name, att in forms.items():
     q = json.loads(json.dumps(p))
@@ -328,6 +329,21 @@ if ! PATH="$NOCRYPTO_PATH" python3 -E -c "import cryptography" 2>/dev/null; then
   else
     bad "a dict attestation without cryptography: exit $_rcs, want 1 with attestation: FAILED"
   fi
+fi
+
+# --- 9b. BACKLOG 39: `attestation: false` is ABSENT, never FAILED -----------
+# `false` is the JSON value a broken client or a hand-edited receipt uses to
+# say "not attested" -- it is not a JWT string, but it is also not the
+# malformed-on-inspection shape the section-9 forms are (a header decoding to
+# [1], a dict, a bare number all imply a check was ATTEMPTED and failed). A
+# `false` reads exactly like a missing field: nothing was ever attested, so it
+# must fall into the same ABSENT bucket a stripped/omitted field uses, exit 1
+# (a key set was supplied and the receipt is unsigned), never FAILED.
+_expect 1 "$(_rc "$R" g1boolfalse --jwks "$W/gjwks.json")" "attestation: false reads ABSENT (1), not FAILED"
+grep -q "attestation: ABSENT" "$W/rc.err" \
+  || bad "attestation: false did not render ABSENT ($(grep "attestation:" "$W/rc.err" | head -1))"
+if grep -q "attestation: FAILED" "$W/rc.err"; then
+  bad "attestation: false was reported as FAILED -- a receipt with no attestation is not tampering"
 fi
 
 # The Bun entry point (bin/loki) delegates any flagged verify to this bash
@@ -368,6 +384,19 @@ for _ks in ks-dict ks-list ks-entry; do
     bad "a malformed key set ($_ks) was reported as FAILED"
   fi
 done
+
+# --- 10b. BACKLOG 39: an EMPTY key set is NOT CHECKED, never FAILED ----------
+# {"keys": []} is a well-shaped key set (a JSON list of objects, vacuously
+# true) so it slipped past the section-10 shape guard and fell all the way
+# through to verify_attestation, which found no matching kid and printed
+# "bad" -- FAILED (exit 1), reading as tampering. An empty keyset is an
+# inability to check (nothing was published to check against), the same fact
+# as a malformed key set, not evidence against the receipt.
+printf '%s' '{"keys": []}' >"$W/ks-empty.json"
+_expect 2 "$(_rc "$R" g1 --jwks "$W/ks-empty.json")" "an empty key set ({\"keys\": []}) is NOT CHECKED"
+if grep -q "attestation: FAILED" "$W/rc.err"; then
+  bad "an empty key set was reported as FAILED -- an inability to check read as tampering"
+fi
 
 # --- 11. A mistyped flag is a usage error, not a skipped check ---------------
 # "--jwk keys.json" and "-jwks keys.json" used to be read as extra positionals
@@ -580,6 +609,47 @@ if command -v jq >/dev/null 2>&1; then
     ok "remote render: a dict attestation is TAMPERED without cryptography too"
   else
     bad "remote render: dict attestation without cryptography returned $_rr, want 1 TAMPERED ($(head -1 "$W/render.out"))"
+  fi
+
+  # --- BACKLOG 39, remote route: an EMPTY key set is NOT CHECKED ------------
+  # {"keys": []} is well-shaped (a list of objects, vacuously) so it slipped
+  # past the shape guard in loki_remote_attestation_status and fell through to
+  # verify_attestation, which found no matching kid and printed "bad" -- the
+  # CONSUMER (loki_remote_verify_receipt) then rendered TAMPERED for an
+  # inability to check, not evidence against the receipt.
+  mkdir -p "$W/srv-empty/.well-known"
+  printf '%s' '{"keys": []}' >"$W/srv-empty/.well-known/jwks.json"
+  _r_empty="$(_LOKI_SCRIPT_DIR="$REPO_ROOT/autonomy" bash -c "
+    source '$W/remote.sh'; loki_remote_attestation_status '$R/.loki/proofs/g1/proof.json' 'file://$W/srv-empty'")"
+  if [ -z "$_r_empty" ]; then
+    ok "remote check: an empty key set yields no verdict (not 'bad')"
+  else
+    bad "remote check: an empty key set produced '$_r_empty', want '' (NOT CHECKED)"
+  fi
+  _render_srv() {  # <id> <srv-dir> -> return code; output in $W/render.out
+    _LOKI_SCRIPT_DIR="$REPO_ROOT/autonomy" bash -c "
+      source '$W/remote.sh'; loki_remote_verify_receipt '$R/.loki/proofs/$1/proof.json' 'file://$2'" \
+      >"$W/render.out" 2>&1
+    echo "$?"
+  }
+  _rr="$(_render_srv g1 "$W/srv-empty")"
+  if grep -q "NOT CHECKED" "$W/render.out" && ! grep -qE "TAMPERED|FAILED" "$W/render.out"; then
+    ok "remote render: an empty key set is NOT CHECKED, never TAMPERED (return $_rr)"
+  else
+    bad "remote render: empty key set returned $_rr ($(head -1 "$W/render.out")), want NOT CHECKED"
+  fi
+
+  # --- BACKLOG 39, remote route: attestation: false reads consistently -----
+  # jq's `// empty` already treats JSON false as missing, short-circuiting
+  # loki_remote_attestation_status to '' before Python runs -- so the render
+  # falls through to the same UNSIGNED branch a genuinely absent attestation
+  # takes. Measured through the CONSUMER so a future change to either copy is
+  # caught here, matching the local route's g1boolfalse case in section 9b.
+  _rr="$(_render_srv g1boolfalse "$W/srv")"
+  if grep -q "UNSIGNED" "$W/render.out" && ! grep -qE "TAMPERED|FAILED" "$W/render.out"; then
+    ok "remote render: attestation: false reads UNSIGNED, never TAMPERED (return $_rr)"
+  else
+    bad "remote render: attestation: false returned $_rr ($(head -1 "$W/render.out")), want UNSIGNED"
   fi
 else
   echo "  SKIP: jq not installed -- remote dependency guard not measured"
