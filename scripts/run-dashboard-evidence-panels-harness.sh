@@ -15,6 +15,9 @@
 #   - one receipt with cost_usd null  -> must render "-", never "$0.00"
 #   - that receipt is NOT VERIFIED    -> must survive to the pixel unsoftened
 #   - budget_limit absent             -> must say "no spend cap", never imply one
+#   - one MEASURED zero-cost record   -> spend renders "$0.00" (the positive
+#                                        control; with no record at all the
+#                                        server now sends null, not 0)
 # A fixture that drifted with the repo could silently stop exercising any of
 # those three, which is how the unit tests underneath this passed while the
 # real page rendered nothing.
@@ -81,6 +84,16 @@ cat > "$SEED/.loki/state/relevant-learnings.json" <<'JSON'
 JSON
 
 # No budget file at all -> budget_limit null -> the UI must SAY there is no cap.
+
+# A MEASURED zero: real observed tokens, provider-reported cost 0.0. This is
+# what the "$0.00 still renders" positive control needs. It used to pass on an
+# EMPTY efficiency dir, because /api/budget answered current_cost 0.0 for a run
+# nobody measured; that fabricated zero is gone (it is null now), so the
+# control needs a real measurement to stand on.
+mkdir -p "$SEED/.loki/metrics/efficiency" || exit 2
+cat > "$SEED/.loki/metrics/efficiency/iteration-1.json" <<'JSON'
+{"iteration": 1, "model": "sonnet", "phase": "build", "input_tokens": 1200, "output_tokens": 300, "cost_usd": 0.0}
+JSON
 
 # 2. Boot against the seed.
 lsof -ti:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null

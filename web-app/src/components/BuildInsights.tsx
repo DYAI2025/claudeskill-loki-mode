@@ -12,25 +12,27 @@ interface PhaseBreakdown {
   percentage: number;
 }
 
+// Every metric below that the caller cannot measure is null, and renders as
+// "Not recorded". A 0 here would be a reading nobody took.
 interface BuildInsightsProps {
   /** Number of files created */
   filesCreated: number;
-  /** Number of files modified */
-  filesModified: number;
-  /** Total lines of code generated */
-  linesGenerated: number;
-  /** Number of tests generated */
-  testsGenerated: number;
-  /** Test pass rate (0-1) */
-  testPassRate: number;
-  /** Total token usage */
-  totalTokens: number;
+  /** Number of files modified; null when not recorded */
+  filesModified: number | null;
+  /** Total lines of code generated; null when not recorded */
+  linesGenerated: number | null;
+  /** Number of tests generated; null when not recorded */
+  testsGenerated: number | null;
+  /** Test pass rate (0-1); null when not recorded */
+  testPassRate: number | null;
+  /** Total token usage; null when not recorded */
+  totalTokens: number | null;
   /** Token breakdown by phase */
   phaseBreakdown: PhaseBreakdown[];
   /** Total build time in seconds */
   totalTimeSecs: number;
-  /** Quality gate score (0-100) */
-  qualityScore: number;
+  /** Quality gate score (0-100); null when not recorded */
+  qualityScore: number | null;
   /** Total cost in dollars; null when no cost was recorded */
   totalCost: number | null;
   /** Number of iterations */
@@ -58,6 +60,12 @@ function formatTime(seconds: number): string {
 function formatLinesOfCode(count: number): string {
   if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
   return String(count);
+}
+
+const NOT_RECORDED = 'Not recorded';
+
+function orNotRecorded(v: number | null, format: (n: number) => string): string {
+  return v === null ? NOT_RECORDED : format(v);
 }
 
 function getQualityLabel(score: number): { label: string; color: string } {
@@ -134,9 +142,14 @@ export function BuildInsights({
   className = '',
 }: BuildInsightsProps) {
   const [expanded, setExpanded] = useState(true);
-  const quality = getQualityLabel(qualityScore);
+  // No score, no verdict: an unmeasured build is not "Needs Work".
+  const quality = qualityScore === null ? null : getQualityLabel(qualityScore);
   const maxPhaseDuration = Math.max(...phaseBreakdown.map(p => p.durationSecs), 1);
-  const costLabel = totalCost !== null ? `$${totalCost.toFixed(2)}` : 'Not recorded';
+  const costLabel = totalCost !== null ? `$${totalCost.toFixed(2)}` : NOT_RECORDED;
+  const passRateLabel = orNotRecorded(testPassRate, r => `${Math.round(r * 100)}%`);
+  const qualityLabel = qualityScore === null || quality === null
+    ? NOT_RECORDED
+    : `${qualityScore}/100 (${quality.label})`;
 
   const handleShare = () => {
     const summary = [
@@ -149,14 +162,14 @@ export function BuildInsights({
       '',
       'Output:',
       `  Files Created: ${filesCreated}`,
-      `  Files Modified: ${filesModified}`,
-      `  Lines Generated: ${linesGenerated}`,
-      `  Tests Generated: ${testsGenerated}`,
-      `  Test Pass Rate: ${Math.round(testPassRate * 100)}%`,
+      `  Files Modified: ${orNotRecorded(filesModified, String)}`,
+      `  Lines Generated: ${orNotRecorded(linesGenerated, String)}`,
+      `  Tests Generated: ${orNotRecorded(testsGenerated, String)}`,
+      `  Test Pass Rate: ${passRateLabel}`,
       '',
       'Resources:',
-      `  Total Tokens: ${formatTokens(totalTokens)}`,
-      `  Quality Score: ${qualityScore}/100 (${quality.label})`,
+      `  Total Tokens: ${orNotRecorded(totalTokens, formatTokens)}`,
+      `  Quality Score: ${qualityLabel}`,
       '',
       'Time Breakdown:',
       ...phaseBreakdown.map(p => `  ${p.label}: ${formatTime(p.durationSecs)} (${Math.round(p.percentage)}%)`),
@@ -176,13 +189,15 @@ export function BuildInsights({
           <h3 className="text-sm font-semibold text-ink uppercase tracking-wider">
             Build Insights
           </h3>
-          <span className={`text-[11px] font-medium px-2 py-0.5 rounded-pill ${
-            qualityScore >= 80 ? 'bg-success/10 text-success' :
-            qualityScore >= 60 ? 'bg-warning/10 text-warning' :
-            'bg-danger/10 text-danger'
-          }`}>
-            {quality.label}
-          </span>
+          {qualityScore !== null && quality !== null && (
+            <span className={`text-[11px] font-medium px-2 py-0.5 rounded-pill ${
+              qualityScore >= 80 ? 'bg-success/10 text-success' :
+              qualityScore >= 60 ? 'bg-warning/10 text-warning' :
+              'bg-danger/10 text-danger'
+            }`}>
+              {quality.label}
+            </span>
+          )}
         </div>
         <span className="text-muted">
           {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
@@ -196,21 +211,23 @@ export function BuildInsights({
             <StatCard
               icon={FileCode2}
               label="Files"
-              value={String(filesCreated + filesModified)}
-              subtext={`${filesCreated} new, ${filesModified} modified`}
+              value={String(filesModified === null ? filesCreated : filesCreated + filesModified)}
+              subtext={filesModified === null
+                ? `${filesCreated} new, modified not recorded`
+                : `${filesCreated} new, ${filesModified} modified`}
               iconColor="text-primary"
             />
             <StatCard
               icon={Code2}
               label="Lines of Code"
-              value={formatLinesOfCode(linesGenerated)}
+              value={orNotRecorded(linesGenerated, formatLinesOfCode)}
               iconColor="text-info"
             />
             <StatCard
               icon={TestTube2}
               label="Tests"
-              value={String(testsGenerated)}
-              subtext={`${Math.round(testPassRate * 100)}% passing`}
+              value={orNotRecorded(testsGenerated, String)}
+              subtext={testPassRate === null ? 'pass rate not recorded' : `${passRateLabel} passing`}
               iconColor="text-teal"
             />
           </div>
@@ -219,7 +236,7 @@ export function BuildInsights({
             <StatCard
               icon={Zap}
               label="Tokens Used"
-              value={formatTokens(totalTokens)}
+              value={orNotRecorded(totalTokens, formatTokens)}
               iconColor="text-warning"
             />
             <StatCard
@@ -232,9 +249,9 @@ export function BuildInsights({
             <StatCard
               icon={Shield}
               label="Quality"
-              value={`${qualityScore}`}
-              subtext={quality.label}
-              iconColor={quality.color}
+              value={orNotRecorded(qualityScore, String)}
+              subtext={quality?.label}
+              iconColor={quality?.color ?? 'text-muted'}
             />
           </div>
 

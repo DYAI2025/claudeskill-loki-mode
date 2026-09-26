@@ -481,7 +481,8 @@ export const api = {
       project_total_usd: number;
       budget: {
         limit: number | null;
-        used: number;
+        // null when a cap is set but no spend was measured (status "unknown").
+        used: number | null;
         remaining: number | null;
         percent_used: number | null;
         status: string;

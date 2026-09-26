@@ -128,8 +128,10 @@ describe('loki-analytics provider comparison', () => {
 
 describe('loki-cost-waterfall', () => {
   it('an unmeasured phase is not scaled, not a share of the total, and the total says partial', async () => {
+    // The /api/cost shape the component reads (by_phase + estimated_cost_usd).
     const el = mount(LokiCostWaterfall, async () => ({
-      phases: [{ phase: 'planning', cost_usd: null }, { phase: 'building', cost_usd: 2 }],
+      by_phase: { planning: { cost_usd: null }, building: { cost_usd: 2 } },
+      estimated_cost_usd: 2,
     }));
     await el._loadData();
     const out = markup(el.shadowRoot.innerHTML);
@@ -149,7 +151,10 @@ describe('loki-cost-waterfall', () => {
   });
 
   it('a measured zero phase still renders $0.00', async () => {
-    const el = mount(LokiCostWaterfall, async () => ({ phases: [{ phase: 'planning', cost_usd: 0 }] }));
+    const el = mount(LokiCostWaterfall, async () => ({
+      by_phase: { planning: { cost_usd: 0 } },
+      estimated_cost_usd: 0,
+    }));
     await el._loadData();
     assert.ok(markup(el.shadowRoot.innerHTML).includes('$0.00'));
   });
@@ -169,7 +174,7 @@ describe('dashboard/static/cost.html', () => {
   };
   const fns = new Function(
     `${pick('esc')}\n${pick('fmtUsd')}\n${pick('statusText')}\n${pick('renderBudget')}\n${pick('renderCurrentRun')}\n` +
-    'return { renderBudget, renderCurrentRun };')();
+    'return { renderBudget, renderCurrentRun, statusText };')();
   const points = (out) => {
     const m = /points="([^"]*)"/.exec(out);
     return m ? m[1].trim().split(/\s+/).filter(Boolean).length : 0;
@@ -194,5 +199,14 @@ describe('dashboard/static/cost.html', () => {
   it('a budget with an unknown percent is not 0.0%', () => {
     const out = fns.renderBudget({ limit: 10, used: null, remaining: null, percent_used: null, status: 'ok', warn_threshold_percent: 80 });
     assert.ok(!out.includes('0.0%'), 'unknown budget use rendered as 0.0%');
+  });
+
+  it('a cap with unknown spend says unknown, not within budget or no cap', () => {
+    // The server sends status "unknown" when a cap is set and nothing was
+    // measured. Unknown is never a pass, and the cap exists.
+    const out = fns.renderBudget({ limit: 10, used: null, remaining: null, percent_used: null, status: 'unknown', warn_threshold_percent: 80 });
+    assert.ok(!/Within budget/i.test(out), 'unknown spend rendered as within budget');
+    assert.ok(!/No budget cap set/i.test(out), 'a set cap with unknown spend rendered as no cap');
+    assert.ok(/not recorded|unknown/i.test(fns.statusText('unknown')), 'unknown status has no explicit state');
   });
 });

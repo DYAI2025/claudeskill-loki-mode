@@ -7822,7 +7822,7 @@ def _compute_cost_snapshot() -> dict:
     by_phase: dict = {}
     by_model: dict = {}
     budget_limit = None
-    budget_used = 0.0
+    budget_used = None
     budget_remaining = None
     # Did ANY record carry an observed value? Not "was a file present".
     cost_recorded = False
@@ -7927,7 +7927,10 @@ def _compute_cost_snapshot() -> dict:
             if not isinstance(budget_data, dict):
                 budget_data = {}
             budget_limit = budget_data.get("limit")
-            if budget_limit is not None:
+            # Spend against the cap only when something was measured: with
+            # nothing recorded, "used" is unknown, not $0.00, and "remaining"
+            # is unknown, not the whole cap.
+            if budget_limit is not None and cost_recorded:
                 budget_used = estimated_cost
                 budget_remaining = max(0.0, budget_limit - budget_used)
         except (json.JSONDecodeError, KeyError):
@@ -7964,7 +7967,7 @@ def _compute_cost_snapshot() -> dict:
             "cost_usd": round(v["cost_usd"], 6) if v["measured"] else None,
         } for k, v in by_model.items()},
         "budget_limit": budget_limit,
-        "budget_used": round(budget_used, 6) if budget_limit is not None else None,
+        "budget_used": round(budget_used, 6) if budget_limit is not None and budget_used is not None else None,
         "budget_remaining": round(budget_remaining, 6) if budget_remaining is not None else None,
     }
 
@@ -7978,7 +7981,7 @@ async def get_budget():
 
     # Read budget configuration
     budget_limit = None
-    budget_used = 0.0
+    budget_used = None
     exceeded = False
     exceeded_at = None
 
@@ -7992,7 +7995,7 @@ async def get_budget():
             if not isinstance(budget_data, dict):
                 budget_data = {}
             budget_limit = budget_data.get("limit") or budget_data.get("budget_limit")
-            budget_used = budget_data.get("budget_used", 0.0)
+            budget_used = budget_data.get("budget_used")
             exceeded = budget_data.get("exceeded", False)
             exceeded_at = budget_data.get("exceeded_at")
         except (json.JSONDecodeError, KeyError):
@@ -8023,16 +8026,22 @@ async def get_budget():
 
     # Coerce defensively: a budget.json with a non-numeric budget_used/limit
     # (e.g. "n/a", null, a list) parses as valid JSON but would crash float()
-    # with ValueError/TypeError. Treat non-numeric values as 0.0 / None so the
-    # endpoint returns a clean payload instead of a 500.
-    def _to_float(value, default=0.0):
+    # with ValueError/TypeError. Treat non-numeric values as None (unknown) so
+    # the endpoint returns a clean payload instead of a 500.
+    def _to_float(value, default=None):
         try:
             return float(value)
         except (ValueError, TypeError):
             return default
 
     budget_limit_f = _to_float(budget_limit, None) if budget_limit is not None else None
-    budget_used_f = _to_float(budget_used, 0.0)
+    # A recorded budget.json spend is a reading only when it is a positive
+    # number. bash check_budget_limit writes "budget_used": 0.0 for a run it
+    # measured nothing for, and a bool or non-numeric value is no reading at
+    # all; each of those is unknown, never $0.00 spent.
+    budget_used_f = None if isinstance(budget_used, bool) else _to_float(budget_used, None)
+    if budget_used_f is not None and not budget_used_f > 0:
+        budget_used_f = None
 
     # current_cost must reflect real live spend, not the static budget.json
     # field which only updates when run.sh persists it. The same divergence
@@ -8044,7 +8053,10 @@ async def get_budget():
     try:
         snapshot = _compute_budget_snapshot(loki_dir)
         live_used = snapshot.get("used")
-        if isinstance(live_used, (int, float)) and live_used > 0:
+        # Live spend wins when positive. A measured live zero stands only when
+        # budget.json holds no positive reading; unmeasured live spend is None
+        # and leaves the recorded fallback (or unknown) in place.
+        if isinstance(live_used, (int, float)) and (live_used > 0 or budget_used_f is None):
             budget_used_f = float(live_used)
         if budget_limit_f is None and snapshot.get("limit") is not None:
             budget_limit_f = _to_float(snapshot.get("limit"), None)
@@ -8054,12 +8066,12 @@ async def get_budget():
         pass
 
     remaining = None
-    if budget_limit_f is not None:
+    if budget_limit_f is not None and budget_used_f is not None:
         remaining = max(0.0, budget_limit_f - budget_used_f)
 
     return {
         "budget_limit": budget_limit_f,
-        "current_cost": round(budget_used_f, 4),
+        "current_cost": round(budget_used_f, 4) if budget_used_f is not None else None,
         "exceeded": exceeded,
         "exceeded_at": exceeded_at,
         "remaining": round(remaining, 4) if remaining is not None else None,
@@ -8072,15 +8084,19 @@ async def get_budget():
 _BUDGET_WARN_FRACTION = 0.80
 
 
-def _budget_status(used: float, limit: Optional[float]) -> str:
+def _budget_status(used: Optional[float], limit: Optional[float]) -> str:
     """Classify budget usage. Read-time only; no state mutation.
 
-    Returns one of: "none" (no limit set), "ok" (<80%), "warn" (>=80% and
-    <100%), "exceeded" (>=100%). The warn band is the anti-surprise wedge:
-    the user sees it BEFORE the hard cap pauses the run.
+    Returns one of: "none" (no limit set), "unknown" (a limit is set but no
+    spend was measured), "ok" (<80%), "warn" (>=80% and <100%), "exceeded"
+    (>=100%). The warn band is the anti-surprise wedge: the user sees it
+    BEFORE the hard cap pauses the run. Unknown is never "ok": nothing was
+    measured, so nothing is within budget.
     """
     if limit is None or limit <= 0:
         return "none"
+    if used is None:
+        return "unknown"
     if used >= limit:
         return "exceeded"
     if used >= _BUDGET_WARN_FRACTION * limit:
@@ -8101,11 +8117,15 @@ def _compute_budget_snapshot(loki_dir: _Path) -> dict:
     budget_file = loki_dir / "metrics" / "budget.json"
 
     current_total = 0.0
+    # Same predicate as /api/cost: a present record is not a measurement.
+    cost_recorded = False
     if efficiency_dir.exists():
         for eff_file in sorted(efficiency_dir.glob("iteration-*.json")):
             data = _safe_json_read(eff_file, default=None)
             if not isinstance(data, dict):
                 continue
+            if _record_is_measured(data):
+                cost_recorded = True
             inp = data.get("input_tokens", 0) or 0
             out = data.get("output_tokens", 0) or 0
             # Cache tiers, same as the /api/cost path. This snapshot drives the
@@ -8144,8 +8164,9 @@ def _compute_budget_snapshot(loki_dir: _Path) -> dict:
         except (TypeError, ValueError):
             budget_limit = None
 
-    used = round(current_total, 6)
-    if budget_limit is not None and budget_limit > 0:
+    # Unmeasured spend is null (status "unknown"), never $0.00 / 0.0% used.
+    used = round(current_total, 6) if cost_recorded else None
+    if budget_limit is not None and budget_limit > 0 and used is not None:
         remaining = max(0.0, budget_limit - used)
         percent_used = round((used / budget_limit) * 100, 2)
     else:
@@ -8216,7 +8237,8 @@ def _compute_cost_timeline() -> dict:
             # codex run wrote reported total_usd $0.00 with cost_recorded True
             # -- the endpoint asserting the run was FREE. Same predicate as
             # /api/cost so the two cost readers cannot disagree.
-            if _record_is_measured(data):
+            measured = _record_is_measured(data)
+            if measured:
                 cost_recorded = True
             inp = data.get("input_tokens", 0) or 0
             out = data.get("output_tokens", 0) or 0
@@ -8245,8 +8267,10 @@ def _compute_cost_timeline() -> dict:
                 "provider": data.get("provider"),
                 "input_tokens": inp,
                 "output_tokens": out,
-                "cost_usd": round(cost, 6),
-                "cumulative_usd": round(cumulative, 6),
+                # An iteration nobody measured has no cost and no point on the
+                # cumulative line (cost.html skips a null point).
+                "cost_usd": round(cost, 6) if measured else None,
+                "cumulative_usd": round(cumulative, 6) if measured else None,
             })
         current_total = cumulative
 

@@ -147,6 +147,8 @@
     if (st === "exceeded") return "Budget cap reached. The run is paused to prevent a surprise bill.";
     if (st === "warn") return "Approaching budget cap (80% or more used). Warning only, the run continues.";
     if (st === "ok") return "Within budget.";
+    // A cap is set but no spend was measured: unknown, never "within budget".
+    if (st === "unknown") return "Spend not recorded yet, so budget use is unknown.";
     return "No budget cap set. Set LOKI_BUDGET_LIMIT to cap spend.";
   }
 
@@ -162,7 +164,7 @@
     var pct = (b.percent_used === null || b.percent_used === undefined) ? NaN : Number(b.percent_used);
     var known = isFinite(pct);
     var fillPct = known ? Math.max(0, Math.min(100, pct)) : 0;
-    var st = esc(b.status || "ok");
+    var st = esc(b.status || "unknown");
     html += '<div class="gauge">' +
       '<div class="top"><span class="muted">' + fmtUsd(b.used) + ' of ' + fmtUsd(b.limit) + ' used</span>' +
       '<span class="pct">' + (known ? pct.toFixed(1) + '%' : 'not recorded') + '</span></div>' +

@@ -14,14 +14,20 @@
 #                                     resolves to a real route in dashboard/server.py
 #   P7.no-sample-data-panels          no production page reaches a panel that
 #                                     falls back to hardcoded or generated sample
-#                                     data, and no Math.random() feeds a metric
+#                                     data, no Math.random() feeds a metric, and
+#                                     no metric prop is fed a hardcoded number
 #   P7.unmeasured-cost-never-zero     no cost rendering path turns an unmeasured
-#                                     (null/undefined) cost into 0 or "$0.00"
+#                                     (null/undefined) cost into 0 or "$0.00",
+#                                     and the budget/cost endpoints send null
+#                                     (not 0) for spend nobody measured
 #
 # Contract (tests/moat): one "CASE <ID> PASS|FAIL <text>" stdout line per case,
 # diagnostics on stderr, exit 0 whenever the script ran to completion. A missing
 # prerequisite is a FAIL, never a skip. Every "nothing found" result is paired
 # with a positive control proving the same probe finds the bad case.
+#
+# The cost case's server leg starts the real dashboard app in-process
+# (fastapi TestClient, which needs httpx; requirements-test.txt has both).
 #
 # SOURCE, NEVER THE BUNDLE. dashboard/static/index.html is the built bundle and
 # is never scanned: a bundle scan measures the last build, not the code.
@@ -528,7 +534,7 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 # ---------------------------------------------------------------------------
 # P7.no-sample-data-panels
 # ---------------------------------------------------------------------------
-# Three rules, all on comment-stripped source:
+# Four rules, all on comment-stripped source:
 #   1. A component with a sample fallback (`x || generateSample*()`,
 #      `x || SAMPLE_*`, `x ?? sampleFoo`) must not be reachable from a routed
 #      page (web-app/src/pages/*, App.tsx) through the JSX mount graph. Passing a
@@ -538,6 +544,12 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 #   2. No reachable JSX prop is fed a SAMPLE_* constant or sample generator.
 #   3. No Math.random() feeds a metric-named field (uses, rating, tokens, cost,
 #      count, total, score, ...). Confetti, skeleton widths and ids are fine.
+#   4. No reachable JSX prop with a metric name (gatePassRate, testCoverage,
+#      qualityScore, totalTokens, linesGenerated, lintErrors, ...) is fed a
+#      numeric literal or a ternary of two numeric literals. That is a number
+#      nobody measured, rendered as a reading (`gatePassRate={0.8}`,
+#      `testCoverage={i > 2 ? 60 : 20}`); an unmeasured value is null and the
+#      component says so. Layout props (size, thickness) are not metric names.
 # dashboard-ui web components are all shipped in the bundle, so rules 1 and 3
 # apply to every dashboard-ui component file directly.
 cat > "$MOAT_TMP/sample-panels.py" <<'PY'
@@ -548,6 +560,9 @@ webapp_src, dash_dirs = sys.argv[1], sys.argv[2:]
 FALLBACK = re.compile(r'(?:\|\||\?\?)\s*(?:generate\w*?(?:Sample|Mock|Demo|Fake)\w*\s*\(|(?:SAMPLE|MOCK|DEMO|FAKE)_[A-Z0-9_]+\b|(?:sample|mock|demo|fake)[A-Z]\w*\b)')
 PROP = re.compile(r'\w+=\{\s*(?:(?:SAMPLE|MOCK|DEMO|FAKE)_[A-Z0-9_]+|generate\w*?(?:Sample|Mock|Demo|Fake)\w*\s*\()')
 METRIC = re.compile(r'\b\w*(?:uses|count|rating|tokens|cost|percent|total|score|requests|views|downloads|stars|spend|revenue)\w*\b\s*(?::|=(?!=))[^;,]*Math\.random', re.I)
+NUM = r'-?\d+(?:\.\d+)?'
+HARDPROP = re.compile(r'\b(?:\w*(?:Rate|Coverage|Score|Tokens|Cost|Percent|Percentage|Passing|Generated|Modified|Usage|Spend|Confidence|Errors|Complexity)'
+                      r'|rate|coverage|score|tokens|cost|percent|percentage|confidence)=\{\s*(?:' + NUM + r'|[^{}?]*\?\s*' + NUM + r'\s*:\s*' + NUM + r')\s*\}')
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
 findings = []
@@ -581,6 +596,8 @@ for f in sorted(reach):
         findings.append(f'{rel(f)}:{ln} sample-data fallback reachable via {" > ".join(reach[f])}')
     for ln in lines_matching(src[f], PROP):
         findings.append(f'{rel(f)}:{ln} JSX prop fed sample data, reachable via {" > ".join(reach[f])}')
+    for ln in lines_matching(src[f], HARDPROP):
+        findings.append(f'{rel(f)}:{ln} hardcoded number presented as a measured metric, reachable via {" > ".join(reach[f])}')
 for f in files:
     for ln in lines_matching(src[f], METRIC):
         findings.append(f'{rel(f)}:{ln} Math.random() feeds a rendered metric')
@@ -592,6 +609,8 @@ for d in dash_dirs:
         for ln in lines_matching(s, METRIC):
             findings.append(f'{os.path.relpath(f, os.path.dirname(os.path.dirname(d.rstrip("/"))))}:{ln} Math.random() feeds a rendered metric')
 print(f'SCANNED pages={len(pages)} reachable={len(reach)} files={len(files)}')
+for f in sorted(reach):
+    print('REACH ' + rel(f))
 for x in findings:
     print('FINDING ' + x)
 sys.exit(1 if findings else 0)
@@ -603,24 +622,37 @@ case_sample_panels() {
     # Positive control: a page reaching a sample-fallback panel and a random
     # metric must both be flagged; confetti randomness must not be.
     mkdir -p "$ctl/src/pages" "$ctl/src/components" "$ctl/fixed/src/pages" "$ctl/fixed/src/components"
-    printf '%s\n' 'export function P() { return <div><Panel /><Stats /><Clean /></div>; }' > "$ctl/src/pages/P.tsx"
+    printf '%s\n' 'export function P() { return <div><Panel /><Stats /><Clean /><Gauge /><Plain /></div>; }' > "$ctl/src/pages/P.tsx"
     printf '%s\n' 'export function Panel({ data }) { const d = data || generateSampleData(); return <b>{d}</b>; }' > "$ctl/src/components/Panel.tsx"
     printf '%s\n' 'export function Stats() { const s = { uses: Math.floor(Math.random() * 10) }; return <i>{s.uses}</i>; }' > "$ctl/src/components/Stats.tsx"
     printf '%s\n' 'export function Clean() { const left = Math.random() * 100; return <i style={{ left }} />; }' > "$ctl/src/components/Clean.tsx"
-    printf '%s\n' 'export function P() { return <div><Panel data={x} /></div>; }' > "$ctl/fixed/src/pages/P.tsx"
+    # Rule 4: a literal and a literal ternary, each on its own line so each is
+    # flagged individually; a measured prop and layout numbers must not be.
+    printf '%s\n' 'export function Gauge({ n }) { return <div>' '<Ring gatePassRate={0.8} size={28} />' \
+        '<Ring testCoverage={n > 2 ? 60 : 20} /></div>; }' > "$ctl/src/components/Gauge.tsx"
+    printf '%s\n' 'export function Plain({ rate }) { return <Ring gatePassRate={rate} size={28} thickness={4} />; }' > "$ctl/src/components/Plain.tsx"
+    printf '%s\n' 'export function P() { return <div><Panel data={x} /><Gauge g={g} /></div>; }' > "$ctl/fixed/src/pages/P.tsx"
     printf '%s\n' 'export function Panel({ data }) { return <b>{data ?? null}</b>; }' > "$ctl/fixed/src/components/Panel.tsx"
+    printf '%s\n' 'export function Gauge({ g }) { return g == null ? null : <Ring gatePassRate={g} size={28} />; }' > "$ctl/fixed/src/components/Gauge.tsx"
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/src" 2>&1)" || rc=$?
     if [ "$rc" != 1 ] || ! grep -q 'components/Panel.tsx:1 sample-data fallback' <<<"$out" \
-        || ! grep -q 'components/Stats.tsx:1 Math.random' <<<"$out" || grep -q 'Clean.tsx' <<<"$out"; then
-        echo "FAIL|positive control failed (rc=$rc): $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 0
+        || ! grep -q 'components/Stats.tsx:1 Math.random' <<<"$out" || grep -q '^FINDING.*Clean.tsx' <<<"$out" \
+        || ! grep -q 'components/Gauge.tsx:2 hardcoded number' <<<"$out" \
+        || ! grep -q 'components/Gauge.tsx:3 hardcoded number' <<<"$out" || grep -q '^FINDING.*Plain.tsx' <<<"$out"; then
+        echo "FAIL|positive control failed (rc=$rc): $(grep -v '^REACH ' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0
     fi
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$ctl/fixed/src" 2>&1)" || rc=$?
-    [ "$rc" = 0 ] || { echo "FAIL|control: a panel without a sample fallback was flagged: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 0; }
+    [ "$rc" = 0 ] || { echo "FAIL|control: a panel without a sample fallback was flagged: $(grep -v '^REACH ' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 0; }
 
     rc=0
     python3 "$MOAT_TMP/sample-panels.py" "$REPO_ROOT/web-app/src" \
         "$REPO_ROOT/dashboard-ui/components" "$REPO_ROOT/dashboard-ui/core" > "$MOAT_TMP/sample.txt" 2>&1 || rc=$?
-    sed 's/^/  /' "$MOAT_TMP/sample.txt" >&2
+    grep -v '^REACH ' "$MOAT_TMP/sample.txt" | sed 's/^/  /' >&2
+    # The workspace is where rule 4's defect lived; a scan that never reached it
+    # would pass without looking.
+    if [ "$rc" -le 1 ] && ! grep -q '^REACH .*components/ProjectWorkspace.tsx$' "$MOAT_TMP/sample.txt"; then
+        echo "FAIL|ProjectWorkspace.tsx is not in the reachable set; the scan would miss the workspace panels"; return 0
+    fi
     case "$rc" in
         0) echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/sample.txt")" ;;
         1) echo "FAIL|$(grep -c '^FINDING' "$MOAT_TMP/sample.txt") sample-data finding(s): $(grep '^FINDING' "$MOAT_TMP/sample.txt" | head -4 | sed 's/^FINDING //; s/ reachable via.*//' | tr '\n' ';')" ;;
@@ -664,6 +696,107 @@ for h in hits:
     print('HIT ' + h)
 sys.exit(1 if hits else 0)
 PY
+
+# SERVER LEG. A client can only say "not recorded" if the server sends null: a
+# budget reader that re-derives 0 from nothing makes every honest formatter
+# above print "$0.00 of $10.00 used, 0.0%". One scenario per process (no module
+# state carries over), LOKI_DIR resolved by the app's own resolver, a budget cap
+# of $10, and one efficiency record:
+#   unmeasured     no token or cost field    -> every budget field null, status
+#                                               never ok/warn/exceeded
+#   measured       tokens + cost_usd 2.5     -> every field a positive number
+#   measured-zero  tokens + cost_usd 0.0     -> spent/percent read 0, not null
+# The last two are the controls: a fix that nulls every zero is as wrong.
+cat > "$MOAT_TMP/budget-null.py" <<'PY'
+import json, numbers, os, sys
+repo, loki, scenario = sys.argv[1:4]
+sys.path.insert(0, repo)
+os.environ.pop('LOKI_BUDGET_LIMIT', None)
+os.environ['LOKI_DIR'] = loki
+extra = {
+    'unmeasured': {},
+    'measured': {'input_tokens': 1000, 'output_tokens': 500, 'cost_usd': 2.5},
+    'measured-zero': {'input_tokens': 9412, 'output_tokens': 11008, 'cost_usd': 0.0},
+}[scenario]
+rec = dict({'iteration': 1, 'model': 'sonnet', 'phase': 'build'}, **extra)
+os.makedirs(os.path.join(loki, 'metrics', 'efficiency'))
+with open(os.path.join(loki, 'metrics', 'efficiency', 'iteration-1.json'), 'w') as fh:
+    json.dump(rec, fh)
+with open(os.path.join(loki, 'metrics', 'budget.json'), 'w') as fh:
+    json.dump({'limit': 10}, fh)
+from fastapi.testclient import TestClient
+from dashboard import server
+client = TestClient(server.app, raise_server_exceptions=False)
+got = {}
+for path in ('/api/cost', '/api/budget', '/api/cost/timeline'):
+    r = client.get(path)
+    if r.status_code != 200:
+        print(f'FATAL GET {path} -> HTTP {r.status_code}')
+        sys.exit(2)
+    got[path] = r.json()
+# (label, endpoint, key path, reads 0 on a measured zero)
+FIELDS = [
+    ('/api/cost budget_used', '/api/cost', ['budget_used'], True),
+    ('/api/cost budget_remaining', '/api/cost', ['budget_remaining'], False),
+    ('/api/budget current_cost', '/api/budget', ['current_cost'], True),
+    ('/api/budget remaining', '/api/budget', ['remaining'], False),
+    ('/api/cost/timeline budget.used', '/api/cost/timeline', ['budget', 'used'], True),
+    ('/api/cost/timeline budget.remaining', '/api/cost/timeline', ['budget', 'remaining'], False),
+    ('/api/cost/timeline budget.percent_used', '/api/cost/timeline', ['budget', 'percent_used'], True),
+    ('/api/cost/timeline iterations[0].cost_usd', '/api/cost/timeline', ['current_run', 'iterations', 0, 'cost_usd'], True),
+]
+MISSING = object()
+def dig(d, keys):
+    for k in keys:
+        try:
+            d = d[k]
+        except (KeyError, IndexError, TypeError):
+            return MISSING
+    return d
+def isnum(v):
+    return isinstance(v, numbers.Real) and not isinstance(v, bool)
+bad = []
+for label, path, keys, zero in FIELDS:
+    v = dig(got[path], keys)
+    if v is MISSING:
+        bad.append(f'{label} missing')
+    elif scenario == 'unmeasured' and v is not None:
+        bad.append(f'{label} = {v!r}, want null')
+    elif scenario == 'measured' and not (isnum(v) and v > 0):
+        bad.append(f'{label} = {v!r}, want a positive number')
+    elif scenario == 'measured-zero' and not (isnum(v) and (v == 0) == zero):
+        bad.append(f'{label} = {v!r}, want {"0" if zero else "a positive number"}')
+status = dig(got['/api/cost/timeline'], ['budget', 'status'])
+if scenario == 'unmeasured' and status in ('ok', 'warn', 'exceeded', MISSING):
+    bad.append(f'/api/cost/timeline budget.status = {status!r} claims a reading')
+if scenario != 'unmeasured' and status != 'ok':
+    bad.append(f'/api/cost/timeline budget.status = {status!r}, want ok')
+print(f'CHECKED {len(FIELDS) + 1} fields ({scenario})')
+for b in bad:
+    print('BAD ' + b)
+sys.exit(1 if bad else 0)
+PY
+
+# Prints nothing and returns 0 on pass; prints the reason and returns 1 on fail.
+cost_server_leg() {
+    py_server -c 'import fastapi, httpx' >/dev/null 2>&1 \
+        || { echo "prerequisite missing: python fastapi + httpx (the server leg drives the real app)"; return 1; }
+    local sc d rc out
+    # Controls first: a red unmeasured leg means something only once the same
+    # probe has read real numbers back.
+    for sc in measured measured-zero unmeasured; do
+        d="$MOAT_TMP/budget-$sc"
+        mkdir -p "$d/.loki"
+        rc=0
+        out="$(cd "$d" && py_server "$MOAT_TMP/budget-null.py" "$REPO_ROOT" "$d/.loki" "$sc" 2> "$d/err")" || rc=$?
+        printf '%s\n' "$out" | sed "s/^/  server[$sc] /" >&2
+        grep -q '^CHECKED ' <<<"$out" \
+            || { echo "server leg ($sc) did not run (rc=$rc): $(tail -c 200 "$d/err" | tr '\n' ' ') $(tr '\n' ' ' <<<"$out")"; return 1; }
+        [ "$rc" = 0 ] \
+            || { echo "server leg ($sc): $(grep '^BAD ' <<<"$out" | head -4 | sed 's/^BAD //' | tr '\n' ';')"; return 1; }
+    done
+    return 0
+}
 
 case_cost_zero() {
     command -v python3 >/dev/null 2>&1 || { echo "FAIL|prerequisite missing: python3"; return 0; }
@@ -725,14 +858,18 @@ dashboard-ui/core/loki-unified-styles.js|export function formatUSD\(|toFixed\(
 EOF
     [ "$good" = 5 ] || { echo "FAIL|only $good of 5 known-correct formatters were checked"; return 0; }
 
+    local srv="" srv_fail=""
+    srv="$(cost_server_leg)" || srv_fail="${srv:-server leg failed with no reason}"
+
     rc=0
     python3 "$MOAT_TMP/cost-zero.py" "$REPO_ROOT/dashboard-ui/components" "$REPO_ROOT/dashboard-ui/core" \
         "$REPO_ROOT/web-app/src" "$REPO_ROOT/dashboard/static" > "$MOAT_TMP/cost.txt" 2>&1 || rc=$?
     sed "s#$REPO_ROOT/##; s/^/  /" "$MOAT_TMP/cost.txt" >&2
     case "$rc" in
-        0) echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass" ;;
-        1) echo "FAIL|$(grep -c '^HIT' "$MOAT_TMP/cost.txt") unmeasured-cost-as-zero site(s): $(grep '^HIT' "$MOAT_TMP/cost.txt" | sed "s#^HIT $REPO_ROOT/##; s/: .*//" | tr '\n' ' ')" ;;
-        *) echo "FAIL|scanner refused (rc=$rc)" ;;
+        0) if [ -n "$srv_fail" ]; then echo "FAIL|$srv_fail"
+           else echo "PASS|$(grep '^SCANNED' "$MOAT_TMP/cost.txt") files, $good known-correct files pass; /api/cost, /api/budget and /api/cost/timeline send null for unmeasured spend, numbers for measured and measured-zero"; fi ;;
+        1) echo "FAIL|$(grep -c '^HIT' "$MOAT_TMP/cost.txt") unmeasured-cost-as-zero site(s): $(grep '^HIT' "$MOAT_TMP/cost.txt" | sed "s#^HIT $REPO_ROOT/##; s/: .*//" | tr '\n' ' ')${srv_fail:+; $srv_fail}" ;;
+        *) echo "FAIL|scanner refused (rc=$rc)${srv_fail:+; $srv_fail}" ;;
     esac
 }
 
@@ -765,8 +902,8 @@ run_case() {
 START_S=$SECONDS
 run_case P7.webapp-client-routes-exist "web-app client paths resolve to real web-app/server.py routes" case_webapp_routes
 run_case P7.dashboard-client-routes-exist "dashboard-ui /api paths resolve to real dashboard/server.py routes" case_dashboard_routes
-run_case P7.no-sample-data-panels "no production page reaches sample or random data panels" case_sample_panels
-run_case P7.unmeasured-cost-never-zero "no cost path renders unmeasured cost as 0 or \$0.00" case_cost_zero
+run_case P7.no-sample-data-panels "no production page reaches sample, random or hardcoded-metric data panels" case_sample_panels
+run_case P7.unmeasured-cost-never-zero "no cost path, client or server, turns unmeasured cost into 0 or \$0.00" case_cost_zero
 
 for id in P7.webapp-client-routes-exist P7.dashboard-client-routes-exist P7.no-sample-data-panels P7.unmeasured-cost-never-zero; do
     case " $EMITTED " in *" $id "*) ;; *) printf 'CASE %s FAIL runner did not emit this case\n' "$id" ;; esac

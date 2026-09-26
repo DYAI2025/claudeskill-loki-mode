@@ -231,9 +231,11 @@ export function MetricsPage() {
         <KPICard
           label="Budget used"
           value={
-            budget?.percent_used == null
+            budget?.limit == null
               ? 'No budget set'
-              : `${budget.percent_used.toFixed(0)}%`
+              : budget.percent_used == null
+                ? 'Not recorded'
+                : `${budget.percent_used.toFixed(0)}%`
           }
           detail={
             budget?.limit == null

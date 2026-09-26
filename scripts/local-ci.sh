@@ -434,6 +434,12 @@ declare -a _FAST_KEEP=(
   # The runner's own self-test: proves every ratchet rule still fires, so the
   # gate above cannot go green by checking nothing. Measured ~6s, own repos.
   "tests/test-moat-runner.sh"
+  # Moat P7 at the pixel: the real cost components and cost.html render an
+  # unmeasured cost as unknown and a measured zero as $0.00. Unregistered, its
+  # mocks rotted to a dead response shape and two cases failed unseen. The
+  # moat's P7 static scan cannot see a rendering regression; this can.
+  # Measured 0.1s (node --test, no install, no network).
+  "dashboard unmeasured cost never renders as zero"
   # CLAUDE.md cleanup mandate: sub-second, and the whole point is that it runs
   # on every invocation, not only the slow one.
   "no leftovers from this run"
@@ -1826,6 +1832,18 @@ if command -v node >/dev/null 2>&1; then
 else
   skip_check "dashboard SPA inline scripts parse" "node not installed"
 fi
+
+# ---------------------------------------------------------------------------
+# 10c2. Moat P7 at the pixel: an unmeasured cost never renders as $0.00
+# ---------------------------------------------------------------------------
+# dashboard-ui/tests/loki-unmeasured-cost-never-zero.node.test.mjs drives the
+# real cost components and cost.html's own functions. It was registered in no
+# runner, so its waterfall mocks drifted to a response shape the component no
+# longer reads and 2 of 11 cases failed with nobody seeing it. Node is REQUIRED
+# here, not skipped (as in tests/test-audit-js-suites.sh): a missing runtime is
+# an unmeasured result, never a pass. Needs no npm install (relative imports).
+run_check "dashboard unmeasured cost never renders as zero (node --test)" \
+  'command -v node >/dev/null 2>&1 || { echo "node not installed: the suite did not run (unmeasured, not clean)"; exit 1; }; node --test dashboard-ui/tests/loki-unmeasured-cost-never-zero.node.test.mjs 2>&1 | tail -12'
 
 # ---------------------------------------------------------------------------
 # 10d. Dashboard fresh-repo integrated UX harness (v7.18.0)

@@ -85,8 +85,10 @@ run_test() {
     case "$test_file" in
         *" "*)
             # Command form: the script is the last whitespace-separated token
-            # that looks like a path to a test file.
-            _script_path="$(printf '%s\n' $test_file | grep -E '\.(sh|py)$' | tail -1)"
+            # that looks like a path to a test file. Node suites (.mjs/.js)
+            # count too: with no matching token this grep exits 1, and under
+            # set -e that assignment would end the whole runner.
+            _script_path="$(printf '%s\n' $test_file | grep -E '\.(sh|py|mjs|js)$' | tail -1)"
             ;;
     esac
     if [ -n "$_script_path" ] && [ ! -f "$_script_path" ]; then
@@ -514,6 +516,11 @@ run_test "report cost agrees with its own budget state file" "$SCRIPT_DIR/test-r
 run_test "loki stop is bounded regardless of provider timeout" "$SCRIPT_DIR/test-stop-latency.sh"
 run_test "audit chain claims match what the chain proves" "$SCRIPT_DIR/test-audit-chain-honesty.sh"
 run_test "audit subsystem Node suites (witness, manifest, crosslink)" "$SCRIPT_DIR/test-audit-js-suites.sh"
+# Moat P7 at the pixel: the real cost components and cost.html render an
+# unmeasured cost as unknown, never $0.00, and a measured zero as $0.00. Node is
+# required, not skipped (as in the audit suites above): no runtime means the
+# suite did not run, which is unmeasured, not clean.
+run_test "dashboard unmeasured cost never renders as zero (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-unmeasured-cost-never-zero.node.test.mjs"
 run_test "shipped agent roles reach the review pool" "$SCRIPT_DIR/test-agent-types-loaded.sh"
 run_test "policy present but unevaluable refuses fail-closed" "$SCRIPT_DIR/test-policy-node-failclosed.sh"
 run_test "audit entries attribute an actor honestly" "$SCRIPT_DIR/test-audit-actor-attribution.sh"

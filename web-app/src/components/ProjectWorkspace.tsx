@@ -49,7 +49,6 @@ import {
 import type { ConsoleMessage } from './PreviewToolbar';
 
 import { AIChatPanel } from './AIChatPanel';
-import { ConfidenceIndicator } from './ConfidenceIndicator';
 import { BuildInsights } from './BuildInsights';
 import { BuildReplay } from './BuildReplay';
 import { NLSearch } from './NLSearch';
@@ -1542,7 +1541,9 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
         <ShortcutsHelpButton onClick={() => setShowHelp(true)} />
       </div>
 
-      {/* Build progress bar with confidence indicator */}
+      {/* Build progress bar. The "AI confidence" gauge that sat beside it was
+          fed a hardcoded 80% gate pass rate and a coverage that jumped from
+          20% to 60% at iteration 3; nothing measures either, so it is gone. */}
       <div className="flex items-center gap-2">
         <div className="flex-1">
           <BuildProgressBar
@@ -1554,18 +1555,6 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
             isRunning={isBuilding}
           />
         </div>
-        {isBuilding && (
-          <div className="flex-shrink-0 pr-2">
-            <ConfidenceIndicator
-              gatePassRate={0.8}
-              testCoverage={buildStatus.iteration > 2 ? 60 : 20}
-              iteration={buildStatus.iteration}
-              maxIterations={buildStatus.maxIterations}
-              phase={buildPhase}
-              compact
-            />
-          </div>
-        )}
       </div>
 
       {/* Checkpoint timeline */}
@@ -2289,14 +2278,16 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
                       <div className="h-full overflow-y-auto p-4">
                         <BuildInsights
                           filesCreated={sessionData.files.filter(f => f.type === 'file').length}
-                          filesModified={0}
-                          linesGenerated={0}
-                          testsGenerated={0}
-                          testPassRate={0}
-                          totalTokens={0}
+                          // Nothing on this page measures these; null renders
+                          // "Not recorded" instead of a zero nobody read.
+                          filesModified={null}
+                          linesGenerated={null}
+                          testsGenerated={null}
+                          testPassRate={null}
+                          totalTokens={null}
                           phaseBreakdown={[]}
                           totalTimeSecs={buildStatus.startTime ? Math.floor((Date.now() - buildStatus.startTime) / 1000) : 0}
-                          qualityScore={0}
+                          qualityScore={null}
                           totalCost={buildStatus.cost}
                           iterations={buildStatus.iteration}
                           provider={selectedProvider}
