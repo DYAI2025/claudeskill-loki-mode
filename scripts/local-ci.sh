@@ -1690,13 +1690,30 @@ if command -v bun >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
       # the repo, and CI never runs local-ci.sh from an npm install.
       BUN_FROM_SOURCE=1 bash bin/loki $args > "$PARITY_TMP/$label.bun" 2>&1 || true
       if [ "$mode" = "json" ]; then
-        # v7.4.12: also floor the disk.available_gb value because Python
-        # json.dumps emits 58.0 while JS JSON.stringify emits 58 -- same
-        # number, different representation -- and the underlying df read
-        # can drift by 1GB between two near-simultaneous calls.
-        jq -S "if .disk?.available_gb? != null then .disk.available_gb = (.disk.available_gb | floor) else . end" "$PARITY_TMP/$label.bash" > "$PARITY_TMP/$label.bash.s" 2>/dev/null || true
-        jq -S "if .disk?.available_gb? != null then .disk.available_gb = (.disk.available_gb | floor) else . end" "$PARITY_TMP/$label.bun"  > "$PARITY_TMP/$label.bun.s"  2>/dev/null || true
-        if ! diff -q "$PARITY_TMP/$label.bash.s" "$PARITY_TMP/$label.bun.s" >/dev/null 2>&1; then
+        # BACKLOG 26 (matches the BACKLOG-26-DISK-TOLERANCE block in
+        # .github/workflows/bun-parity.yml): a v7.4.12 floor only absorbed
+        # the Python-float-vs-JS-int formatting difference (58.0 vs 58); it
+        # did nothing for a genuine 1GB integer drift between two
+        # near-simultaneous df reads (94 vs 95), which is a real, common
+        # flake here too. Check the two readings are within a small
+        # absolute tolerance, then drop the key from both sides before the
+        # structural diff -- a real divergence (tens of GB off, or present
+        # on only one side) still fails.
+        DISK_TOLERANCE_GB=3
+        bash_disk="$(jq -r ".disk.available_gb // \"null\"" "$PARITY_TMP/$label.bash" 2>/dev/null || echo null)"
+        bun_disk="$(jq -r ".disk.available_gb // \"null\"" "$PARITY_TMP/$label.bun" 2>/dev/null || echo null)"
+        disk_ok=1
+        if [ "$bash_disk" != "null" ] && [ "$bun_disk" != "null" ]; then
+          if ! jq -n --argjson a "$bash_disk" --argjson b "$bun_disk" --argjson tol "$DISK_TOLERANCE_GB" \
+               -e "((\$a - \$b) | if . < 0 then -. else . end) <= \$tol" >/dev/null 2>&1; then
+            disk_ok=0
+          fi
+        elif [ "$bash_disk" != "$bun_disk" ]; then
+          disk_ok=0
+        fi
+        jq -S "if .disk?.available_gb? != null then del(.disk.available_gb) else . end" "$PARITY_TMP/$label.bash" > "$PARITY_TMP/$label.bash.s" 2>/dev/null || true
+        jq -S "if .disk?.available_gb? != null then del(.disk.available_gb) else . end" "$PARITY_TMP/$label.bun"  > "$PARITY_TMP/$label.bun.s"  2>/dev/null || true
+        if [ "$disk_ok" -eq 0 ] || ! diff -q "$PARITY_TMP/$label.bash.s" "$PARITY_TMP/$label.bun.s" >/dev/null 2>&1; then
           echo "DIFF: $label (attempt $ATTEMPT)"
           BAD=$((BAD+1))
           mkdir -p "$FLAKE_DIR" 2>/dev/null || true
