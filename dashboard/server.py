@@ -12589,9 +12589,52 @@ async def proofs_summary():
     }
 
 
+def _proof_integrity_check(proof: dict) -> dict:
+    """Recompute a receipt's integrity with the CLI verifier's own checks.
+
+    Runs autonomy/lib/proof-verify.py verify_integrity() (hash, gpg, headline,
+    cost coherence) plus its schema check, loaded from this install, never from
+    the project. The diff is NOT re-derived: that runs git inside the project,
+    which a read route must not do, so drift_checked is always False and the
+    panel names `loki proof verify <id>` for the full check.
+
+    status: verified (every check here ran and passed), tampered (the recorded
+    hash does not match the bytes), failed (a check ran and said no),
+    not_verified (nothing to check against, or the checks could not run).
+    """
+    out = {"status": "not_verified", "hash_ok": None, "gpg_ok": None,
+           "drift_checked": False, "reasons": [],
+           "checked_by": "autonomy/lib/proof-verify.py verify_integrity"}
+    ver = proof.get("verification")
+    if not isinstance(ver, dict) or not ver.get("hash"):
+        out["reasons"] = ["the receipt records no integrity hash, so there is "
+                          "nothing to recompute"]
+        return out
+    try:
+        pv = _build_execution._load_proof_verifier()
+        r = pv.verify_integrity(proof)
+        schema_reason = pv.check_schema_version(proof)
+    except Exception as exc:  # the verifier could not run: say so, never pass
+        out["reasons"] = ["the verifier could not run here: %s" % exc]
+        return out
+    out["hash_ok"] = r.get("hash_ok")
+    out["gpg_ok"] = r.get("gpg_ok")
+    out["reasons"] = list(r.get("reasons") or [])
+    if r.get("hash_ok") is not True:
+        out["status"] = "tampered"
+    elif not r.get("ok"):
+        out["status"] = "failed"
+    elif schema_reason:
+        out["reasons"].append(schema_reason)
+    else:
+        out["status"] = "verified"
+    return out
+
+
 @app.get("/api/proofs/{run_id}", dependencies=[Depends(auth.require_scope("read"))])
 async def get_proof(run_id: str):
-    """Return the redacted proof.json for one run."""
+    """Return the redacted proof.json for one run, plus integrity_check: the
+    verdict the server computed for it (see _proof_integrity_check)."""
     run_dir = _safe_proof_run_dir(run_id)
     proof_json = run_dir / "proof.json"
     if not proof_json.is_file():
@@ -12599,6 +12642,10 @@ async def get_proof(run_id: str):
     data = _safe_json_read(proof_json, default=None)
     if not isinstance(data, dict):
         raise HTTPException(status_code=500, detail="proof.json unreadable")
+    # Computed on the file's contents BEFORE anything is added to the response;
+    # a to_thread because a gpg signature check shells out to gpg.
+    integrity = await asyncio.to_thread(_proof_integrity_check, dict(data))
+    data["integrity_check"] = integrity
     # Surface the optional PR linkage alongside the proof. The proof.json itself
     # already carries honesty.headline; we only add pr_url so the panel can show
     # "PR #N -> <headline>". Absent pr.json -> pr_url null, never an error.

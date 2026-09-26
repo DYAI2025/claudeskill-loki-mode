@@ -163,6 +163,16 @@ export interface ProofDetail extends ProofSummary {
   honesty?: { headline?: string | null };
   council?: { final_verdict?: string | null };
   cost?: { usd?: number | null };
+  // Added by the server, not part of proof.json: the verdict it COMPUTED by
+  // running the CLI verifier's integrity checks (dashboard/server.py
+  // _proof_integrity_check). The diff is never re-derived there.
+  integrity_check?: {
+    status: 'verified' | 'tampered' | 'failed' | 'not_verified';
+    hash_ok?: boolean | null;
+    gpg_ok?: boolean | 'n/a' | null;
+    drift_checked?: boolean;
+    reasons?: string[];
+  };
 }
 
 // Mirrors GET /api/proofs/summary. `unknown` is a first-class bucket, not a

@@ -2395,15 +2395,16 @@ document.addEventListener('DOMContentLoaded', function() {
         return;
       }
       badge.classList.remove('empty');
-      // "N receipts - M verified" with the verified count emphasized.
+      // "N receipts - M recorded verified". The count is each receipt's own
+      // recorded headline (/api/proofs/summary), not re-verified here.
       textEl.innerHTML = plural(total, 'receipt') + ' - '
-        + '<span class="receipts-verified"></span> verified';
+        + '<span class="receipts-verified"></span> recorded verified';
       var vEl = textEl.querySelector('.receipts-verified');
       if (vEl) vEl.textContent = String(verified);
       badge.title = plural(verified, 'receipt') + ' of ' + total
-        + ' verified by a deterministic Evidence Receipt (re-verifiable with '
-        + '"loki proof verify"). "Verified" means tests passed with real '
-        + 'exit-code evidence, not an LLM opinion.';
+        + ' recorded a VERIFIED headline (tests passed with real exit-code '
+        + 'evidence, not an LLM opinion). Recorded by the generator and not '
+        + 're-verified here: check one with "loki proof verify <run-id>".';
       badge.classList.add('show');
     }
 
@@ -2513,8 +2514,12 @@ document.addEventListener('DOMContentLoaded', function() {
           var html = '';
           for (var i = 0; i < rows.length; i++) {
             var x = rows[i] || {};
-            var verdict = x.headline || x.final_verdict || 'UNKNOWN';
-            var verified = /^VERIFIED/i.test(verdict);
+            // Recorded values, labelled: the receipt's own headline, else the
+            // council vote. Success colour only for an exact VERIFIED headline
+            // ("VERIFIED WITH GAPS" is not a success).
+            var verdict = x.headline ? x.headline
+              : (x.final_verdict ? 'council ' + x.final_verdict : 'UNKNOWN');
+            var verified = x.headline === 'VERIFIED';
             var col = verified ? 'var(--loki-success)' : 'var(--loki-text-muted)';
             var files = (x.files_changed === null || x.files_changed === undefined)
               ? '-' : String(x.files_changed);

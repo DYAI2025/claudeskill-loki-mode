@@ -32,6 +32,9 @@ RUN="$(mktemp -d "${TMPDIR:-/tmp}/moat-p2.XXXXXX")" || { echo "moat-p2: cannot c
 RUN="$(cd "$RUN" && pwd -P)"
 trap 'rm -rf "$RUN"' EXIT
 mkdir -p "$RUN/home" "$RUN/tmp" "$RUN/stub"
+# Read before HOME moves: a user-site fastapi (the console-verdict case drives
+# the real dashboard app) stays importable through PYTHONUSERBASE.
+MOAT_USERBASE="$(python3 -m site --user-base 2>/dev/null || true)"
 
 export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true
 export LOKI_DELEGATE_PR=0 LOKI_DASHBOARD=false
@@ -873,6 +876,303 @@ case_checklist_not_shadowed() {
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
 }
 
+# P2.console-verdict-needs-computed-result (BACKLOG 113). A console verdict
+# word (verified, valid, proven, tampered) must have a result the server
+# COMPUTED behind it. Four legs, every failure collected, each with controls:
+#   server  GET /api/proofs/<id> on a receipt from the REAL generator carries
+#           integrity_check: intact and intact-with-pr.json read verified (the
+#           controls), an edited copy tampered, a hash-less copy not_verified.
+#           GET /api/v2/audit/verify over a chain from the REAL audit writer
+#           reads verified (control), an edited chain tampered, no audit dir
+#           nothing_checked with verified:false.
+#   audit viewer  the real component: a checked chain reads [VALID] and a broken
+#           one [TAMPERED] (controls); zero files checked never reads VALID, a
+#           failed request or a verdict-less body never reads TAMPERED or VALID.
+#   receipt panel  PROVENANCE[classify(detail)] extracted from the real
+#           EvidenceReceiptPanel.tsx: a server-verified receipt still affirms
+#           (control); no server verdict, no hash, failed or not_verified never
+#           affirm; tampered says tampered.
+#   old code  the same two client probes run on the verbatim pre-fix lines
+#           (`valid !== false`, the catch that set valid:false, and classify()
+#           reading only `v.hash`), and must flag them: a probe that cannot see
+#           the old bug proves nothing about the new code.
+cv_old_audit() { # verbatim pre-fix lines of loki-audit-viewer.js (0afb6e2c)
+    cat <<'EOF'
+export class OldAuditViewer {
+  constructor(get) { this._api = { _get: get }; this._verifyResult = null; }
+  _escapeHtml(str) { if (!str) return ''; return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  async _verifyIntegrity() {
+    const api = this._api;
+    try {
+      const result = await api._get('/api/v2/audit/verify');
+      this._verifyResult = result;
+    } catch (err) {
+      this._verifyResult = { valid: false, error: err.message };
+    }
+  }
+  html() {
+      const isValid = this._verifyResult.valid !== false;
+      return `${isValid ? '[VALID] Audit chain integrity verified.' : `[TAMPERED] ${this._escapeHtml(this._verifyResult.error || 'Integrity check failed.')}`}`;
+  }
+}
+EOF
+}
+cv_old_receipt() { # verbatim pre-fix PROVENANCE labels/proven lines and classify() of EvidenceReceiptPanel.tsx
+    cat <<'EOF'
+const PROVENANCE: Record<string, { label: string; proven: string }> = {
+  verified: {
+    label: 'Verified',
+    proven: 'These receipt bytes are unaltered, and they were signed by the holder of the signing key.',
+  },
+  unsigned: {
+    label: 'Unsigned',
+    proven: 'The receipt is internally consistent with its own integrity hash.',
+  },
+  unchecked: {
+    label: 'Not checked',
+    proven: 'The integrity hash matches, so nothing is wrong with the contents.',
+  },
+  tampered: {
+    label: 'Tampered',
+    proven: 'Nothing. The recorded hash does not match the contents.',
+  },
+};
+function classify(detail: ProofDetail | null): Provenance {
+  const v = detail?.verification;
+  if (!v || !v.hash) return 'unsigned';
+  // A signature of either kind is present but not evaluated in-browser.
+  if (v.attestation || v.gpg_signature) return 'unchecked';
+  return 'unsigned';
+}
+EOF
+}
+case_console_verdict() {
+    need python3 git node || return
+    local d="$RUN/cv" ts="" bad="" out rc cand
+    for cand in web-app dashboard-ui; do
+        [ -f "$REPO_ROOT/$cand/node_modules/typescript/lib/typescript.js" ] \
+            && { ts="$REPO_ROOT/$cand/node_modules/typescript/lib/typescript.js"; break; }
+    done
+    [ -n "$ts" ] || { _why="prerequisite missing: typescript (npm ci in web-app or dashboard-ui of this checkout)"; return; }
+    PYTHONUSERBASE="$MOAT_USERBASE" python3 -c 'import fastapi, httpx' >/dev/null 2>&1 \
+        || { _why="prerequisite missing: python fastapi + httpx (the server leg drives the real dashboard app)"; return; }
+    mkdir -p "$d"
+
+    # --- server leg: a receipt from the real generator ---------------------------
+    new_repo "$d/repo" >/dev/null 2>&1 || { _why="fixture repo failed"; return; }
+    printf 'change\n' >> "$d/repo/seed.txt"; g "$d/repo" commit -qam change
+    mkdir -p "$d/repo/.loki/state" "$d/repo/.loki/quality"
+    printf '%s' '{"code_review":"passed","static_analysis":"passed","mock_integrity":"passed"}' > "$d/repo/.loki/state/quality-gates.json"
+    printf '%s' '{"status":"verified","command":"npm test","exit_code":0}' > "$d/repo/.loki/quality/test-results.json"
+    printf '%s' '{"command":"npm run build","exit_code":0,"ran":true}' > "$d/repo/.loki/quality/build-results.json"
+    (cd "$d/repo" && python3 "$GEN" --loki-dir "$d/repo/.loki" --out-dir "$d/gen" --quiet) >/dev/null 2>&1
+    [ -s "$d/gen/proof.json" ] || { _why="the real generator wrote no proof.json"; return; }
+    cat > "$d/server.py" <<'PY'
+import copy, json, sys
+from pathlib import Path
+root, gen_proof, work = sys.argv[1:4]
+sys.path.insert(0, root)
+from fastapi.testclient import TestClient
+from dashboard import server, audit
+loki = Path(work) / "loki"
+server._get_loki_dir = lambda: loki
+proof = json.load(open(gen_proof))
+def seed(rid, p, pr=None):
+    d = loki / "proofs" / rid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "proof.json").write_text(json.dumps(p, indent=2))
+    if pr:
+        (d / "pr.json").write_text(json.dumps({"pr_url": pr}))
+seed("r-ok", proof)
+seed("r-pr", proof, "https://example.invalid/pr/1")
+edited = copy.deepcopy(proof)
+edited["loki_version"] = "0.0.0-edited"
+seed("r-edit", edited)
+nohash = copy.deepcopy(proof)
+nohash.pop("verification", None)
+seed("r-nohash", nohash)
+c = TestClient(server.app, raise_server_exceptions=False)
+for rid in ("r-ok", "r-pr", "r-edit", "r-nohash"):
+    r = c.get("/api/proofs/" + rid)
+    ic = r.json().get("integrity_check") if r.status_code == 200 else None
+    print("PROOF %s %s" % (rid, ic.get("status") if isinstance(ic, dict) else "MISSING"))
+audit.ENTERPRISE_AUDIT_ENABLED = True
+audit.INTEGRITY_ENABLED = True
+def verify(label, d):
+    audit.AUDIT_DIR = d
+    r = c.get("/api/v2/audit/verify")
+    b = r.json() if r.status_code == 200 else {}
+    print("AUDIT %s %s %s files=%s" % (label, b.get("status", "MISSING"),
+                                       b.get("verified", "MISSING"), b.get("files_checked")))
+real = Path(work) / "audit-real"
+real.mkdir()
+audit.AUDIT_DIR = real
+audit._last_hash = "0" * 64
+audit.log_event("create", "project", "p1")
+audit.log_event("delete", "project", "p1")
+verify("real", real)
+f = sorted(real.glob("audit-*.jsonl"))[0]
+lines = f.read_text().splitlines()
+e = json.loads(lines[0])
+e["action"] = "edited"
+lines[0] = json.dumps(e)
+f.write_text("\n".join(lines) + "\n")
+verify("edited", real)
+verify("none", Path(work) / "audit-none")
+PY
+    rc=0
+    out="$(cd "$d" && PYTHONUSERBASE="$MOAT_USERBASE" python3 "$d/server.py" "$REPO_ROOT" "$d/gen/proof.json" "$d" 2> "$d/server.err")" || rc=$?
+    printf '%s\n' "$out" | sed 's/^/  console-verdict server: /' >&2
+    if ! printf '%s\n' "$out" | grep -q '^AUDIT none '; then
+        bad="$bad [server leg did not run (rc=$rc): $(tail -c 200 "$d/server.err" | tr '\n' ' ')]"
+    else
+        local want line
+        for want in "PROOF r-ok verified" "PROOF r-pr verified" "PROOF r-edit tampered" "PROOF r-nohash not_verified" \
+                    "AUDIT real verified True" "AUDIT edited tampered False" "AUDIT none nothing_checked False"; do
+            line="$(printf '%s\n' "$out" | grep "^${want%% *} $(printf '%s' "$want" | cut -d' ' -f2) " | head -1)"
+            case "$line" in
+                "$want"*) ;;
+                *) bad="$bad [server: want '$want', got '${line:-nothing}']" ;;
+            esac
+        done
+    fi
+
+    # --- client legs: the real components and the verbatim old lines -------------
+    cv_old_audit > "$d/old-audit.mjs"
+    cv_old_receipt > "$d/old-receipt.tsx"
+    python3 - "$REPO_ROOT/web-app/src/components/EvidenceReceiptPanel.tsx" > "$d/new-receipt.tsx" <<'PY' || { _why="$_why${bad:+$bad }could not extract PROVENANCE/classify from EvidenceReceiptPanel.tsx"; return; }
+import re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+out = []
+for start_re in (r"^const PROVENANCE\b", r"^function classify\("):
+    start = next((i for i, l in enumerate(lines) if re.search(start_re, l)), None)
+    if start is None:
+        sys.exit(3)
+    depth, seen = 0, False
+    for l in lines[start:]:
+        out.append(l)
+        depth += l.count("{") - l.count("}")
+        seen = seen or "{" in l
+        if seen and depth <= 0:
+            break
+print("\n".join(out))
+PY
+    cat > "$d/client.mjs" <<'EOF'
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import fs from 'node:fs';
+const [tsPath, dir, auditPath] = process.argv.slice(2);
+const ts = createRequire(import.meta.url)(tsPath);
+const fakeClassList = { contains: () => false, add() {}, remove() {}, toggle() {} };
+globalThis.document = { body: { classList: fakeClassList },
+  documentElement: { classList: fakeClassList, dataset: {}, style: { setProperty() {} } },
+  addEventListener() {}, removeEventListener() {}, querySelector: () => null,
+  createElement: () => ({ style: {}, setAttribute() {}, appendChild() {} }) };
+class FakeHTMLElement {
+  attachShadow() { this._s = { innerHTML: '', getElementById: () => null, querySelector: () => null, querySelectorAll: () => [] }; return this._s; }
+  get shadowRoot() { return this._s; }
+  getAttribute() { return null; } hasAttribute() { return false; } setAttribute() {} removeAttribute() {}
+}
+globalThis.HTMLElement = FakeHTMLElement;
+globalThis.customElements = { _d: new Map(), define(n, c) { this._d.set(n, c); }, get(n) { return this._d.get(n); } };
+globalThis.window = { location: { origin: 'http://localhost' }, matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }), addEventListener() {}, removeEventListener() {} };
+globalThis.getComputedStyle = () => ({ getPropertyValue: () => '' });
+globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+
+const AUDIT_IN = {
+  checked: async () => ({ valid: true, files_checked: 2, entries_checked: 5 }),
+  broken: async () => ({ valid: false, files_checked: 1, first_tampered_file: '/x/audit-1.jsonl', first_tampered_line: 2 }),
+  zero: async () => ({ valid: true, files_checked: 0, entries_checked: 0 }),
+  failed: async () => { throw new Error('HTTP 503'); },
+  noverdict: async () => ({ detail: 'Not authenticated' }),
+};
+function judgeAudit(t) {
+  const flags = [];
+  if (!/\[VALID\]/.test(t.checked)) flags.push('control: a checked chain does not read [VALID]');
+  if (!/TAMPERED/.test(t.broken)) flags.push('control: a broken chain does not read TAMPERED');
+  if (/\[VALID\]|integrity verified/i.test(t.zero)) flags.push('zero files checked reads VALID');
+  if (/TAMPERED|\[VALID\]/.test(t.failed)) flags.push('a failed request reads ' + (/TAMPERED/.test(t.failed) ? 'TAMPERED' : 'VALID'));
+  if (/TAMPERED|\[VALID\]/.test(t.noverdict)) flags.push('a body with no verdict reads a verdict');
+  return flags;
+}
+const H = 'h'.repeat(64);
+const RECEIPT_IN = {
+  server_verified: { verification: { hash: H }, integrity_check: { status: 'verified', gpg_ok: 'n/a' } },
+  server_signed: { verification: { hash: H, gpg_signature: 's' }, integrity_check: { status: 'verified', gpg_ok: true } },
+  no_server_verdict: { verification: { hash: H } },
+  no_hash: { verification: {} },
+  null_detail: null,
+  failed: { verification: { hash: H }, integrity_check: { status: 'failed', gpg_ok: false } },
+  not_verified: { verification: { hash: H }, integrity_check: { status: 'not_verified' } },
+  tampered: { verification: { hash: H }, integrity_check: { status: 'tampered' } },
+};
+function judgeReceipt(P, classify) {
+  const say = (k) => { const s = P[classify(RECEIPT_IN[k])] || {}; return { label: String(s.label), affirms: !/^Nothing\b/.test(String(s.proven)) }; };
+  const flags = [];
+  if (!say('server_verified').affirms) flags.push('control: a server-verified receipt no longer affirms anything');
+  if (say('server_signed').label !== 'Verified') flags.push('control: a server-verified signed receipt is not labelled Verified');
+  for (const k of ['no_server_verdict', 'no_hash', 'null_detail', 'failed', 'not_verified']) {
+    const s = say(k);
+    if (s.affirms) flags.push(`${k} affirms ("${s.label}")`);
+  }
+  if (!/tamper/i.test(say('tampered').label)) flags.push(`a tampered verdict reads "${say('tampered').label}"`);
+  return flags;
+}
+async function loadTs(file, name) {
+  const js = ts.transpileModule(fs.readFileSync(file, 'utf8') + '\nexport { PROVENANCE, classify };\n',
+    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 } }).outputText;
+  const f = `${dir}/${name}.mjs`;
+  fs.writeFileSync(f, js);
+  return import(pathToFileURL(f).href);
+}
+const html = (el) => el.shadowRoot.innerHTML.replace(/<style>[\s\S]*?<\/style>/g, '');
+async function runAudit(make, read) {
+  const t = {};
+  for (const [k, get] of Object.entries(AUDIT_IN)) { const el = make(get); await el._verifyIntegrity(); t[k] = read(el); }
+  return judgeAudit(t);
+}
+const { LokiAuditViewer } = await import(pathToFileURL(auditPath).href);
+const { OldAuditViewer } = await import(pathToFileURL(`${dir}/old-audit.mjs`).href);
+const newA = await runAudit((get) => { const el = new LokiAuditViewer(); el.attachShadow({ mode: 'open' }); el._api = { _get: get, _post: async () => ({}) }; el._loading = false; return el; }, html);
+const oldA = await runAudit((get) => new OldAuditViewer(get), (el) => el.html());
+const nr = await loadTs(`${dir}/new-receipt.tsx`, 'new-receipt');
+const or = await loadTs(`${dir}/old-receipt.tsx`, 'old-receipt');
+const newR = judgeReceipt(nr.PROVENANCE, nr.classify);
+const oldR = judgeReceipt(or.PROVENANCE, or.classify);
+for (const f of newA) console.log('NEW audit-viewer: ' + f);
+for (const f of newR) console.log('NEW receipt-panel: ' + f);
+for (const f of oldA) console.log('OLD audit-viewer: ' + f);
+for (const f of oldR) console.log('OLD receipt-panel: ' + f);
+console.log('CHECKED');
+EOF
+    rc=0
+    out="$(node "$d/client.mjs" "$ts" "$d" "$REPO_ROOT/dashboard-ui/components/loki-audit-viewer.js" 2> "$d/client.err")" || rc=$?
+    printf '%s\n' "$out" | sed 's/^/  console-verdict client: /' >&2
+    if ! printf '%s\n' "$out" | grep -qx 'CHECKED'; then
+        bad="$bad [client legs did not run (rc=$rc): $(tail -c 240 "$d/client.err" | tr '\n' ' ')]"
+    else
+        # Positive controls: the probes must see the old bug, on every shape it had.
+        local ctl
+        for ctl in "OLD audit-viewer: zero files checked reads VALID" "OLD audit-viewer: a failed request reads TAMPERED" \
+                   "OLD receipt-panel: no_server_verdict affirms" "OLD receipt-panel: no_hash affirms" \
+                   "OLD receipt-panel: a tampered verdict reads"; do
+            printf '%s\n' "$out" | grep -qF "$ctl" || bad="$bad [positive control: the probe did not flag the verbatim old code: $ctl]"
+        done
+        # Negative controls the old code did satisfy (it read a checked chain
+        # VALID, a broken one TAMPERED, and affirmed a good receipt): flagging
+        # those would mean the probe is too strict, not that the code was wrong.
+        # (It could never label a signed receipt Verified, so that one is new-only.)
+        for ctl in "OLD audit-viewer: control: a checked chain" "OLD audit-viewer: control: a broken chain" \
+                   "OLD receipt-panel: control: a server-verified receipt"; do
+            printf '%s\n' "$out" | grep -qF "$ctl" && bad="$bad [negative control: the probe flags what the old code got right: $ctl]"
+        done
+        while IFS= read -r line; do
+            bad="$bad [${line#NEW }]"
+        done < <(printf '%s\n' "$out" | grep '^NEW ')
+    fi
+    if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
+}
+
 # --- run ----------------------------------------------------------------------
 run_case P2.advisory-only-never-verified "advisory/model-only gate passes never yield a VERIFIED headline (generator + verifier)" case_advisory_only
 run_case P2.unknown-gate-fails-closed "an unrecognized gate name or status cannot read green (generator + verifier)" case_unknown_gate
@@ -888,6 +1188,7 @@ run_case P2.council-inconclusive-cannot-exit-zero "inconclusive evidence plus a 
 run_case P2.council-readers-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing test results green in the council's readers" case_council_readers_not_shadowed
 run_case P2.checklist-verify-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing PRD checklist checks green (checklist-verify.py, summary, council evidence, hard gate)" case_checklist_not_shadowed
 run_case P2.exit-zero-with-failures-not-pass "a runner that exits 0 while its own summary reports failures (jest 'Tests: 1 failed') is recorded pass:false with no unit-tests.pass, and the council blocks it (bash); a recorded failed_count > 0 (or legacy failed > 0) with pass:true fails the council evidence gate and the Bun test gate alike, while 0, null and a missing count still pass on both" case_exit_zero_with_failures
+run_case P2.console-verdict-needs-computed-result "a console verdict word needs a computed result: the receipt route carries the verifier's integrity_check (tampered, not_verified, verified on a real generator receipt), the audit verify route says nothing_checked for zero files, the audit viewer never reads VALID for nothing checked or TAMPERED for a failed request, and the receipt panel never affirms without a server-verified result; both client probes flag the verbatim pre-fix lines" case_console_verdict
 
 printf 'moat-p2: finished in %ss\n' "$(( $(date +%s) - T_START ))" >&2
 exit 0

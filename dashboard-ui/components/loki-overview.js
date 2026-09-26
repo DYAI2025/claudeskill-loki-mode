@@ -419,12 +419,14 @@ export class LokiOverview extends LokiElement {
         </div>
       `;
     }
+    // PASSED only when the gate says so. Any other status is not a pass.
+    const passed = g.status === 'passed' || g.status === 'pass';
     return `
       <div class="overview-card">
         <div class="card-label">Council Gate</div>
         <div class="card-value small-text">
-          <span class="status-dot active"></span>
-          PASSED
+          <span class="status-dot ${passed ? 'active' : 'offline'}"></span>
+          ${passed ? 'PASSED' : `Unknown (${this._escapeHtml(String(g.status))})`}
         </div>
       </div>
     `;
@@ -470,7 +472,7 @@ export class LokiOverview extends LokiElement {
     const firstSeconds = journey.time_to_first_result_sec;
     const firstMeasured = typeof firstSeconds === 'number' && firstSeconds >= 0;
     const firstKind = journey.first_result_kind === 'code_change'
-      ? 'verified patch'
+      ? 'first code change'
       : journey.first_result_kind === 'proposed_solution_plan'
         ? 'proposed solution'
         : 'result';
@@ -479,7 +481,7 @@ export class LokiOverview extends LokiElement {
     const headline = typeof proof?.honesty?.headline === 'string' ? proof.honesty.headline : null;
     const gaps = Array.isArray(proof?.honesty?.degraded) ? proof.honesty.degraded.length : null;
     const proofValue = headline || 'Not evaluated';
-    const proofMeta = gaps === null ? 'Uncertainty not measured' : (gaps === 0 ? 'No recorded gaps' : `${gaps} recorded gap${gaps === 1 ? '' : 's'}`);
+    const proofMeta = (headline ? 'Recorded, not re-verified here; ' : '') + (gaps === null ? 'uncertainty not measured' : (gaps === 0 ? 'no recorded gaps' : `${gaps} recorded gap${gaps === 1 ? '' : 's'}`));
 
     const pullRequest = journey.pull_request;
     let prValue = 'Not prepared';
@@ -498,7 +500,7 @@ export class LokiOverview extends LokiElement {
         <div class="journey-heading" id="journey-heading">Issue to PR</div>
         <div class="journey-steps">
           ${this._renderJourneyStep('Current phase', phaseValue, 'Live session status')}
-          ${this._renderJourneyStep('First useful result', firstValue, firstMeasured && journey.first_result_verified_patch !== true ? 'Plan only, not a verified patch' : 'From the run receipt')}
+          ${this._renderJourneyStep('First useful result', firstValue, firstMeasured && journey.first_result_verified_patch !== true ? 'Plan only, no code change yet' : 'From the run receipt')}
           ${this._renderJourneyStep('Gates and evidence', proofValue, proofMeta)}
           ${this._renderJourneyStep('PR readiness', prValue, prLink || 'No public PR URL recorded')}
         </div>

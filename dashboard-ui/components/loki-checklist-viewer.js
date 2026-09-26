@@ -444,7 +444,7 @@ export class LokiChecklistViewer extends LokiElement {
     if (unwaivedCritical.length > 0) {
       return `<div class="gate-banner gate-blocked">COUNCIL GATE: BLOCKED - ${unwaivedCritical.length} critical item${unwaivedCritical.length !== 1 ? 's' : ''} must be verified or waived before completion</div>`;
     }
-    return '<div class="gate-banner gate-passed">COUNCIL GATE: PASSED - No blocking critical failures</div>';
+    return '<div class="gate-banner gate-passed">COUNCIL GATE: NOT BLOCKED - no critical item is failing</div>';
   }
 
   render() {

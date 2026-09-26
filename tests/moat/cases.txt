@@ -74,3 +74,4 @@ P6.resume-keeps-ignored-user-file
 P6.resume-after-interrupt-commits-agent-files
 P6.agent-self-commit-does-not-lose-user-file
 P2.exit-zero-with-failures-not-pass
+P2.console-verdict-needs-computed-result

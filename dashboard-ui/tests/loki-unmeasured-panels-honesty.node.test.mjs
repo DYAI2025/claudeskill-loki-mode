@@ -308,3 +308,40 @@ describe('app status, keys, runs, checklist, gates, diff, preview', async () => 
     el._error = null; el._status = { status: 'not_initialized' }; el.render(); h = html(el); assert.match(h, /No app running yet/);
   });
 });
+
+// BACKLOG 113: the audit viewer printed "[VALID] ... verified" for any result
+// whose `valid` was not false, so a server that checked zero files read as a
+// verified chain, and its catch turned a failed request into "[TAMPERED]".
+// A verdict needs a computed result behind it: VALID only for valid === true
+// with files checked, TAMPERED only for a chain the server found broken.
+describe('audit viewer verify banner', async () => {
+  const { LokiAuditViewer } = await import(C('loki-audit-viewer.js'));
+  const verify = async (get) => {
+    const el = mount(LokiAuditViewer, { _get: get });
+    await el._verifyIntegrity();
+    return html(el);
+  };
+  it('a chain with files checked reads VALID (control)', async () => {
+    const h = await verify(async () => ({ valid: true, files_checked: 2, entries_checked: 9 }));
+    assert.match(h, /\[VALID\]/); assert.doesNotMatch(h, /TAMPERED|NOT VERIFIED/);
+  });
+  it('zero files checked is not a verified chain', async () => {
+    const h = await verify(async () => ({ valid: true, files_checked: 0, entries_checked: 0 }));
+    assert.doesNotMatch(h, /\[VALID\]|integrity verified/i); assert.doesNotMatch(h, /TAMPERED/);
+    assert.match(h, /NOT VERIFIED/); assert.match(h, /nothing was checked/i);
+  });
+  it('a failed request reads NOT VERIFIED (could not check), never TAMPERED', async () => {
+    const h = await verify(fail);
+    assert.doesNotMatch(h, /TAMPERED|\[VALID\]/); assert.match(h, /NOT VERIFIED/); assert.match(h, /could not check/i);
+  });
+  it('a body with no verdict reads NOT VERIFIED', async () => {
+    const h = await verify(async () => ({ detail: 'Not authenticated' }));
+    assert.doesNotMatch(h, /TAMPERED|\[VALID\]/); assert.match(h, /NOT VERIFIED/);
+  });
+  it('a broken chain reads TAMPERED with where it broke (control)', async () => {
+    const h = await verify(async () => ({ valid: false, files_checked: 1, entries_checked: 1,
+      first_tampered_file: '/x/audit-2026-09-26.jsonl', first_tampered_line: 2 }));
+    assert.match(h, /\[TAMPERED\]/); assert.match(h, /audit-2026-09-26\.jsonl/); assert.match(h, /line 2/);
+    assert.doesNotMatch(h, /\[VALID\]/);
+  });
+});
