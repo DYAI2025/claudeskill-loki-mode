@@ -1291,6 +1291,121 @@ else
 fi
 
 # =============================================================================
+# Test T-opt-out-leftover-branch (BACKLOG 90): the user stays on a leftover
+# session branch, makes a file, and runs again with LOKI_BRANCH_PROTECTION=false.
+# Setup takes no snapshot on the opt-out, so the earlier session's snapshot is
+# stale: committing with it would sweep the new file in, and a checkout of the
+# base would delete it. The opt-out must commit nothing and leave the index
+# alone. The second run is its own process, like a real `loki start`.
+# =============================================================================
+echo "Test T-opt-out-leftover-branch (BACKLOG 90): opt-out on a leftover session branch commits nothing"
+ROO="$(make_repo toptoutleftover)"
+outoo="$(
+    cd "$ROO" || exit 1
+    source "$PREAMBLE"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    s1="$(git rev-parse --abbrev-ref HEAD)"
+    printf 'print(1)\n' > app.py
+    commit_session_changes >/dev/null 2>&1
+    s1_commit="$(git cat-file -e HEAD:app.py 2>/dev/null && echo yes || echo no)"
+    s1_head="$(git rev-parse HEAD)"
+    printf 'mine\n' > later.txt
+    msg="$(LOKI_BRANCH_PROTECTION=false bash -c '. "$1"; ITERATION_COUNT=1; result=0; setup_agent_branch; commit_session_changes' _ "$PREAMBLE" 2>&1)"
+    case "$s1" in (loki/session-*) leftover=yes ;; (*) leftover=no ;; esac
+    same="$( [ "$(git rev-parse HEAD)" = "$s1_head" ] && echo yes || echo no )"
+    in_head="$(git cat-file -e HEAD:later.txt 2>/dev/null && echo yes || echo no)"
+    staged="$(git diff --cached --name-only | tr '\n' ' ')"
+    said="$(printf '%s' "$msg" | grep -q 'no session commit' && echo yes || echo no)"
+    git checkout -q develop 2>/dev/null
+    after="$(cat later.txt 2>/dev/null || echo MISSING)"
+    printf 'LEFTOVER=%s S1COMMIT=%s SAME=%s INHEAD=%s STAGED=[%s] SAID=%s AFTER=%s' \
+        "$leftover" "$s1_commit" "$same" "$in_head" "$staged" "$said" "$after"
+)"
+if [ "$outoo" = "LEFTOVER=yes S1COMMIT=yes SAME=yes INHEAD=no STAGED=[] SAID=yes AFTER=mine" ]; then
+    pass "opt-out on a leftover session branch: no commit, index untouched, the user's new file survives the base checkout"
+else
+    fail "opt-out on a leftover session branch committed with a stale snapshot (or lost the user's file)" "got: $outoo"
+fi
+
+# =============================================================================
+# Test T-agent-self-commit (BACKLOG 74): the agent rewrites .gitignore and runs
+# `git add -A && git commit` itself, putting the user's untracked usernotes.txt
+# and ignored debug.log and dist/app.js (a "dist/" snapshot entry covers the
+# file) on the session branch. The session commit must take them out of the
+# branch tip (they stay on disk), name them, say the history still holds them,
+# and record them; a checkout of the base must not delete them.
+# =============================================================================
+echo "Test T-agent-self-commit (BACKLOG 74): user files the agent committed are removed from the branch tip, kept on disk"
+RSC="$(make_repo tselfcommit)"
+outsc="$(
+    cd "$RSC" || exit 1
+    source "$PREAMBLE"
+    printf 'my notes\n' > usernotes.txt
+    printf 'debug\n' > debug.log
+    mkdir -p dist && printf 'built\n' > dist/app.js
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'build/\n' > .gitignore
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    swept="$(git ls-tree -r --name-only HEAD | grep -cxE 'usernotes\.txt|debug\.log|dist/app\.js')"
+    msg="$(commit_session_changes 2>&1)"
+    kept="$(git ls-tree -r --name-only HEAD | grep -xE 'usernotes\.txt|debug\.log|dist/app\.js' | tr '\n' ' ')"
+    agent="$(git cat-file -e HEAD:work.py 2>/dev/null && echo yes || echo no)"
+    named="$(printf '%s' "$msg" | grep 'usernotes.txt' | grep 'debug.log' | grep -q 'dist/app.js' && echo yes || echo no)"
+    history="$(printf '%s' "$msg" | grep -q 'do not push' && echo yes || echo no)"
+    rec="$(tr '\000' ' ' 2>/dev/null < .loki/state/agent-committed-user-files.z)"
+    git checkout -q develop 2>/dev/null
+    intact="$( [ "$(cat usernotes.txt 2>/dev/null)" = "my notes" ] && [ "$(cat debug.log 2>/dev/null)" = "debug" ] \
+        && [ "$(cat dist/app.js 2>/dev/null)" = "built" ] && echo yes || echo no )"
+    printf 'SWEPT=%s KEPT=[%s] AGENT=%s NAMED=%s HISTORY=%s REC=[%s] INTACT=%s' \
+        "$swept" "$kept" "$agent" "$named" "$history" "$rec" "$intact"
+)"
+if [ "$outsc" = "SWEPT=3 KEPT=[] AGENT=yes NAMED=yes HISTORY=yes REC=[debug.log dist/app.js usernotes.txt ] INTACT=yes" ]; then
+    pass "agent self-commit: user files out of the branch tip, named, recorded, intact after the base checkout; agent work kept"
+else
+    fail "agent self-commit left user files on the branch tip (or lost them)" "got: $outsc"
+fi
+
+# =============================================================================
+# Test T-agent-self-commit-secret-abort (BACKLOG 74): the agent self-commits
+# the user's untracked .env, then leaves a new secret-bearing config.js. The
+# secret scan aborts the session commit; the user's .env must still come off
+# the branch tip (an abort that restored it would let a base checkout delete
+# it), and the agent's secret must not be committed.
+# =============================================================================
+echo "Test T-agent-self-commit-secret-abort (BACKLOG 74): a secret abort never puts the user's .env back on the branch"
+RSS="$(make_repo tselfcommitsecret)"
+outss="$(
+    cd "$RSS" || exit 1
+    source "$PREAMBLE"
+    printf 'API_TOKEN=mine\n' > .env
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    swept="$(git cat-file -e HEAD:.env 2>/dev/null && echo yes || echo no)"
+    printf '%s\n' 'const KEY="sk-AbCdEf0123456789AbCdEfGh"' > config.js
+    msg="$(commit_session_changes 2>&1)"
+    env_in_head="$(git cat-file -e HEAD:.env 2>/dev/null && echo yes || echo no)"
+    secret_in_head="$(git cat-file -e HEAD:config.js 2>/dev/null && echo yes || echo no)"
+    aborted="$(printf '%s' "$msg" | grep -q 'possible secret detected in config.js' && echo yes || echo no)"
+    git checkout -q develop 2>/dev/null
+    intact="$( [ "$(cat .env 2>/dev/null)" = "API_TOKEN=mine" ] && echo yes || echo no )"
+    printf 'SWEPT=%s ENVINHEAD=%s SECRETINHEAD=%s ABORTED=%s INTACT=%s' \
+        "$swept" "$env_in_head" "$secret_in_head" "$aborted" "$intact"
+)"
+if [ "$outss" = "SWEPT=yes ENVINHEAD=no SECRETINHEAD=no ABORTED=yes INTACT=yes" ]; then
+    pass "secret abort: the user's .env is off the branch tip and survives the base checkout; the agent's secret not committed"
+else
+    fail "a secret abort left the user's .env on the branch (or committed the secret)" "got: $outss"
+fi
+
+# =============================================================================
 # MUTATION CHECK (non-vacuity proof for T-nested-secret-file).
 # Disable ONLY _commit_path_looks_secret (the path heuristic) AFTER sourcing
 # BRANCH_LIB, leaving the content scan intact, re-run the SAME nested-secret

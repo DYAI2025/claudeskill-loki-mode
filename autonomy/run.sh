@@ -9367,6 +9367,86 @@ fi
 if ! type _commit_scan_secret_file >/dev/null 2>&1; then _commit_scan_secret_file() { return 1; }; fi
 if ! type _commit_path_looks_secret >/dev/null 2>&1; then _commit_path_looks_secret() { return 1; }; fi
 
+# _loki_covered_paths <paths> <snapshot> <top> <out>
+# Atomically write <out>: the NUL-delimited entries of <paths> that <snapshot>
+# covers (the entry itself or a parent "dir/" entry, as workspace_diff._covered)
+# and that still exist under <top>. Non-zero on a read or write failure. -E and
+# no cwd on sys.path (D7): the cwd is the agent's repo.
+_loki_covered_paths() {
+    python3 -E -c 'import sys
+sys.path[:] = [p for p in sys.path if p not in ("", ".")]
+import os
+paths, snap, top, out = sys.argv[1:5]
+def entries(path):
+    with open(path, "rb") as fh:
+        return [p for p in fh.read().split(b"\0") if p]
+held = set(entries(snap))
+def covered(path):
+    if path in held:
+        return True
+    cut = path.find(b"/")
+    while cut != -1:
+        if path[:cut + 1] in held:
+            return True
+        cut = path.find(b"/", cut + 1)
+    return False
+# A file gone from disk stays tracked: untracking it would leave its bytes
+# only in history.
+top = os.fsencode(top)
+hits = [p for p in entries(paths) if covered(p) and os.path.lexists(os.path.join(top, p))]
+with open(out + ".tmp", "wb") as fh:
+    fh.write(b"".join(p + b"\0" for p in hits))
+os.replace(out + ".tmp", out)' "$@" 2>/dev/null
+}
+
+# _loki_untrack_agent_committed_user_files <branch> (BACKLOG 74)
+# An agent that rewrites .gitignore and runs `git add -A && git commit` itself
+# puts the user's untracked or ignored files on the session branch, and a
+# checkout of the base then deletes them from disk. Files ADDED on the branch
+# since it forked from the recorded base that the pre-existing snapshot covers
+# are removed from the index (they stay on disk) and that removal is committed
+# on its own, before the session commit: it adds no content, and no later exit
+# (a secret abort, a failed unstage) can put the files back on the branch tip.
+# Records this session's removals in .loki/state/agent-committed-user-files.z
+# and warns that the branch history still holds them. Non-zero only when the
+# removal could not be committed: the caller then makes no session commit,
+# whose `git add -A` would stage the files again.
+_loki_untrack_agent_committed_user_files() {
+    local snap=".loki/state/preexisting-untracked.z" rec=".loki/state/agent-committed-user-files.z"
+    local base="" fork="" top="" names=""
+    [ -s "$snap" ] || return 0
+    [ -s .loki/state/base-branch.txt ] && base="$(cat .loki/state/base-branch.txt 2>/dev/null)"
+    if ! top="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "$base" ] \
+       || ! fork="$(git merge-base HEAD "$base" 2>/dev/null)"; then
+        log_warn "Could not check whether the agent committed your pre-existing untracked files (base branch '${base:-unknown}' not found). Review $1 before pushing it."
+        return 0
+    fi
+    # --no-renames: a user file swept in beside a deleted tracked file must
+    # read as added, not as a rename of that file.
+    if ! git -C "$top" diff --name-only -z --no-renames --diff-filter=A "$fork" HEAD > "$rec.added" 2>/dev/null \
+       || ! _loki_covered_paths "$rec.added" "$snap" "$top" "$rec.new"; then
+        rm -f "$rec.added" "$rec.new" "$rec.new.tmp"
+        log_warn "Could not check whether the agent committed your pre-existing untracked files. Review $1 before pushing it."
+        return 0
+    fi
+    rm -f "$rec.added"
+    if [ ! -s "$rec.new" ]; then
+        rm -f "$rec.new"
+        return 0
+    fi
+    mv -f "$rec.new" "$rec"
+    names="$(_loki_nul_names "$rec")"
+    git reset -q >/dev/null 2>&1 || true
+    if ! git -C "$top" update-index -z --force-remove --stdin < "$rec" >/dev/null 2>&1 \
+       || ! git commit -q -m "Loki Mode: untrack pre-existing user files the agent committed" >/dev/null 2>&1; then
+        log_warn "The agent committed your pre-existing files on $1 and Loki could not remove them from the branch: ${names}. They are on disk. Before switching branches, run git rm --cached on each and commit, or a checkout of the base deletes them. Left uncommitted: no session commit."
+        return 1
+    fi
+    log_warn "The agent committed your pre-existing untracked or ignored files on $1: ${names}. Loki removed them from the branch tip; they stay on disk, untracked. The branch history still holds them: do not push $1 as-is. To drop them from its history: git reset --soft ${fork} && git commit"
+    audit_agent_action "git_untrack_user_files" "Removed pre-existing user files the agent committed" "files=${names}" || true
+    return 0
+}
+
 commit_session_changes() {
     # Squash the session's work into one honest session-end commit on the agent
     # branch (LOCK A3/A4/A8). Commit-always (incl. failed runs) so the user is
@@ -9401,6 +9481,25 @@ commit_session_changes() {
             ;;
     esac
 
+    # Commit nothing unless THIS run took a current snapshot (BACKLOG 90). The
+    # LOCK A1 opt-out takes none, so it never commits, even on a leftover
+    # loki/session-* branch whose agent-branch.txt and snapshot belong to an
+    # earlier session: that stale snapshot would sweep in a file the user made
+    # since, and a checkout of the base would delete it. Checked before any
+    # staging, so the opt-out leaves the user's index alone.
+    if [ "${_LOKI_SNAPSHOT_THIS_RUN:-0}" != 1 ]; then
+        if [ "${LOKI_BRANCH_PROTECTION:-true}" != "true" ]; then
+            log_info "Branch protection off (LOKI_BRANCH_PROTECTION=${LOKI_BRANCH_PROTECTION}): no session commit; the work stays uncommitted on ${cur}"
+        elif [ -f "$PWD/.loki/state/preexisting-untracked.failed" ]; then
+            log_warn "Left uncommitted: could not record your pre-existing untracked files at session start (the snapshot needs git 2.18+, excluding them needs 2.25+). Review and commit manually."
+        else
+            log_warn "Left uncommitted: this run recorded no snapshot of your pre-existing untracked files, so it makes no session commit. Review and commit manually."
+        fi
+        return 0
+    fi
+
+    _loki_untrack_agent_committed_user_files "$cur" || return 0
+
     # Stage everything except .loki/ runtime state and a secret-path denylist.
     # These excludes are defense-in-depth ONLY for the top-level cases git
     # pathspec handles cleanly. We deliberately do NOT add nested globs like
@@ -9426,12 +9525,8 @@ commit_session_changes() {
     # Agent-created files stay staged. Skip an empty snapshot: an
     # empty --pathspec-from-file resets the WHOLE index. No snapshot (older
     # session): behave as before. If the unstage fails (git < 2.25), commit
-    # nothing rather than sweep the user's files in.
-    if [ -f "$PWD/.loki/state/preexisting-untracked.failed" ]; then
-        git reset -q >/dev/null 2>&1 || true
-        log_warn "Left uncommitted: could not record your pre-existing untracked files at session start (the snapshot needs git 2.18+, excluding them needs 2.25+). Review and commit manually."
-        return 0
-    fi
+    # nothing rather than sweep the user's files in. A failed snapshot never
+    # gets here (the snapshot guard above returns first).
     local preexisting="$PWD/.loki/state/preexisting-untracked.z" top=""
     if [ -s "$preexisting" ]; then
         if ! { top="$(git rev-parse --show-toplevel 2>/dev/null)" \
@@ -12089,6 +12184,12 @@ ZT_MATCHES_EOF
 }
 
 enforce_test_coverage() {
+    # Every suite this gate launches (pytest, unittest, the coverage pass, a
+    # package script that runs Python) runs inside the user's repo: no
+    # __pycache__/*.pyc there, so none can land in the session commit when the
+    # repo does not ignore them (BACKLOG 85). Bytecode caching only; the same
+    # tests run. Scoped to this call.
+    local -x PYTHONDONTWRITEBYTECODE=1
     local loki_dir="${TARGET_DIR:-.}/.loki"
     local quality_dir="$loki_dir/quality"
     mkdir -p "$quality_dir" "$loki_dir/signals"
