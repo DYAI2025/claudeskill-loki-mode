@@ -76,6 +76,11 @@ _loki_prd_enrich_invoke() {
         fi
         # fall through to the claude path (fail-closed)
     fi
+    # Only the provider the operator chose may see a prompt (V10 P5). The gate
+    # above admits any provider with an argv seam, but this call is claude-only.
+    # ponytail: non-claude providers take the fallback; upgrade path is routing
+    # this call through provider_invoke_argv.
+    [ "${LOKI_PROVIDER:-claude}" = "claude" ] || return 1
     command -v claude >/dev/null 2>&1 || return 1
     local rc=0
     local out=""

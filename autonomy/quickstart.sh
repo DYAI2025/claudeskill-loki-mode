@@ -763,6 +763,10 @@ _qs_detect_brownfield() {
 : "${LOKI_QUICKSTART_CLASSIFY_TIMEOUT:=15}"
 _qs_classify_invoke() {
     local prompt="$1"
+    # Only the provider the operator chose may see a prompt (V10 P5): with any
+    # other provider the offline keyword ranking is used.
+    # ponytail: upgrade path is routing this call through provider_invoke_argv.
+    [ "${LOKI_PROVIDER:-claude}" = "claude" ] || return 1
     command -v claude >/dev/null 2>&1 || return 1
     local rc=0 out=""
     local to=""

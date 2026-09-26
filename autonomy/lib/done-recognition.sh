@@ -100,6 +100,11 @@ _loki_done_recog_invoke() {
         # fall through to the claude/deterministic paths (fail-closed)
     fi
 
+    # Only the provider the operator chose may see a prompt (V10 P5). The gate
+    # above admits any provider with an argv seam, but this call is claude-only.
+    # ponytail: non-claude providers take the fallback; upgrade path is routing
+    # this call through provider_invoke_argv.
+    [ "${LOKI_PROVIDER:-claude}" = "claude" ] || return 1
     command -v claude >/dev/null 2>&1 || return 1
 
     # STRUCTURED VERDICT (v8.x): when the CLI supports --json-schema, force valid

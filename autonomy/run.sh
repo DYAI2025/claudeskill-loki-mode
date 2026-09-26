@@ -19331,6 +19331,10 @@ PYEOF
 _intelligent_usage_regen() {
     local target_dir="${TARGET_DIR:-.}"
     local usage_path="$target_dir/USAGE.md"
+    # Only the provider the operator chose may see a prompt (V10 P5): on any
+    # other provider keep the agent-written USAGE.md.
+    # ponytail: upgrade path is routing this call through provider_invoke_argv.
+    [ "${LOKI_PROVIDER:-claude}" = "claude" ] || return 0
     # Find a working `claude` binary; if absent, bail silently.
     if ! command -v claude >/dev/null 2>&1; then
         return 0
