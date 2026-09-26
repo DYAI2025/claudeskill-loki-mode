@@ -1071,6 +1071,7 @@ fi
 # guard hides the mutation.
 RED_RUN_SH="$WORKROOT/run-nobacklog70.sh"
 sed -e '/_loki_snapshot_seal$/d' \
+    -e '/BACKLOG-70-SEAL-CHECK$/d' \
     -e '/_loki_snapshot_verify || return 1$/d' \
     -e '/_loki_snapshot_verify || true$/d' \
     -e '/if ! _loki_snapshot_verify; then/,/^    fi$/d' \
@@ -1086,12 +1087,12 @@ if [ -f "$_SECRET_LIB" ]; then
     printf '\n' >> "$RED_LIB"
     cat "$_SECRET_LIB" >> "$RED_LIB"
 fi
-# Non-vacuity for the mutation itself: all four call sites (not the function
+# Non-vacuity for the mutation itself: all five call sites (not the function
 # DEFINITIONS, which stay behind as harmless dead code) must be gone from the
 # extracted block, or this "RED" run would just re-prove the fixed behavior.
 # grep -c always prints a count and exits 1 on zero matches, so it is never
 # combined with `|| echo`, which would print a second, misleading line.
-red_removed="$(grep -c '^    _loki_snapshot_seal$\|_loki_snapshot_verify || return 1\|_loki_snapshot_verify || true\|if ! _loki_snapshot_verify; then' "$RED_LIB")"
+red_removed="$(grep -c '^    _loki_snapshot_seal$\|BACKLOG-70-SEAL-CHECK\|_loki_snapshot_verify || return 1\|_loki_snapshot_verify || true\|if ! _loki_snapshot_verify; then' "$RED_LIB")"
 RED_PREAMBLE="$WORKROOT/red-preamble.sh"
 sed "s#$BRANCH_LIB#$RED_LIB#" "$PREAMBLE" > "$RED_PREAMBLE" 2>/dev/null \
     || cp "$PREAMBLE" "$RED_PREAMBLE"
@@ -1128,6 +1129,305 @@ if [ "$red_removed" = 0 ] && [ "$outhdr" = "RC=0 INHEADNOTES=no INHEADWORK=yes D
     pass "RED confirmed: without the BACKLOG-70 guard, the deleted hash file goes undisclosed and the agent's work.js is committed with no warning (non-vacuous)"
 else
     fail "RED reproduction did not show the pre-fix silent-degrade behavior" "red_removed=$red_removed got: $outhdr"
+fi
+
+# =============================================================================
+# Test T-snapshot-hash-fake-awk-on-path (BACKLOG-70 rework): a same-UID agent
+# places a fake `awk` in a directory prepended to PATH that unconditionally
+# prints a well-formed but STALE 64-hex-char digest, then edits a sealed
+# snapshot file. The pre-rework digest computation piped the real hash tool's
+# output through `awk '{print $1}'` resolved via a bare PATH lookup, so the
+# fake awk would intercept that pipe and the stale digest would still "match"
+# the seal -- reintroducing the exact same-UID PATH-hijack bypass class the
+# shasum/sha256sum switch was written to close, just moved one command over.
+# The rework drops awk entirely (shell parameter expansion + explicit hex
+# validation instead), so this must go undetected -> caught: verify must now
+# report a mismatch even though the fake awk's output is well-formed, and the
+# fake awk must never actually run.
+# =============================================================================
+echo "Test T-snapshot-hash-fake-awk-on-path (BACKLOG-70 rework): a fake awk ahead on PATH cannot forge the seal"
+EVILBIN="$WORKROOT/evil-awk-bin"
+mkdir -p "$EVILBIN"
+cat > "$EVILBIN/awk" <<'EOF'
+#!/bin/sh
+# Fake awk: prove it ran, then always print ONLY a well-formed (exactly 64
+# lowercase hex chars, all "a" so the count is trivially verifiable) stale
+# digest -- no trailing filename field, matching what a REAL `awk '{print $1}'`
+# would have extracted from a real `sha256sum`/`shasum` line (the fake tool
+# forges the field-extraction result directly, since it never looks at stdin).
+touch "$(dirname "$0")/.awk-ran"
+printf '%s\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+EOF
+chmod +x "$EVILBIN/awk"
+RFA="$(make_repo tfakeawk)"
+outfa="$(
+    cd "$RFA" || exit 1
+    source "$PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    # Run the SEAL under the same poisoned PATH the RED reproduction uses, so
+    # this GREEN case differs from RED only in the code under test (awk
+    # present vs. absent), not in which half of the run saw a clean PATH.
+    PATH="$EVILBIN:$PATH" setup_agent_branch >/dev/null 2>&1
+    # Positive control: the poisoned PATH really does shadow the real awk.
+    resolved_awk="$(PATH="$EVILBIN:$PATH" command -v awk)"
+    seal_after_setup="$( [ -n "$_LOKI_SNAPSHOT_SEAL" ] && echo yes || echo no )"
+    # Whether the SNAPSHOT WRITE path (not just the digest read path) shells
+    # out to awk is a separate question from what this test asserts; report
+    # it rather than assume it, then reset the marker so AWKRAN below reflects
+    # only the _loki_snapshot_digest call.
+    awk_ran_during_setup="$( [ -f "$EVILBIN/.awk-ran" ] && echo yes || echo no )"
+    rm -f "$EVILBIN/.awk-ran"
+    # Tamper AFTER sealing, same shape as T-snapshot-hash-deleted-disclosed's
+    # edit-after-seal scenario.
+    printf 'agent edit\n' >> .loki/state/preexisting-untracked.z 2>/dev/null || true
+    live="$(PATH="$EVILBIN:$PATH" _loki_snapshot_digest)"
+    awk_ran="$( [ -f "$EVILBIN/.awk-ran" ] && echo yes || echo no )"
+    match="$( [ "$live" = "$_LOKI_SNAPSHOT_SEAL" ] && echo yes || echo no )"
+    printf 'RESOLVEDEVIL=%s SEALAFTERSETUP=%s AWKDURINGSETUP=%s AWKRAN=%s MATCH=%s' \
+        "$( [ "$resolved_awk" = "$EVILBIN/awk" ] && echo yes || echo no )" \
+        "$seal_after_setup" "$awk_ran_during_setup" "$awk_ran" "$match"
+)"
+if [ "$outfa" = "RESOLVEDEVIL=yes SEALAFTERSETUP=yes AWKDURINGSETUP=no AWKRAN=no MATCH=no" ]; then
+    pass "fake awk on PATH (confirmed shadowing the real one) never ran during setup or the digest read; the post-seal edit is correctly detected as a mismatch"
+else
+    fail "a fake awk on PATH was not neutralized (ran, sealing failed, or the tampered digest still matched the seal)" "got: $outfa"
+fi
+
+# RED proof: putting `| awk '{print $1}'` back into a COPY of _loki_snapshot_digest
+# must reproduce the bypass -- the fake awk's stale output is then trusted as
+# the live digest, so an edit made after sealing goes undetected (MATCH=yes).
+RED_AWK_LIB="$WORKROOT/red-awk-lib.sh"
+sed "s/h=\"\${h%% \*}\"/h=\"\$(printf '%s' \"\$h\" | awk '{print \$1}')\"/" "$BRANCH_LIB" > "$RED_AWK_LIB"
+# Anchor on the exact substituted CODE line (printf '%s' "$h" | awk ...), not
+# a bare "awk '{print $1}'" substring: run.sh's own comment describing this
+# reviewer finding quotes that same substring in prose, so a looser grep would
+# count that unrelated comment line as if the mutation had been applied twice.
+red_awk_present="$(grep -c 'h="\$(printf .%s. "\$h" | awk' "$RED_AWK_LIB")"
+RED_AWK_PREAMBLE="$WORKROOT/red-awk-preamble.sh"
+sed "s#$BRANCH_LIB#$RED_AWK_LIB#" "$PREAMBLE" > "$RED_AWK_PREAMBLE" 2>/dev/null || cp "$PREAMBLE" "$RED_AWK_PREAMBLE"
+cat > "$RED_AWK_PREAMBLE" <<EOF
+log_info()  { echo "INFO: \$*"; }
+log_warn()  { echo "WARN: \$*"; }
+log_error() { echo "ERROR: \$*"; }
+audit_log() { return 0; }
+audit_agent_action() { return 0; }
+source "$ADVISORY_LIB"
+source "$RED_AWK_LIB"
+EOF
+RFAR="$(make_repo tfakeawkred)"
+outfar="$(
+    cd "$RFAR" || exit 1
+    source "$RED_AWK_PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    # The PATH must ALREADY be poisoned at seal time too: a real cached/stale
+    # digest bypass means the agent's fake awk emits the SAME fixed string on
+    # every call, so the seal itself (computed through the same fake awk) and
+    # a later live re-check (also through the fake awk) agree with each other
+    # -- while never reflecting the file's real, tampered content.
+    PATH="$EVILBIN:$PATH" setup_agent_branch >/dev/null 2>&1
+    printf 'agent edit\n' >> .loki/state/preexisting-untracked.z 2>/dev/null || true
+    live="$(PATH="$EVILBIN:$PATH" _loki_snapshot_digest)"
+    awk_ran="$( [ -f "$EVILBIN/.awk-ran" ] && echo yes || echo no )"
+    match="$( [ "$live" = "$_LOKI_SNAPSHOT_SEAL" ] && echo yes || echo no )"
+    printf 'AWKRAN=%s MATCH=%s' "$awk_ran" "$match"
+)"
+if [ "$red_awk_present" -ge 1 ] && [ "$outfar" = "AWKRAN=yes MATCH=yes" ]; then
+    pass "RED confirmed: re-introducing the awk pipe lets the fake awk run and its stale output pass as a match (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-fix awk-bypass behavior" "red_awk_present=$red_awk_present got: $outfar"
+fi
+rm -f "$EVILBIN/.awk-ran"
+
+# =============================================================================
+# Test T-snapshot-seal-fails-closed (BACKLOG-70 rework): a hash tool that
+# resolves and exits 0 but prints a GARBAGE, non-hex-or-wrong-length result
+# (a real BusyBox/coreutils variant's `SHA256 (x) = ...` format, or any other
+# tool that answers to the name but doesn't behave like sha256sum/shasum) must
+# be caught by _loki_snapshot_digest's OWN validation ("?" is real, exercised
+# code -- this is NOT the same as overriding _loki_snapshot_digest itself,
+# which would give the seal-check propagation line permanent coverage but
+# leave the validation logic (${h%% *}, the 64-hex check, the `|| h=""` exit-
+# status catch) completely untested; deleting any of those must still pass 48
+# tests without this one). An unresolvable tool (no sha256sum/shasum anywhere)
+# is a DIFFERENT, harmless case verified separately: it falls back to the
+# python3 -I path, which still computes a real digest. Before this rework,
+# sealing "? ?" directly left _LOKI_SNAPSHOT_SEAL="? ?" and
+# _LOKI_SNAPSHOT_THIS_RUN=1: a later verify would recompute the same "? ?"
+# (same lying tool) and see a MATCH, never disarming the guard it should have
+# refused to arm in the first place. The fix fails the whole snapshot closed
+# AT SEAL TIME instead.
+# =============================================================================
+echo "Test T-snapshot-seal-fails-closed (BACKLOG-70 rework): a hash tool that exits 0 with a garbage result fails the snapshot closed at seal time, not silently"
+FAKETOOLDIR="$WORKROOT/faketool"
+mkdir -p "$FAKETOOLDIR"
+cat > "$FAKETOOLDIR/sha256sum" <<'EOF'
+#!/bin/sh
+# A real tool answering to this name but NOT behaving like GNU sha256sum:
+# exits 0, and the "digest" field is exactly 64 characters (so it passes the
+# LENGTH check and specifically exercises the hex-alphabet validation), but
+# every character is "z" -- not valid hex. Simulates a BusyBox/alternate
+# coreutils build, or any tool coincidentally on this name, that the
+# fixed-path resolver still finds and trusts by name alone.
+printf '%s\n' "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  x"
+EOF
+chmod +x "$FAKETOOLDIR/sha256sum"
+RSF="$(make_repo tsealfail)"
+outsf="$(
+    cd "$RSF" || exit 1
+    source "$PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    # Deterministic, root-safe failure injection (chmod 000 is a no-op for
+    # root, which CI may run as): resolve to a tool that exits 0 but lies
+    # about the digest format, exercising the REAL validation in
+    # _loki_snapshot_digest rather than bypassing it.
+    _loki_snapshot_hash_tool() { printf '%s\n' "$FAKETOOLDIR/sha256sum"; }
+    printf 'mine\n' > notes.txt
+    ok=1
+    _loki_snapshot_or_fail_closed >/dev/null 2>&1 || ok=0
+    sealed="$( [ -n "$_LOKI_SNAPSHOT_SEAL" ] && echo yes || echo no )"
+    failed_marker="$( [ -f .loki/state/preexisting-untracked.failed ] && echo yes || echo no )"
+    printf 'OK=%s SEALED=%s FAILEDMARKER=%s' "$ok" "$sealed" "$failed_marker"
+)"
+if [ "$outsf" = "OK=0 SEALED=no FAILEDMARKER=yes" ]; then
+    pass "hash tool exits 0 with a garbage result: snapshot fails closed at seal time (not sealed, failed marker set), never silently armed on garbage"
+else
+    fail "a garbage-but-successful hash tool result did not fail the snapshot closed" "got: $outsf"
+fi
+
+# Mutation check A: deleting the hex-validation's "?" assignment must make
+# this test FAIL -- confirms the assertion depends on the validation itself,
+# not merely on the seal-check propagation line proven by mutation check B.
+RED_NOVALIDATE_LIB="$WORKROOT/red-novalidate-lib.sh"
+sed 's/\*\[!0123456789abcdef\]\*) h="?" ;;/*) : ;;/' "$BRANCH_LIB" > "$RED_NOVALIDATE_LIB"
+red_novalidate_removed="$(grep -c 'h="?" ;;' "$RED_NOVALIDATE_LIB")"
+RED_NOVALIDATE_PREAMBLE="$WORKROOT/red-novalidate-preamble.sh"
+cat > "$RED_NOVALIDATE_PREAMBLE" <<EOF
+log_info()  { echo "INFO: \$*"; }
+log_warn()  { echo "WARN: \$*"; }
+log_error() { echo "ERROR: \$*"; }
+audit_log() { return 0; }
+audit_agent_action() { return 0; }
+source "$ADVISORY_LIB"
+source "$RED_NOVALIDATE_LIB"
+EOF
+RSFNV="$(make_repo tsealfailnovalidate)"
+outsfnv="$(
+    cd "$RSFNV" || exit 1
+    source "$RED_NOVALIDATE_PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _loki_snapshot_hash_tool() { printf '%s\n' "$FAKETOOLDIR/sha256sum"; }
+    printf 'mine\n' > notes.txt
+    ok=1
+    _loki_snapshot_or_fail_closed >/dev/null 2>&1 || ok=0
+    printf 'OK=%s' "$ok"
+)"
+if [ "$red_novalidate_removed" = 0 ] && [ "$outsfnv" = "OK=1" ]; then
+    pass "RED confirmed: removing the hex-format validation lets a garbage-but-successful tool result silently seal and commit (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-validation garbage-passthrough behavior" "red_novalidate_removed=$red_novalidate_removed got: $outsfnv"
+fi
+
+# =============================================================================
+# T-snapshot-seal-exit-status: the reviewer's other named finding was that
+# piping the hash tool's output through awk hid a nonzero exit from that tool
+# behind awk's own exit status (`cmd | awk ...` reports awk's rc, not cmd's).
+# The fix captures to a plain variable (`h="$("$tool" ... )" || h=""`) so a
+# failing tool's exit status is checked directly. Prove it: a tool that prints
+# a perfectly well-formed 64-hex digest on stdout but exits 1 (a real-world
+# shape: disk I/O error after a partial read, or the tool killed mid-write)
+# must NOT have that output trusted, even though the STRING would pass every
+# other validation.
+# =============================================================================
+echo "Test T-snapshot-seal-exit-status (BACKLOG-70 rework): a hash tool that exits 1 fails the snapshot closed even with well-formed stdout"
+EXITFAILDIGEST="$(printf '%064d' 0 | tr 0 a)"
+cat > "$FAKETOOLDIR/sha256sum-exitfail" <<EOF
+#!/bin/sh
+printf '%s\n' "$EXITFAILDIGEST  x"
+exit 1
+EOF
+chmod +x "$FAKETOOLDIR/sha256sum-exitfail"
+RSFE="$(make_repo tsealexitfail)"
+outsfe="$(
+    cd "$RSFE" || exit 1
+    source "$PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _loki_snapshot_hash_tool() { printf '%s\n' "$FAKETOOLDIR/sha256sum-exitfail"; }
+    printf 'mine\n' > notes.txt
+    ok=1
+    _loki_snapshot_or_fail_closed >/dev/null 2>&1 || ok=0
+    printf 'OK=%s' "$ok"
+)"
+if [ "$outsfe" = "OK=0" ]; then
+    pass "hash tool exits 1 with well-formed stdout: its output is not trusted, snapshot fails closed"
+else
+    fail "a hash tool's nonzero exit was not caught (well-formed stdout was trusted anyway)" "got: $outsfe"
+fi
+
+# Mutation check: deleting BOTH `|| h=""` exit-status catches (the shasum
+# branch and the generic branch) must make this test FAIL (non-vacuous) --
+# confirms the assertion depends on the exit-status check, not incidentally on
+# validation that a well-formed 64-hex string would pass anyway.
+RED_EXITSTATUS_LIB="$WORKROOT/red-exitstatus-lib.sh"
+sed 's/ || h="" ;;/ ;;/' "$BRANCH_LIB" > "$RED_EXITSTATUS_LIB"
+red_exitstatus_removed="$(grep -c '|| h="" ;;' "$RED_EXITSTATUS_LIB")"
+RED_EXITSTATUS_PREAMBLE="$WORKROOT/red-exitstatus-preamble.sh"
+cat > "$RED_EXITSTATUS_PREAMBLE" <<EOF
+log_info()  { echo "INFO: \$*"; }
+log_warn()  { echo "WARN: \$*"; }
+log_error() { echo "ERROR: \$*"; }
+audit_log() { return 0; }
+audit_agent_action() { return 0; }
+source "$ADVISORY_LIB"
+source "$RED_EXITSTATUS_LIB"
+EOF
+RSFER="$(make_repo tsealexitfailred)"
+outsfer="$(
+    cd "$RSFER" || exit 1
+    source "$RED_EXITSTATUS_PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _loki_snapshot_hash_tool() { printf '%s\n' "$FAKETOOLDIR/sha256sum-exitfail"; }
+    printf 'mine\n' > notes.txt
+    ok=1
+    _loki_snapshot_or_fail_closed >/dev/null 2>&1 || ok=0
+    printf 'OK=%s' "$ok"
+)"
+if [ "$red_exitstatus_removed" = 0 ] && [ "$outsfer" = "OK=1" ]; then
+    pass "RED confirmed: removing the exit-status catch lets a failing tool's well-formed-looking stdout silently seal and commit (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-fix exit-status-ignored behavior" "red_exitstatus_removed=$red_exitstatus_removed got: $outsfer"
+fi
+
+# Mutation check B: deleting the BACKLOG-70-SEAL-CHECK propagation line must
+# make this test FAIL (non-vacuous) -- confirms the assertion above also
+# depends on that line, not on validation alone.
+RED_SEALCHECK_LIB="$WORKROOT/red-sealcheck-lib.sh"
+sed '/BACKLOG-70-SEAL-CHECK$/d' "$BRANCH_LIB" > "$RED_SEALCHECK_LIB"
+red_sealcheck_removed="$(grep -c 'BACKLOG-70-SEAL-CHECK' "$RED_SEALCHECK_LIB")"
+RED_SEALCHECK_PREAMBLE="$WORKROOT/red-sealcheck-preamble.sh"
+cat > "$RED_SEALCHECK_PREAMBLE" <<EOF
+log_info()  { echo "INFO: \$*"; }
+log_warn()  { echo "WARN: \$*"; }
+log_error() { echo "ERROR: \$*"; }
+audit_log() { return 0; }
+audit_agent_action() { return 0; }
+source "$ADVISORY_LIB"
+source "$RED_SEALCHECK_LIB"
+EOF
+RSFR="$(make_repo tsealfailred)"
+outsfr="$(
+    cd "$RSFR" || exit 1
+    source "$RED_SEALCHECK_PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _loki_snapshot_hash_tool() { printf '%s\n' "$FAKETOOLDIR/sha256sum"; }
+    printf 'mine\n' > notes.txt
+    ok=1
+    _loki_snapshot_or_fail_closed >/dev/null 2>&1 || ok=0
+    printf 'OK=%s' "$ok"
+)"
+if [ "$red_sealcheck_removed" = 0 ] && [ "$outsfr" = "OK=1" ]; then
+    pass "RED confirmed: removing the seal-check propagation line lets an unsealable snapshot silently report success (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-fix seal-check-removed behavior" "red_sealcheck_removed=$red_sealcheck_removed got: $outsfr"
 fi
 
 # =============================================================================
