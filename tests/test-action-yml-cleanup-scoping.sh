@@ -134,13 +134,22 @@ DECOY_PID=$(cat "$DECOY_PIDFILE" 2>/dev/null || true)
 
 if [ -z "$DECOY_PID" ] || ! kill -0 "$DECOY_PID" 2>/dev/null; then
     bad "decoy did not start (test setup broken, not the step under test)"
+elif ! pgrep -f "loki-run-$TOKEN" 2>/dev/null | grep -qx "$DECOY_PID"; then
+    bad "positive control failed: pgrep cannot even enumerate the decoy on this platform -- a later 'survived' result would be vacuous"
 else
     RUNNER_TEMP="$WORK/runner-temp"
     mkdir -p "$RUNNER_TEMP"
+    # Strip the rm -rf line before executing: the extracted block also removes
+    # /tmp/loki-* and $TMPDIR/loki-* wildcard globs, unrelated to the kill
+    # logic under test, which would delete OTHER sessions' run-owned temp
+    # directories on this shared machine. Only the kill-scoping line
+    # ("loki stop") is exercised here.
+    ISOLATED_CLEANUP="$WORK/isolated_cleanup.sh"
+    grep -v 'rm -rf' "$CLEANUP_SCRIPT" > "$ISOLATED_CLEANUP"
     ( cd "$SBX_CWD" && \
       PATH="$REPO_ROOT/autonomy:$PATH" \
       HOME="$SBX_HOME" LOKI_DIR="$SBX_CWD/.loki" RUNNER_TEMP="$RUNNER_TEMP" \
-      bash "$CLEANUP_SCRIPT" >/dev/null 2>&1 )
+      bash "$ISOLATED_CLEANUP" >/dev/null 2>&1 )
     sleep 0.5
     if kill -0 "$DECOY_PID" 2>/dev/null; then
         ok "a foreign loki-run-* process in a DIFFERENT process group survived the Cleanup step"

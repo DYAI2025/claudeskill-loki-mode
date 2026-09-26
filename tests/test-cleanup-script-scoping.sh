@@ -84,13 +84,30 @@ DECOY_PID=$(cat "$DECOY_PIDFILE" 2>/dev/null || true)
 
 if [ -z "$DECOY_PID" ] || ! kill -0 "$DECOY_PID" 2>/dev/null; then
     bad "decoy did not start (test setup broken, not the script under test)"
+elif ! pgrep -f "loki-run-$TOKEN" 2>/dev/null | grep -qx "$DECOY_PID"; then
+    bad "positive control failed: pgrep cannot even enumerate the decoy on this platform -- a later 'survived' result would be vacuous"
 else
-    bash "$CLEANUP_SH" >/dev/null 2>&1
+    # Never execute the whole script: it also removes /tmp/loki-* and
+    # $TMPDIR/loki-* wildcard globs (unrelated to the kill logic under test),
+    # which would delete other sessions' run-owned temp directories and
+    # violates this project's own cleanup discipline. Extract ONLY _kill()
+    # plus its three known-name calls via awk and run that fragment in
+    # isolation with MODE=normal, exactly the code path under test.
+    ISOLATED_FN="$WORK/isolated_kill.sh"
+    {
+        echo 'MODE="normal"'
+        echo 'MY_UID="$(id -u)"'
+        awk '/^_kill\(\) \{/,/^\}/' "$CLEANUP_SH"
+        echo '_kill "mutation-probe" "mutation-probe"'
+        echo '_kill "loki-run-" "loki-run-*"'
+        echo '_kill "loadgen" "loadgen"'
+    } > "$ISOLATED_FN"
+    bash "$ISOLATED_FN" >/dev/null 2>&1
     sleep 0.3
     if kill -0 "$DECOY_PID" 2>/dev/null; then
-        ok "a loki-run-* decoy survived a default-mode cleanup run (no --aggressive)"
+        ok "a loki-run-* decoy survived the isolated _kill() logic in default mode (no --aggressive)"
     else
-        bad "a loki-run-* decoy was KILLED by a default-mode cleanup run -- the bug is still present"
+        bad "a loki-run-* decoy was KILLED by the isolated _kill() logic -- the bug is still present"
     fi
 fi
 
