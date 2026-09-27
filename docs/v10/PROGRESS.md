@@ -975,3 +975,34 @@ changes, to avoid conflicting with or duplicating already-landed work.
 **NO_RECENT_RELEASE remains the sole real blocker.** S-18's dedicated
 adversarial reviewer continues; this remains the single item nothing
 else should take priority over.
+
+## Release train 1 (D25) -- founder directive, timeline log
+
+- 2026-09-27T13:17:07Z: pushed the freeze commit `c31cb1e8` (141 commits
+  since v9.55.0). Main frozen: no further pushes until Tests, Bun
+  Parity, and Security Audit are all green on this exact SHA.
+- 2026-09-27T13:17Z: Bun Parity green on `c31cb1e8` (31s).
+- Security Audit only triggers on a VERSION push or PR, confirmed by
+  reading its `on:` block -- it will fire naturally when VERSION is
+  bumped for the release, and `release.yml`'s own `required-ci` job
+  polls all three (Tests, Bun Parity, Security Audit) at that exact
+  SHA before publishing. No separate wait needed for it now.
+- 2026-09-27T13:39Z: Tests completed `failure` on `c31cb1e8` (22m39s).
+  Investigated immediately per standing discipline (never assume a red
+  is a regression or a flake without checking): the single failure was
+  `Runtime Gate port reclaims scoped to LISTEN + cwd ownership`, on
+  `positive control failed: lsof cannot enumerate the own-tree decoy
+  listener`, shard 0/4. Command: `bash tests/test-runtime-gate-port-
+  scoping.sh` on this exact tree, local run: `RESULT: 12 passed, 0
+  failed`. `git log -- tests/test-runtime-gate-port-scoping.sh` shows
+  this file untouched by anything in this session's 141-commit train
+  (its only commit, `c45899e5`, predates this window). Conclusion: an
+  `lsof`-enumeration timing/environment difference on the shared
+  GitHub-hosted Ubuntu runner, not a regression -- same class as this
+  session's other already-diagnosed environment-only flakes (the
+  review-assurance-tail shard-lineage timing, the now-fixed macOS
+  seatbelt bug, both previously confirmed the same way: reproduce
+  locally, check git history of the failing file, never assume).
+  Reran just the failed shard (`gh run rerun 36321857199 --failed`)
+  on the SAME frozen SHA to get a second data point rather than
+  assuming and moving on.
