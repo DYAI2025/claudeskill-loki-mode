@@ -152,6 +152,49 @@ describe("withholdGithubTokens", () => {
     expect(env["GIT_CONFIG_COUNT"]).toBeUndefined();
     expect(env["GIT_CONFIG_KEY_0"]).toBeUndefined();
   });
+
+  // BACKLOG 149 round 3: SSH transport bypass. Round 2 closed the HTTPS
+  // (GH_TOKEN/GITHUB_TOKEN/GH_CONFIG_DIR/credential.helper) surface but left
+  // SSH_AUTH_SOCK and GIT_SSH_COMMAND untouched -- a reachable SSH agent lets
+  // an agent push over an SSH-transport remote unaffected by any round-2
+  // mitigation. `git remote set-url origin git@github.com:... && git push`
+  // would authenticate exactly as an unrestricted session.
+  it("removes SSH_AUTH_SOCK and overrides GIT_SSH_COMMAND by default", () => {
+    const env: NodeJS.ProcessEnv = {
+      GH_TOKEN: GH,
+      SSH_AUTH_SOCK: "/tmp/real-agent.sock",
+      GIT_SSH_COMMAND: "ssh -i /home/user/.ssh/id_ed25519",
+    };
+    withholdGithubTokens(env, () => {});
+    expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+    expect(env["GIT_SSH_COMMAND"]).toBe("false");
+  });
+
+  it("removes SSH_AUTH_SOCK even when no GH_TOKEN-family var is present", () => {
+    const env: NodeJS.ProcessEnv = { SSH_AUTH_SOCK: "/tmp/real-agent.sock" };
+    withholdGithubTokens(env, () => {});
+    expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+    expect(env["GIT_SSH_COMMAND"]).toBe("false");
+  });
+
+  it("overrides GIT_SSH_COMMAND to false even when it was absent before", () => {
+    const env: NodeJS.ProcessEnv = { GH_TOKEN: GH };
+    withholdGithubTokens(env, () => {});
+    expect(env["GIT_SSH_COMMAND"]).toBe("false");
+    expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+  });
+
+  it("keeps the real SSH agent and ssh command under the opt-out", () => {
+    const env: NodeJS.ProcessEnv = {
+      GH_TOKEN: GH,
+      SSH_AUTH_SOCK: "/tmp/real-agent.sock",
+      GIT_SSH_COMMAND: "ssh -i /home/user/.ssh/id_ed25519",
+      LOKI_ALLOW_AGENT_GITHUB_TOKEN: "1",
+    };
+    withholdGithubTokens(env, () => {});
+    expect(env["SSH_AUTH_SOCK"]).toBe("/tmp/real-agent.sock");
+    expect(env["GIT_SSH_COMMAND"]).toBe("ssh -i /home/user/.ssh/id_ed25519");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -173,7 +216,16 @@ class StopNow implements CouncilHook {
   }
 }
 
-const SAVED = ["LOKI_DIR", "LOKI_CLAUDE_CLI", "GH_TOKEN", "GITHUB_TOKEN", "LOKI_ALLOW_AGENT_GITHUB_TOKEN"];
+const SAVED = [
+  "LOKI_DIR",
+  "LOKI_CLAUDE_CLI",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "LOKI_ALLOW_AGENT_GITHUB_TOKEN",
+  "SSH_AUTH_SOCK",
+  "GIT_SSH_COMMAND",
+];
+const REAL_SSH_AUTH_SOCK = "/tmp/moat-p9-fake-agent.sock";
 let saved: Record<string, string | undefined>;
 let root: string;
 let envDump: string;
@@ -200,6 +252,10 @@ exit 0
   process.env["LOKI_CLAUDE_CLI"] = fake;
   process.env["GH_TOKEN"] = GH;
   process.env["GITHUB_TOKEN"] = GHA;
+  // Synthetic path only -- never a real agent socket. Models an operator
+  // session with a reachable SSH agent (BACKLOG 149 round 3).
+  process.env["SSH_AUTH_SOCK"] = REAL_SSH_AUTH_SOCK;
+  delete process.env["GIT_SSH_COMMAND"];
   delete process.env["LOKI_ALLOW_AGENT_GITHUB_TOKEN"];
   stderrLines = [];
   realStderrWrite = process.stderr.write.bind(process.stderr);
@@ -249,6 +305,12 @@ describe("runAutonomous withholds GitHub tokens from the provider", () => {
     expect(dump).toMatch(/GH_TOKEN=ghp_LOKIWITHHELDsentinel/);
     expect(dump).toMatch(/GH_CONFIG_DIR=/);
     expect(dump).toMatch(/GIT_CONFIG_KEY_0=credential\.helper/);
+    // BACKLOG 149 round 3: the provider must not inherit a reachable SSH
+    // agent, and any ssh-transport git operation it attempts must fail
+    // closed via GIT_SSH_COMMAND=false.
+    expect(dump).not.toContain(`SSH_AUTH_SOCK=${REAL_SSH_AUTH_SOCK}`);
+    expect(dump).not.toMatch(/^SSH_AUTH_SOCK=/m);
+    expect(dump).toMatch(/^GIT_SSH_COMMAND=false$/m);
     expect(warnings()).toBe(0);
   });
 
@@ -258,6 +320,9 @@ describe("runAutonomous withholds GitHub tokens from the provider", () => {
     const dump = readFileSync(envDump, "utf8");
     expect(dump).toContain(`GH_TOKEN=${GH}`);
     expect(dump).toContain(`GITHUB_TOKEN=${GHA}`);
+    // The opt-out is the operator's explicit choice to keep the old, fully
+    // inherited behavior -- the real SSH agent must reach the provider too.
+    expect(dump).toContain(`SSH_AUTH_SOCK=${REAL_SSH_AUTH_SOCK}`);
     expect(warnings()).toBe(1);
   });
 });

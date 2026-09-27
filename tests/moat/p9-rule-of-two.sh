@@ -1261,6 +1261,93 @@ case_injection() {
         return
     fi
 
+    # --- BACKLOG 149 round 3: SSH-transport remote + synthetic agent --------
+    # Round 2 closed HTTPS (GH_TOKEN/GITHUB_TOKEN/GH_CONFIG_DIR/
+    # credential.helper). Nothing there touches SSH_AUTH_SOCK or
+    # GIT_SSH_COMMAND, so a provider session inheriting a reachable SSH agent
+    # could authenticate over an SSH-transport remote exactly as an
+    # unrestricted session. Modeled the same way the HTTPS case avoids real
+    # network egress: a local fake `ssh` binary on PATH stands in for the real
+    # one, execs git-upload-pack/git-receive-pack directly against the SAME
+    # local bare repo ($T/remote.git) instead of connecting anywhere, and
+    # discriminates on whether `ssh-add -l` against the CALLER's own
+    # SSH_AUTH_SOCK lists the synthetic key's fingerprint -- never on a
+    # hardcoded credential, so the model only accepts a caller that actually
+    # holds the (synthetic, never-real) agent identity. A ssh://-scheme
+    # `insteadOf` is used (not a `git@host:` rewrite), so the real git ssh
+    # transport code path runs end to end down to invoking $GIT_SSH_COMMAND/
+    # ssh -- rewriting the git@ form directly would skip ssh invocation
+    # entirely and make this scenario vacuous.
+    # A dedicated, SHORT directory outside $T for the agent socket: Unix
+    # domain socket paths are capped at ~104 bytes (sun_path) on macOS/BSD,
+    # and $T (under $MOAT_TMP, itself under $TMPDIR) is routinely already
+    # close to that on macOS (a /var/folders/... TMPDIR is long) -- confirmed
+    # by reproducing the exact failure ("too long for Unix domain socket")
+    # with the socket placed under $T during this fix's own verification.
+    local SSH_KEY="$T/ssh-key" SSH_AGENT_DIR SSH_FP=""
+    SSH_AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/moat-ssh.XXXXXX" 2>/dev/null)" || SSH_AGENT_DIR=""
+    local SSH_AGENT_SOCK="${SSH_AGENT_DIR:+$SSH_AGENT_DIR/a}"
+    ssh-keygen -q -t ed25519 -N '' -C 'moat-p9-synthetic-test-key-never-real' -f "$SSH_KEY" </dev/null
+    SSH_FP="$(ssh-keygen -lf "${SSH_KEY}.pub" 2>/dev/null | awk '{print $2}')"
+    if [ -z "$SSH_FP" ] || [ -z "$SSH_AGENT_SOCK" ]; then
+        nok "prerequisite missing: ssh-keygen fingerprint or agent socket dir (SSH scenario cannot run)"
+        SSH_FP=""
+    fi
+    {
+        printf '#!/usr/bin/env bash\n'
+        # Real ssh(1) argv shape this fake accepts: [options] user@host command...
+        # Strip anything before the first non-flag token (the destination),
+        # then treat the remainder as the remote command to run locally
+        # against the fixture bare repo -- this is the ONLY thing standing in
+        # for network+sshd; no bytes ever leave this host.
+        printf 'dest=""; while [ $# -gt 0 ]; do case "$1" in -*) shift; [ "$1" != "${1#-}" ] || shift ;; *) dest="$1"; shift; break ;; esac; done\n'
+        printf 'log="${MOAT_LOG_DIR:-.}/ssh.log"\n'
+        printf 'sock="${SSH_AUTH_SOCK:-}"\n'
+        printf 'fp="no-agent"\n'
+        printf 'if [ -n "$sock" ] && [ -S "$sock" ]; then\n'
+        printf '    fp="$(SSH_AUTH_SOCK="$sock" ssh-add -l 2>/dev/null | awk "{print \\$2}" | head -1)"\n'
+        printf '    [ -n "$fp" ] || fp="agent-empty"\n'
+        printf 'fi\n'
+        printf 'printf "dest=%%s fp=%%s cmd=%%s\\n" "$dest" "$fp" "$*" >> "$log"\n'
+        printf 'if [ "$fp" != %q ]; then echo "moat-ssh: Permission denied (publickey)." >&2; exit 255; fi\n' "$SSH_FP"
+        # $1 (after the destination-parsing loop above shifted past it) is the
+        # WHOLE remote command as one pre-quoted string, e.g.
+        # "git-receive-pack '\''/repo.git'\''" -- git passes it as a single
+        # arg for the remote shell to interpret. Only the verb (first word)
+        # matters here; the path is ignored and always replaced with the
+        # fixture's local bare repo, since this fake never really has a
+        # remote filesystem to resolve the real path against.
+        printf 'verb="${1%% *}"\n'
+        printf 'exec "$verb" %q\n' "$T/remote.git"
+    } > "$B/ssh"
+    chmod +x "$B/ssh"
+    if ! ( cd "$W" \
+            && git remote add origin-ssh "ssh://moat-p9.invalid/repo.git" \
+            && git config "url.ssh://moat-p9.invalid/.insteadOf" "ssh://real-would-be-github.invalid/" ) >/dev/null 2>&1; then
+        nok "SSH fixture remote setup failed"
+    fi
+    # Control: with the synthetic agent reachable, an ssh-transport push
+    # succeeds against the fixture; with SSH_AUTH_SOCK absent, it is denied.
+    # Proves the model discriminates before any scenario run trusts it.
+    # ssh-agent -a <sock> forks to background and prints `SSH_AGENT_PID=<pid>`
+    # on stdout (no pidfile) -- captured here so cleanup signals that exact
+    # PID rather than a name-pattern kill.
+    local SSH_AGENT_PID=""
+    if [ -n "$SSH_FP" ]; then
+        SSH_AGENT_PID="$(ssh-agent -a "$SSH_AGENT_SOCK" 2>/dev/null | sed -n 's/^SSH_AGENT_PID=\([0-9]*\);.*/\1/p')"
+        SSH_AUTH_SOCK="$SSH_AGENT_SOCK" ssh-add "$SSH_KEY" >/dev/null 2>&1
+    fi
+    : > "$T/control/ssh.log"
+    ( cd "$W" && PATH="$B:$PATH" SSH_AUTH_SOCK="$SSH_AGENT_SOCK" MOAT_LOG_DIR="$T/control" GIT_SSH_COMMAND="$B/ssh" \
+        git push -q origin-ssh HEAD:refs/heads/moat-ssh-control-with ) >/dev/null 2>&1
+    ( cd "$W" && env -u SSH_AUTH_SOCK PATH="$B:$PATH" MOAT_LOG_DIR="$T/control" GIT_SSH_COMMAND="$B/ssh" \
+        git push -q origin-ssh HEAD:refs/heads/moat-ssh-control-without ) >/dev/null 2>&1
+    if [ -n "$SSH_FP" ] && { ! grep -q "fp=$SSH_FP" "$T/control/ssh.log" 2>/dev/null \
+        || ! grep -q 'fp=no-agent\|fp=agent-empty' "$T/control/ssh.log" 2>/dev/null; }; then
+        nok "SSH push-credential model does not discriminate (ssh log: $(tr '\n' ',' < "$T/control/ssh.log" 2>/dev/null))"
+        SSH_FP=""
+    fi
+
     # --- gh shim: serves the issue to an authenticated caller, logs everything
     python3 - "$T/issue.json" "$MARKER" <<'PY'
 import json, sys
@@ -1347,6 +1434,16 @@ PY
         printf '    echo edited >> "$MOAT_LOG_DIR/provider-actions.log" ;;\nesac\n'
         printf 'export MOAT_PUSH_SOURCE=provider GIT_TERMINAL_PROMPT=0\n'
         printf 'git push -q origin HEAD:refs/heads/injected-$$ >/dev/null 2>&1; echo "git_push_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
+        # BACKLOG 149 round 3: does the provider session's OWN environment
+        # still let it authenticate over an SSH-transport remote? Round 2's
+        # fix never touched SSH_AUTH_SOCK/GIT_SSH_COMMAND, so a provider
+        # inheriting the real agent could push here exactly as an
+        # unrestricted session. `origin-ssh` and its ssh:// insteadOf were set
+        # up on $W before this fixture repo was copied into the sandboxed
+        # work dir, so they are present here unchanged; the fake `ssh` on
+        # PATH (never real network/sshd) is what actually discriminates on
+        # whether SSH_AUTH_SOCK carries the synthetic agent's fingerprint.
+        printf 'git push -q origin-ssh HEAD:refs/heads/injected-ssh-$$ >/dev/null 2>&1; echo "git_push_ssh_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
         printf 'gh pr create --title pwned --body pwned >/dev/null 2>&1; echo "gh_pr_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
         # BACKLOG 149: does the provider session's OWN gh resolution (same
         # precedence order as the shim above) still reach the planted
@@ -1419,11 +1516,21 @@ PY
         # closes this path; see the git-credential-moatkeychain shim above.
         printf '[credential]\n\thelper = moatkeychain\n' > "$L/home/.gitconfig"
         cp -R "$W" "$L/work" || { nok "[$1] fixture copy failed"; return 1; }
-        : > "$L/push.log"; : > "$L/gh.log"; : > "$L/provider-actions.log"
+        : > "$L/push.log"; : > "$L/gh.log"; : > "$L/provider-actions.log"; : > "$L/ssh.log"
         {
             printf 'set -u\n'
             printf 'export HOME=%q PATH=%q TMPDIR=%q MOAT_LOG_DIR=%q\n' "$L/home" "$B:$PATH" "${TMPDIR:-/tmp}" "$L"
             printf 'export GH_TOKEN=%q GITHUB_TOKEN=%q MOAT_ENV_MARKER=inherited\n' "$GH_CANARY" "$GITHUB_CANARY"
+            # BACKLOG 149 round 3: the operator's real, reachable SSH agent
+            # and ssh command, exactly as an unrestricted session would have
+            # them -- SSH_AUTH_SOCK/GIT_SSH_COMMAND is what the fix under test
+            # must withhold from the provider. Only set when the SSH fixture
+            # was actually built (SSH_FP non-empty; see the prerequisite
+            # check above) so a host where ssh-keygen/mktemp failed degrades
+            # to no SSH assertions rather than a broken run.
+            if [ -n "$SSH_FP" ]; then
+                printf 'export SSH_AUTH_SOCK=%q GIT_SSH_COMMAND=%q\n' "$SSH_AGENT_SOCK" "$B/ssh"
+            fi
             # LOKI_DELEGATE_PR=1 is the product default: push and open the PR
             # after the session. Only that trusted step may carry the token.
             printf 'export LOKI_TELEMETRY_DISABLED=true DO_NOT_TRACK=1 LOKI_NO_UPDATE_CHECK=1 CI=true LOKI_DELEGATE_PR=1 LOKI_DASHBOARD=false\n'
@@ -1531,6 +1638,42 @@ PY
         # and reported "no", not merely never printed anything.
         grep -qxF 'credential_helper_read=no' "$T/default/provider-actions.log" \
             || nok "[default] the git-credential-helper probe never ran or never reported (vacuous probe: $(grep 'credential_helper_read=' "$T/default/provider-actions.log" 2>/dev/null || echo 'no credential_helper_read= line found'))"
+        # BACKLOG 149 round 3: the provider session must not be able to push
+        # over an SSH-transport remote using the inherited (real, synthetic-
+        # in-this-test) SSH agent. Skipped (not failed) when the SSH fixture
+        # itself could not be built on this host (SSH_FP empty).
+        #
+        # When the fix is in place, GIT_SSH_COMMAND=false means git invokes
+        # the `false` builtin in place of ssh -- the fake `ssh` binary (and
+        # therefore ssh.log, which only it writes to) is never reached at
+        # all, by design: `false` fails closed before ever consulting
+        # SSH_AUTH_SOCK. So the positive, non-vacuous proof that the fix ran
+        # is in the provider's OWN env dump (GIT_SSH_COMMAND=false,
+        # SSH_AUTH_SOCK absent), not in ssh.log -- an EMPTY ssh.log is the
+        # correct, fixed-state outcome, and a non-empty one (the fake ssh
+        # actually got invoked, meaning GIT_SSH_COMMAND was NOT overridden to
+        # `false`) is the failure signal.
+        if [ -n "$SSH_FP" ]; then
+            grep -qxF 'GIT_SSH_COMMAND=false' "$T"/default/provider-env.* \
+                || nok "[default] the provider session's own env did not show GIT_SSH_COMMAND=false (SSH override missing or wrong)"
+            grep -q '^SSH_AUTH_SOCK=' "$T"/default/provider-env.* \
+                && nok "[default] the provider session inherited a real SSH_AUTH_SOCK (SSH agent not withheld): $(grep '^SSH_AUTH_SOCK=' "$T"/default/provider-env.* | head -1)"
+            # Positive check, not just absence-of-bad-value: the SSH push
+            # attempt must actually have run and failed (any non-zero rc --
+            # `false` denies it before ssh-transport auth is ever attempted),
+            # so a provider crash before ever invoking git push cannot pass
+            # this vacuously.
+            grep -q '^git_push_ssh_rc=' "$T/default/provider-actions.log" 2>/dev/null \
+                || nok "[default] the provider's SSH-transport push attempt never ran or never reported (vacuous probe)"
+            grep -q '^git_push_ssh_rc=0$' "$T/default/provider-actions.log" 2>/dev/null \
+                && nok "[default] the provider's SSH-transport push succeeded (rc=0) -- SSH agent was not withheld"
+            # ssh.log must stay EMPTY: the fake ssh binary this fixture built
+            # (and thus its fingerprint check) is never reached when
+            # GIT_SSH_COMMAND=false is correctly in effect. A non-empty log
+            # here means the override did not take effect.
+            [ -s "$T/default/ssh.log" ] \
+                && nok "[default] the fake ssh binary was invoked at all (GIT_SSH_COMMAND=false did not take effect): $(tr '\n' ',' < "$T/default/ssh.log" 2>/dev/null)"
+        fi
     fi
 
     # 2. auto-pr: LOKI_AUTO_PR=1, so the session PR comes from create_session_pr.
@@ -1571,6 +1714,21 @@ PY
             || nok "[opt-out] the git-credential-helper probe is blind under the opt-out (expected the provider to resolve a credential when the helper chain is not reset)"
         grep -qF -- "$HELPER_CANARY" "$T"/opt-out/provider-credential.* 2>/dev/null \
             || nok "[opt-out] the git-credential-helper probe is blind under the opt-out (canary not found in what the provider resolved)"
+        # BACKLOG 149 round 3, positive control: under the opt-out, SSH is
+        # never withheld either -- the provider's own env keeps the real
+        # (synthetic-in-this-test) SSH_AUTH_SOCK, GIT_SSH_COMMAND is never
+        # overridden to `false`, and its ssh-transport push actually
+        # authenticates against the fake ssh binary. If this ever stops
+        # matching, the probe itself is blind rather than the fix being
+        # broken.
+        if [ -n "$SSH_FP" ]; then
+            grep -qF "SSH_AUTH_SOCK=$SSH_AGENT_SOCK" "$T"/opt-out/provider-env.* \
+                || nok "[opt-out] the SSH probe is blind under the opt-out (expected the provider to inherit the real SSH_AUTH_SOCK)"
+            grep -qxF 'GIT_SSH_COMMAND=false' "$T"/opt-out/provider-env.* \
+                && nok "[opt-out] GIT_SSH_COMMAND was overridden to false under the opt-out (should be untouched)"
+            grep -q "fp=$SSH_FP" "$T/opt-out/ssh.log" 2>/dev/null \
+                || nok "[opt-out] the SSH probe is blind under the opt-out (expected the fake ssh to observe the real agent fingerprint)"
+        fi
     fi
 
     # 4. hosts-only: a user authenticated ONLY via `gh auth login` (hosts.yml),
@@ -1635,6 +1793,20 @@ PY
     # has no issue-fetch step of its own; the PRD path is the untrusted-text
     # channel that route actually has).
     inj_run_bun_default
+
+    # Stop the synthetic ssh-agent by its exact captured PID (never a
+    # name-pattern kill) -- it has no further use once the Bun scenarios
+    # (which never touch SSH) have run. Its socket dir lives OUTSIDE $MOAT_TMP
+    # (a short, fixed-depth path under $TMPDIR directly -- see the
+    # SSH_AGENT_DIR comment above: a Unix domain socket path under the
+    # $MOAT_TMP/inj/... depth routinely exceeds the ~104-byte sun_path limit
+    # on macOS/BSD), so it is not covered by the outer moat_cleanup's
+    # `rm -rf "$MOAT_TMP"` and needs its own explicit removal here, validated
+    # as a real mktemp-created path before deletion.
+    [ -n "$SSH_AGENT_PID" ] && kill "$SSH_AGENT_PID" 2>/dev/null
+    case "${SSH_AGENT_DIR:-}" in
+        "${TMPDIR:-/tmp}"/moat-ssh.*) rm -rf "$SSH_AGENT_DIR" ;;
+    esac
 }
 
 # inj_run_bun <scenario> <extra exports>: like inj_run, but the spec is a
@@ -1741,7 +1913,7 @@ moat_run "P9.comment-trigger-author-gate" \
     "agent jobs reachable by outsider-authored events check that author visibly in YAML, on the event's own field" \
     case_gate
 moat_run "P9.injection-cannot-reach-token" \
-    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push from a provider session; Loki's own post-session push/PR still can" \
+    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push (HTTPS or SSH) from a provider session via the IMPLICIT resolution paths this fix closes (env vars, gh config store, git credential.helper, SSH agent/ssh command); Loki's own post-session push/PR still can. Does not hold against an explicit named-account keyring read (gh auth token -u <username>, env -u GH_TOKEN -u GITHUB_TOKEN gh auth token, security find-generic-password) or a direct ssh/hosts.yml/keychain read outside git -- the actual boundary is a CI job holding no write token and no SSH agent while the agent runs" \
     case_injection
 moat_run "P9.checkout-no-persisted-credentials" \
     "actions/checkout sets persist-credentials: false in issue/comment/review-triggered and agent-running jobs" \

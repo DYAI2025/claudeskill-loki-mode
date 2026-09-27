@@ -5339,7 +5339,13 @@ except Exception:
 }
 
 #===============================================================================
-# Rule of Two (moat P9): a GitHub token never reaches an agent session.
+# Rule of Two (moat P9): a GitHub token never reaches an agent session via the
+# IMPLICIT resolution paths this module withholds (env vars, gh config store,
+# git credential.helper, SSH agent/ssh command). Not an absolute claim -- see
+# the disclosed residuals at the end of this header (an explicit named-account
+# keyring read, a direct ssh/hosts.yml/keychain read outside git); the actual
+# security boundary is a CI job holding no write token and no SSH agent while
+# the agent runs.
 #
 # The run reads untrusted issue text and spawns agents that act on it, so a
 # token in the exported environment is one prompt injection away from a push.
@@ -5414,18 +5420,62 @@ except Exception:
 # untouched, so Claude's own OAuth (F49) is unaffected -- nothing here reads
 # or writes $HOME/.claude or touches any Anthropic credential path.
 #
+# BACKLOG 149 (round 3, REJECT rework): round 2's fix is HTTPS-only. A
+# round-3 reviewer confirmed, live, that none of the above touches
+# SSH_AUTH_SOCK or GIT_SSH_COMMAND -- the provider session's real, untouched
+# environment always has a reachable SSH agent (by this design's own stated
+# intent of keeping the environment live for Claude's own OAuth), so
+# `git remote set-url origin git@github.com:<owner>/<repo>.git && git push`
+# authenticates exactly as an unrestricted session. Reproduced with a
+# synthetic-only ssh-agent and a throwaway key (never a real credential):
+# `ssh-add -l` against the inherited SSH_AUTH_SOCK lists the identity, and any
+# ssh-transport git operation would authenticate with it.
+#
+# Fix: SSH_AUTH_SOCK is unset (not sentineled) for the withheld session.
+# Unlike the GH_TOKEN-family vars, there is no documented gh/ssh "falls
+# through to a keyring when absent, stops when present-but-wrong" behavior for
+# SSH_AUTH_SOCK to defeat -- ssh(1) simply has no agent to consult when the
+# var is unset, with no OS-level fallback socket path. A sentinel (nonexistent
+# path) would behave identically to unset here (both mean "no agent
+# reachable"), so unset is the simpler, equally-correct choice for THIS var
+# specifically -- it does not contradict round 2's reasoning for sentineling
+# the token vars, it applies that same reasoning to a var with different
+# fallback semantics. GIT_SSH_COMMAND is set to `false` (a POSIX builtin that
+# ignores all arguments and always exits 1): git invokes it in place of ssh
+# for any ssh-transport fetch/push, and git's own docs (`git help git-config`)
+# confirm the env var "is overridden when the environment variable is set" --
+# i.e. GIT_SSH_COMMAND (env) unconditionally outranks core.sshCommand
+# (config), so setting only the env var closes both an operator-configured
+# core.sshCommand AND an agent-configured one, with no separate
+# GIT_CONFIG_COUNT-based core.sshCommand reset needed. This means even an
+# explicit `ssh -i <path>` invocation made THROUGH git (git fetch/push/clone
+# over an ssh:// or git@ URL) fails; it does NOT stop an agent from invoking
+# the real `/usr/bin/ssh` binary directly outside of git, which is a
+# disclosed residual (see below), the same class as the already-disclosed
+# `gh auth token -u <username>` and on-disk hosts.yml/keychain reads.
+#
 # Loki's own trusted calls (gh() below, _loki_with_github_tokens) restore the
 # REAL env values (or absence) for the 4 token vars, the real GH_CONFIG_DIR
-# (or absence), and the real GIT_CONFIG_COUNT/KEY/VALUE state (or absence)
-# around the one trusted command, then re-apply the withhold afterward.
+# (or absence), the real GIT_CONFIG_COUNT/KEY/VALUE state (or absence), and
+# the real SSH_AUTH_SOCK/GIT_SSH_COMMAND state (or absence) around the one
+# trusted command, then re-apply the withhold afterward -- this repo's own
+# trusted git operations (create_session_pr, on_run_complete's git push,
+# proof-check.sh) use whatever `origin` is configured as, which is not
+# hardcoded to HTTPS, so an SSH-origin user's Loki-initiated push must still
+# work; the SSH sentinel needs the same re-grant path as the token vars, not
+# a simpler one.
 #
 # This is hygiene against a naive injection, not an isolation boundary: code
 # running as the same user can still read the parent's environment block
 # (/proc/<pid>/environ on Linux, sudo on a hosted runner), the hosts.yml file
 # directly off disk (F49 keeps $HOME live), or invoke `git -c
-# credential.helper=...` / `security find-generic-password` explicitly to
-# route around this. The boundary is a CI job that holds no write token while
-# the agent runs (see .github/workflows/loki-issue-to-pr.yml).
+# credential.helper=...` / `security find-generic-password` /
+# `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token` / `gh auth token -u
+# <username>` / the real `ssh` binary directly with an explicit `-i` key path
+# or a re-discovered agent socket (e.g. `launchctl getenv SSH_AUTH_SOCK` on
+# macOS) explicitly to route around this. The boundary is a CI job that holds
+# no write token and no SSH agent while the agent runs (see
+# .github/workflows/loki-issue-to-pr.yml).
 #===============================================================================
 _LOKI_WITHHELD_TOKENS=""
 _LOKI_GIT_CONFIG_COUNT_UNSUPPORTED=""
@@ -5445,6 +5495,11 @@ _LOKI_GIT_CONFIG_COUNT_OLD=""
 _LOKI_GIT_CONFIG_COUNT_HAD=""
 _LOKI_GIT_CRED_INDEX=""
 _LOKI_GH_SENTINEL=""
+_LOKI_SSH_AUTH_SOCK_HAD=""
+_LOKI_SSH_AUTH_SOCK_OLD=""
+_LOKI_GIT_SSH_COMMAND_HAD=""
+_LOKI_GIT_SSH_COMMAND_OLD=""
+_LOKI_SSH_WITHHELD=""
 
 # Restore the real value (or absence) of one of the 4 token vars, using the
 # per-var _HAD/_VAL pair captured by _loki_gh_capture. Bash has no portable
@@ -5514,12 +5569,29 @@ _loki_gh_capture() {
         : # GH_TOKEN/GITHUB_TOKEN/GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN
           # all get the SAME sentinel per _loki_gh_apply, so one check covers
           # all 4 -- _LOKI_*_REAL_HAD stays unset for each, meaning "restore to
-          # absent", not "restore to this garbage value".
+          # absent", not "restore to this garbage value". The same inherited
+          # process also had SSH_AUTH_SOCK unset and GIT_SSH_COMMAND=false by
+          # this same apply, so _LOKI_SSH_AUTH_SOCK_HAD/_LOKI_GIT_SSH_COMMAND_HAD
+          # stay unset too (restore to absent, not to `false`) -- see the SSH
+          # capture below, gated on this same flag.
     else
         if [ -n "${GH_TOKEN+x}" ]; then _LOKI_GH_TOKEN_REAL_HAD=1; _LOKI_GH_TOKEN_REAL_VAL="$GH_TOKEN"; fi
         if [ -n "${GITHUB_TOKEN+x}" ]; then _LOKI_GITHUB_TOKEN_REAL_HAD=1; _LOKI_GITHUB_TOKEN_REAL_VAL="$GITHUB_TOKEN"; fi
         if [ -n "${GH_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GH_ENT_TOKEN_REAL_HAD=1; _LOKI_GH_ENT_TOKEN_REAL_VAL="$GH_ENTERPRISE_TOKEN"; fi
         if [ -n "${GITHUB_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GITHUB_ENT_TOKEN_REAL_HAD=1; _LOKI_GITHUB_ENT_TOKEN_REAL_VAL="$GITHUB_ENTERPRISE_TOKEN"; fi
+    fi
+    # SSH sentinel (BACKLOG 149 round 3): capture the real pre-withhold state
+    # of SSH_AUTH_SOCK and GIT_SSH_COMMAND, same inherited-sentinel guard as
+    # the token vars above (GIT_SSH_COMMAND=false is this fix's own withheld
+    # value, never an operator's real config -- an operator who genuinely
+    # wants `false` as their ssh command is not a real scenario worth
+    # preserving across the guard).
+    if [ -z "$_inherited_sentinel" ]; then
+        if [ -n "${SSH_AUTH_SOCK+x}" ]; then _LOKI_SSH_AUTH_SOCK_HAD=1; _LOKI_SSH_AUTH_SOCK_OLD="$SSH_AUTH_SOCK"; fi
+        if [ -n "${GIT_SSH_COMMAND+x}" ] && [ "$GIT_SSH_COMMAND" != "false" ]; then
+            _LOKI_GIT_SSH_COMMAND_HAD=1
+            _LOKI_GIT_SSH_COMMAND_OLD="$GIT_SSH_COMMAND"
+        fi
     fi
     for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
         _LOKI_WITHHELD_TOKENS="${_LOKI_WITHHELD_TOKENS:+$_LOKI_WITHHELD_TOKENS }$_v"
@@ -5587,6 +5659,13 @@ _loki_gh_apply() {
     export "GIT_CONFIG_VALUE_${_LOKI_GIT_CRED_INDEX}="
     export GIT_CONFIG_COUNT=$((_LOKI_GIT_CRED_INDEX + 1))
     _LOKI_GIT_CRED_SCOPED=1
+    # SSH sentinel (BACKLOG 149 round 3): no reachable SSH agent, and any
+    # ssh-transport git operation fails closed via GIT_SSH_COMMAND=false
+    # (env var, so it overrides any core.sshCommand -- see the header comment
+    # above _LOKI_WITHHELD_TOKENS for the git-docs citation).
+    unset SSH_AUTH_SOCK
+    export GIT_SSH_COMMAND=false
+    _LOKI_SSH_WITHHELD=1
     if command -v gh >/dev/null 2>&1; then
         gh() { _loki_with_github_tokens command gh "$@"; }
     fi
@@ -5609,6 +5688,10 @@ _loki_gh_restore() {
         unset GIT_CONFIG_COUNT
     fi
     unset "GIT_CONFIG_KEY_${_LOKI_GIT_CRED_INDEX}" "GIT_CONFIG_VALUE_${_LOKI_GIT_CRED_INDEX}"
+    # SSH sentinel restore: give the trusted command back the real SSH agent
+    # and ssh command, so Loki's own push/PR still works over an SSH origin.
+    _loki_restore_one_token SSH_AUTH_SOCK "$_LOKI_SSH_AUTH_SOCK_HAD" "$_LOKI_SSH_AUTH_SOCK_OLD"
+    _loki_restore_one_token GIT_SSH_COMMAND "$_LOKI_GIT_SSH_COMMAND_HAD" "$_LOKI_GIT_SSH_COMMAND_OLD"
 }
 
 _LOKI_GH_TRUSTED_DEPTH=0
@@ -5671,9 +5754,9 @@ _loki_withhold_github_tokens() {
     _loki_gh_capture
     _loki_gh_apply
     if [ -n "$_first_time" ]; then
-        log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper. Loki's own push and PR steps still use the real credentials."
+        log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper, SSH agent (SSH_AUTH_SOCK unset, GIT_SSH_COMMAND=false). Loki's own push and PR steps still use the real credentials."
         if [ -n "$_LOKI_GIT_CONFIG_COUNT_UNSUPPORTED" ]; then
-            printf '%s\n' "WARNING: git < 2.31 detected -- GIT_CONFIG_COUNT/GIT_CONFIG_KEY/GIT_CONFIG_VALUE (used to reset credential.helper) are silently ignored on this git version. The git-invoked credential-helper bypass (BACKLOG 149 round 2) is NOT closed on this host; upgrade git to 2.31+ to close it. The GH_TOKEN-family sentinel and GH_CONFIG_DIR scoping above are unaffected and still apply." >&2
+            printf '%s\n' "WARNING: git < 2.31 detected -- GIT_CONFIG_COUNT/GIT_CONFIG_KEY/GIT_CONFIG_VALUE (used to reset credential.helper) are silently ignored on this git version. The git-invoked credential-helper bypass (BACKLOG 149 round 2) is NOT closed on this host; upgrade git to 2.31+ to close it. The GH_TOKEN-family sentinel, GH_CONFIG_DIR scoping, and the SSH_AUTH_SOCK/GIT_SSH_COMMAND withhold above are unaffected and still apply (GIT_SSH_COMMAND is a plain env var, not a GIT_CONFIG_* mechanism, so it needs no version floor)." >&2
         fi
     fi
 }

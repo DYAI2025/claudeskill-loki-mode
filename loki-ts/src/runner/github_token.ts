@@ -1,5 +1,10 @@
 // Rule of Two (moat P9) on the Bun route: a GitHub token never reaches an
-// agent session.
+// agent session via the IMPLICIT resolution paths this module withholds (env
+// vars, gh config store, git credential.helper, SSH agent/ssh command). Not
+// an absolute claim -- see the disclosed residuals further down (an explicit
+// named-account keyring read, a direct ssh/hosts.yml/keychain read outside
+// git); the actual security boundary is a CI job holding no write token and
+// no SSH agent while the agent runs.
 //
 // Mirrors _loki_withhold_github_tokens in autonomy/run.sh. The runner reads
 // spec text and spawns agents (claude CLI, the Agent SDK query(), codex,
@@ -64,16 +69,41 @@
 // absence) around that one call, the same way the bash route's
 // _loki_with_github_tokens does.
 //
+// BACKLOG 149 (round 3, REJECT rework): round 2's fix is HTTPS-only. Neither
+// SSH_AUTH_SOCK nor GIT_SSH_COMMAND/core.sshCommand was touched, so the
+// runner's real, untouched environment always has a reachable SSH agent (by
+// this design's own stated intent of keeping the environment live for
+// Claude's own OAuth) -- an agent can `git remote set-url origin
+// git@github.com:<owner>/<repo>.git && git push` and authenticate exactly as
+// an unrestricted session. Mirrors autonomy/run.sh's
+// _loki_withhold_github_tokens fix (see its header comment for the git-docs
+// citation and the full residual-gap list): SSH_AUTH_SOCK is deleted (not
+// sentineled -- unlike the token vars, there is no documented ssh/gh
+// "falls through when absent" behavior for this var to defeat, so unset is
+// equally correct and simpler), and GIT_SSH_COMMAND is set to `false` (a
+// POSIX builtin, ignores all arguments, always exits 1), which env-overrides
+// any core.sshCommand per git's own docs. The Bun runner has no trusted
+// post-session git call to re-grant this to, same as the token vars above.
+// Residual, not closed by this fix: an agent invoking the real `ssh` binary
+// directly (outside of git) with an explicit `-i <key>` path, or
+// re-discovering an agent socket (e.g. `launchctl getenv SSH_AUTH_SOCK` on
+// macOS) -- the same disclosed class as `gh auth token -u <username>`,
+// `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token`, and a direct hosts.yml/
+// keychain read.
+//
 // Hygiene against a naive injection, not an isolation boundary: code running
 // as the same user can still read another process's environment, the
 // hosts.yml file directly off disk (HOME stays live by design), or invoke
-// `git -c credential.helper=...` explicitly to route around this. The
-// boundary is a CI job that holds no write token while the agent runs.
+// `git -c credential.helper=...` / `gh auth token -u <username>` /
+// `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token` / the real `ssh` binary
+// directly explicitly to route around this. The boundary is a CI job that
+// holds no write token and no SSH agent while the agent runs.
 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 export const GITHUB_TOKEN_VARS = [
   "GH_TOKEN",
@@ -85,16 +115,43 @@ export const GITHUB_TOKEN_VARS = [
 export const AGENT_TOKEN_WARNING_PREFIX =
   "WARNING: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the agent session holds the GitHub token";
 
+export const GIT_VERSION_FLOOR_WARNING =
+  "WARNING: git < 2.31 detected -- GIT_CONFIG_COUNT/GIT_CONFIG_KEY/GIT_CONFIG_VALUE (used to reset credential.helper) are silently ignored on this git version. The git-invoked credential-helper bypass (BACKLOG 149 round 2) is NOT closed on this host; upgrade git to 2.31+ to close it. The GH_TOKEN-family sentinel, GH_CONFIG_DIR scoping, and the SSH_AUTH_SOCK/GIT_SSH_COMMAND withhold above are unaffected and still apply (GIT_SSH_COMMAND is a plain env var, not a GIT_CONFIG_* mechanism, so it needs no version floor).";
+
+// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n were introduced in git
+// 2.31.0 (2021-03-15); an older git silently ignores them, leaving the
+// credential.helper reset a no-op with no error signal. Mirrors the bash
+// route's git-version detection in _loki_gh_capture (autonomy/run.sh) -- this
+// was previously missing on the Bun route entirely (a secondary, non-blocking
+// finding from the round-2 rework). Best-effort: any failure to invoke or
+// parse `git --version` is treated as "cannot tell", which does not warn
+// (matching the bash route's fail-silent-on-unparseable behavior).
+function isGitVersionBelowFloor(): boolean {
+  try {
+    const out = execFileSync("git", ["--version"], { encoding: "utf8" });
+    const m = /git version (\d+)\.(\d+)/.exec(out);
+    if (!m) return false;
+    const major = Number(m[1]);
+    const minor = Number(m[2]);
+    return major < 2 || (major === 2 && minor < 31);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Set every GitHub token var to a fresh per-process garbage value (never
  * merely delete them -- see module comment (a)), scope gh's own credential
- * store (GH_CONFIG_DIR) to a fresh empty directory, and reset git's own
- * credential.helper chain to empty (module comment (b)), unless the operator
- * opted out. Returns the token names that held a real value before this ran
- * (config/credential-helper scoping is not reflected in the return value --
- * callers that only care about the 4 env vars, such as the existing tests,
- * keep working unchanged). Under the opt-out nothing is changed and, when a
- * token is present, exactly one warning line goes to `warn`.
+ * store (GH_CONFIG_DIR) to a fresh empty directory, reset git's own
+ * credential.helper chain to empty (module comment (b)), and remove the SSH
+ * agent / override the ssh command (round 3, see module comment), unless the
+ * operator opted out. Returns the token names that held a real value before
+ * this ran (config/credential-helper/SSH scoping is not reflected in the
+ * return value -- callers that only care about the 4 env vars, such as the
+ * existing tests, keep working unchanged). Under the opt-out nothing is
+ * changed and, when a token is present, exactly one warning line goes to
+ * `warn`. When git below 2.31 is detected, one additional warning line
+ * (GIT_VERSION_FLOOR_WARNING) goes to `warn` naming exactly what stays open.
  */
 export function withholdGithubTokens(
   env: NodeJS.ProcessEnv = process.env,
@@ -134,5 +191,13 @@ export function withholdGithubTokens(
   env[`GIT_CONFIG_KEY_${n}`] = "credential.helper";
   env[`GIT_CONFIG_VALUE_${n}`] = "";
   env["GIT_CONFIG_COUNT"] = String(n + 1);
+  if (isGitVersionBelowFloor()) {
+    warn(GIT_VERSION_FLOOR_WARNING);
+  }
+  // SSH sentinel (round 3, BACKLOG 149): no reachable SSH agent, and any
+  // ssh-transport git operation fails closed via GIT_SSH_COMMAND=false (env
+  // var, so it overrides any core.sshCommand -- see module comment).
+  delete env["SSH_AUTH_SOCK"];
+  env["GIT_SSH_COMMAND"] = "false";
   return present;
 }
