@@ -228,7 +228,8 @@ else
     bad "worktree age filter mismatch: output follows"
     printf '%s\n' "$OUT"
 fi
-EXPECTED_T1="VIOLATION: IDLE_BUILDERS: only 1 active builder worktree(s) while 2 ready slice(s) exist on BOARD (S-01, S-02)
+EXPECTED_T1="VIOLATION: AGENT_OVER_BUDGET: agent(s) past their role/tier time budget: S-03 building LOW (60.0 min, budget 15 min)
+VIOLATION: IDLE_BUILDERS: only 1 active builder worktree(s) while 2 ready slice(s) exist on BOARD (S-01, S-02)
 VIOLATION: LOW_READY: only 2 ready slice(s) on BOARD (want at least 8); cut 6 more"
 assert_exact_violations "T1 IDLE_BUILDERS" "$EXPECTED_T1"
 
@@ -260,7 +261,8 @@ done
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_UNRELEASED" \
     "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_MANY[@]}")"; then rc=0; else rc=$?; fi
-EXPECTED_T2="VIOLATION: UNRELEASED_MERGE: S-15 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_SHA) while CI is green"
+EXPECTED_T2="VIOLATION: UNRELEASED_MERGE: S-15 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_SHA) while CI is green
+VIOLATION: AGENT_OVER_BUDGET: agent(s) past their role/tier time budget: S-01 building LOW (60.0 min, budget 15 min), S-02 building LOW (60.0 min, budget 15 min), S-03 building LOW (60.0 min, budget 15 min), S-04 building LOW (60.0 min, budget 15 min), S-05 building LOW (60.0 min, budget 15 min), S-06 building LOW (60.0 min, budget 15 min)"
 assert_exact_violations "T2 UNRELEASED_MERGE" "$EXPECTED_T2"
 (cd "$FAKE_REPO" || exit 1; git reset -q --hard v1.0.0)
 
@@ -630,6 +632,7 @@ UNRELEASED_ALL_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 main)"
 EXPECTED_ALL="VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL (1 rule failure(s)) -- a live suite failure is always a regression regardless of the proven count (see $MOAT_RESULT_FAIL)
 VIOLATION: UNRELEASED_MERGE: 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_ALL_SHA) while CI is green
 VIOLATION: REVIEW_STALE: review-pending past 45 minutes: S-01 (60.0 min)
+VIOLATION: AGENT_OVER_BUDGET: agent(s) past their role/tier time budget: S-01 review LOW (60.0 min, budget 30 min)
 VIOLATION: IDLE_BUILDERS: only 0 active builder worktree(s) while 1 ready slice(s) exist on BOARD (S-02)
 VIOLATION: LOW_READY: only 1 ready slice(s) on BOARD (want at least 8); cut 7 more
 VIOLATION: NO_RECENT_RELEASE: no release in the last 90 minutes (3000.0 minutes since last release)
@@ -638,6 +641,7 @@ assert_exact_violations "T11 all-except-CI_RED" "$EXPECTED_ALL"
 EXPECTED_NEXT_ALL="NEXT ACTION: MOAT_REGRESSION: identify which moat property regressed and revert or fix it before any further merge -- measured moat suite reports FAIL (1 rule failure(s)) -- a live suite failure is always a regression regardless of the proven count (see $MOAT_RESULT_FAIL)
 NEXT ACTION: UNRELEASED_MERGE: cut a release now, main has been unreleased past the 30-minute budget -- 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_ALL_SHA) while CI is green
 NEXT ACTION: REVIEW_STALE: escalate or finish review for the named slice(s), they have exceeded the 45-minute budget -- review-pending past 45 minutes: S-01 (60.0 min)
+NEXT ACTION: AGENT_OVER_BUDGET: check in on the named agent(s), they have exceeded their role/tier time budget -- agent(s) past their role/tier time budget: S-01 review LOW (60.0 min, budget 30 min)
 NEXT ACTION: IDLE_BUILDERS: dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md -- only 0 active builder worktree(s) while 1 ready slice(s) exist on BOARD (S-02)
 NEXT ACTION: LOW_READY: the Product Owner should cut the named number of additional slices onto the ready queue -- only 1 ready slice(s) on BOARD (want at least 8); cut 7 more
 NEXT ACTION: NO_RECENT_RELEASE: cut a release now, none has shipped in over 90 minutes -- no release in the last 90 minutes (3000.0 minutes since last release)
@@ -1027,6 +1031,88 @@ if printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): UNKNOWN" \
     ok "main CI UNKNOWN does not suppress LOW_READY (6 active worktrees correctly means no IDLE_BUILDERS here either)"
 else
     bad "T20 unknown-does-not-suppress case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T21 -- AGENT_OVER_BUDGET (S-75, D26 guard 3): LOW builder at 20 min (over the 15-min budget) fires"
+BOARD_LOW_BUILDER_OVER="$WORK/BOARD-low-builder-over.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | LOW | building@2026-09-27T01:40Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_LOW_BUILDER_OVER"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_LOW_BUILDER_OVER"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: AGENT_OVER_BUDGET: agent(s) past their role/tier time budget: S-01 building LOW (20.0 min, budget 15 min)"; then
+    ok "LOW builder at 20 min (over its 15-min budget): AGENT_OVER_BUDGET fires naming the slice, elapsed time, and budget"
+else
+    bad "T21 LOW-builder-over case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T21b -- AGENT_OVER_BUDGET: the same LOW builder slice at 10 min (under budget) does NOT fire"
+BOARD_LOW_BUILDER_UNDER="$WORK/BOARD-low-builder-under.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | LOW | building@2026-09-27T01:50Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_LOW_BUILDER_UNDER"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_LOW_BUILDER_UNDER"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET"; then
+    ok "LOW builder at 10 min (under its 15-min budget): AGENT_OVER_BUDGET correctly does not fire"
+else
+    bad "T21b LOW-builder-under case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T21c -- AGENT_OVER_BUDGET: HIGH-tier review at 45 min (under its 60-min budget) does NOT fire"
+BOARD_HIGH_REVIEW_UNDER="$WORK/BOARD-high-review-under.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | HIGH | review@2026-09-27T01:15Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_HIGH_REVIEW_UNDER"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_HIGH_REVIEW_UNDER"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET"; then
+    ok "HIGH review at 45 min (under its 60-min budget): AGENT_OVER_BUDGET correctly does not fire"
+else
+    bad "T21c HIGH-review-under case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T21d -- AGENT_OVER_BUDGET: HIGH-tier review at 65 min (over its 60-min budget) fires"
+BOARD_HIGH_REVIEW_OVER="$WORK/BOARD-high-review-over.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | HIGH | review@2026-09-27T00:55Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_HIGH_REVIEW_OVER"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_HIGH_REVIEW_OVER"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "AGENT_OVER_BUDGET: agent(s) past their role/tier time budget: S-01 review HIGH (65.0 min, budget 60 min)"; then
+    ok "HIGH review at 65 min (over its 60-min budget): AGENT_OVER_BUDGET fires"
+else
+    bad "T21d HIGH-review-over case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T21e -- AGENT_OVER_BUDGET: an active row with no parseable Tier cell reports UNKNOWN, never silently skipped"
+BOARD_NO_TIER="$WORK/BOARD-no-tier.md"
+{
+    echo "| ID | Owner | File set | Status | Notes |"
+    echo "|---|---|---|---|---|"
+    echo "| S-01 | a | x | building@2026-09-27T01:00Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_NO_TIER"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_NO_TIER"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Agent budget: UNKNOWN for S-01 (no parseable Tier cell on an active row)" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*agent_budget" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET"; then
+    ok "no Tier cell on an active building row: reported UNKNOWN, never silently treated as in-budget"
+else
+    bad "T21e no-tier case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 

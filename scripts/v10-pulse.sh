@@ -304,8 +304,8 @@ NOW = now_epoch()
 # the TOP violation -- an accidental ordering-by-discovery would misrank it.
 VIOLATION_PRIORITY = [
     "CI_RED", "CI_CANCELLED_STREAK", "MOAT_REGRESSION", "UNRELEASED_MERGE",
-    "REVIEW_STALE", "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE",
-    "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
+    "REVIEW_STALE", "AGENT_OVER_BUDGET", "IDLE_BUILDERS", "LOW_READY",
+    "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
 ]
 
 violations = []          # list of (code, text)
@@ -552,17 +552,20 @@ STATUS_TOKEN_RE = re.compile(
     r"@(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z)$"
 )
 ID_RE = re.compile(r"^(GF|PF|S)-\d+$")
+TIER_CELL_RE = re.compile(r"^(LOW|MEDIUM|HIGH)$")
 
 
 def parse_board(path):
     """Parse BOARD.md's pipe table rows. Cell position varies (some rows
-    omit the Acceptance-checks column), so this finds the Status cell by
-    matching the normalized token@timestamp pattern rather than trusting a
-    fixed column index."""
+    omit the Acceptance-checks column, and BOARD.md has used at least four
+    different header layouts), so this finds the Status cell (and the Tier
+    cell) by matching their normalized content rather than trusting a fixed
+    column index."""
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
     rows = []
     unparsed = []
+    tiers = {}
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("|"):
@@ -583,7 +586,12 @@ def parse_board(path):
             unparsed.append(row_id)
             continue
         rows.append((row_id, status_cell[0], status_cell[1]))
-    return {"rows": rows, "unparsed": unparsed}
+        for cell in cells[1:]:
+            tm = TIER_CELL_RE.match(cell)
+            if tm:
+                tiers[row_id] = tm.group(1)
+                break
+    return {"rows": rows, "unparsed": unparsed, "tiers": tiers}
 
 
 board = safe(parse_board, BOARD_MD)
@@ -636,6 +644,88 @@ else:
         add_violation(
             "REVIEW_STALE",
             "review-pending past 45 minutes: %s" % ids_desc,
+        )
+
+    # AGENT_OVER_BUDGET: founder-specified per-role agent time budgets
+    # (D26 guard 3). "building" rows are a builder agent, "review" rows are
+    # a reviewer agent; "review-blocked"/"blocked" rows have no agent
+    # actively working them and are excluded, same as REVIEW_STALE's own
+    # (review, review-blocked) scope one section up.
+    #
+    # Budget table (minutes), keyed by (role, tier):
+    #   builder LOW=15, builder MEDIUM=30 -- founder-specified directly.
+    #   reviewer LOW=30, reviewer MEDIUM=30 -- founder said "reviewer (any
+    #     tier up to MEDIUM): 30 minutes", i.e. flat 30 regardless of
+    #     LOW/MEDIUM, unlike the builder row which scales with tier.
+    #   reviewer HIGH=60 -- "HIGH-tier adversarial reviewer: 60 minutes",
+    #     founder-specified directly.
+    #   builder HIGH -- NOT named by the founder. BOARD.md's own history
+    #     has real HIGH-tier BUILD rows (GF-1..GF-5, PF-1/PF-2 are all
+    #     HIGH-tier build slices, not reviews), so this is a real case, not
+    #     a hypothetical needing no entry. ponytail: picked 60 (symmetry
+    #     with the HIGH reviewer budget: HIGH-tier work is HIGH-tier work
+    #     regardless of role) over a conservative 30, because these are
+    #     exactly the security/GF-class slices that took the longest
+    #     round-trips this session; 30 would false-fire on routine HIGH
+    #     builder work. Flagged here and in the S-75 report as the one
+    #     founder-underspecified budget in this table -- revisit if the
+    #     founder gives an explicit number.
+    _AGENT_BUDGET_MIN = {
+        ("building", "LOW"): 15,
+        ("building", "MEDIUM"): 30,
+        ("building", "HIGH"): 60,
+        ("review", "LOW"): 30,
+        ("review", "MEDIUM"): 30,
+        ("review", "HIGH"): 60,
+    }
+    # ponytail: this reads BOARD.md's own `building@`/`review@` cell, the
+    # same source IDLE_BUILDERS' own comment warns "go stale between edits".
+    # A slice actually finished/handed-off but left at a stale status token
+    # will read as still running and can false-fire here; the fix is to
+    # update the BOARD cell (already required practice), not to change this
+    # check -- same tradeoff this file already accepts for REVIEW_STALE and
+    # UNRELEASED_MERGE's board-derived reads.
+    board_tiers = board.get("tiers", {})
+    over_budget = []
+    tier_unknown_active = []
+    active_checked = 0
+    for row_id, token, ts in board_rows:
+        if token not in ("building", "review"):
+            continue
+        t = parse_time_value(ts)
+        if t is None:
+            continue
+        active_checked += 1
+        age = (NOW - t) / 60.0
+        tier = board_tiers.get(row_id)
+        if tier is None:
+            tier_unknown_active.append(row_id)
+            continue
+        budget = _AGENT_BUDGET_MIN.get((token, tier))
+        if budget is None:
+            tier_unknown_active.append(row_id)
+            continue
+        if age > budget:
+            over_budget.append((row_id, token, tier, age, budget))
+    emit(
+        "Agent budget: %d active (building/review) row(s) checked, %d over budget"
+        % (active_checked, len(over_budget))
+    )
+    if tier_unknown_active:
+        mark_unknown("agent_budget")
+        emit(
+            "Agent budget: UNKNOWN for %s (no parseable Tier cell on an active row)"
+            % ", ".join(sorted(tier_unknown_active))
+        )
+    if over_budget:
+        over_budget.sort(key=lambda item: -item[3])
+        ids_desc = ", ".join(
+            "%s %s %s (%.1f min, budget %d min)" % (rid, role, tier, age, budget)
+            for rid, role, tier, age, budget in over_budget
+        )
+        add_violation(
+            "AGENT_OVER_BUDGET",
+            "agent(s) past their role/tier time budget: %s" % ids_desc,
         )
 
     ready_count = counts.get("ready", 0)
@@ -1164,6 +1254,7 @@ _NEXT_ACTION_TEXT = {
     "MOAT_REGRESSION": "identify which moat property regressed and revert or fix it before any further merge",
     "UNRELEASED_MERGE": "cut a release now, main has been unreleased past the 30-minute budget",
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
+    "AGENT_OVER_BUDGET": "check in on the named agent(s), they have exceeded their role/tier time budget",
     "IDLE_BUILDERS": "dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md",
     "LOW_READY": "the Product Owner should cut the named number of additional slices onto the ready queue",
     "NO_RECENT_RELEASE": "cut a release now, none has shipped in over 90 minutes",
