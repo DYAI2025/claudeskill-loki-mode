@@ -958,6 +958,7 @@ run_test "web-app chat completion never says Done. for a silent failure (node --
 run_test "dashboard checkpoint viewer shows a failed read, not empty (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-checkpoint-viewer-fetch-error.node.test.mjs"
 run_test "dashboard council transcripts show a failed hook-events read (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-council-transcripts-fetch-error.node.test.mjs"
 run_test "dashboard task board keeps a server load error visible (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-task-board-fetch-error.node.test.mjs"
+run_test "dashboard API keys load error hides the empty state (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-api-keys-fetch-error.node.test.mjs"
 run_test "shipped agent roles reach the review pool" "$SCRIPT_DIR/test-agent-types-loaded.sh"
 run_test "policy present but unevaluable refuses fail-closed" "$SCRIPT_DIR/test-policy-node-failclosed.sh"
 run_test "audit entries attribute an actor honestly" "$SCRIPT_DIR/test-audit-actor-attribution.sh"
