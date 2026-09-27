@@ -5,6 +5,26 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.60.0
+
+**Release train 5: Rule of Two credential withholding closes its remaining bypasses, a release reuses its parent's CI verdict, and the pre-push hook drops to under a second.** Released on the founder's call without further review cycles on work already completed (D27).
+
+**Security (S-18, BACKLOG 149):**
+- The run withholds GitHub credentials from the agent on every channel: the GH_TOKEN family, `gh` config, the git credential helper, SSH agent and `GIT_SSH_COMMAND`.
+- Bun spawns pass an explicit environment, so a planted `core.fsmonitor` no longer sees the start-of-process credentials.
+- A nested run fails closed and cannot push.
+- Loki's own post-run push now goes from a fresh private repo, so agent-planted hooks, `core.sshCommand`, a repo-local credential helper and `insteadOf` never run with credentials. Trusted `gh` calls run from `/` with an explicit repo.
+- `LOKI_AUTO_PR` and the delegated PR push only to a github.com origin, and only to the origin the repo had when the run started. GitHub Enterprise and GitLab are planned for M9. The local branch no longer gets an upstream set.
+
+**Release (S-84, Part C items 3 and 5):**
+- `required-ci` reuses the parent's Tests and Bun Parity success when the parent-to-release diff only bumps versions. Every allowlisted file is compared byte for byte apart from the version literal. The source map is compared as JSON without `debugId`. CHANGELOG.md may only gain one inserted version entry.
+- A completed failure at the release SHA always fails.
+- `needs: gate` and gate's duplicate pytest are removed.
+
+**Tooling (D27):**
+- `.githooks/pre-push` is now an identity check, `bash -n` and the red-main warning: 0.8s instead of a full serial pytest (S-97).
+- The pulse gains TRAIN_LATE, and `scripts/v10-ops.sh push-main` pushes without a pipe and succeeds only when `git ls-remote` matches HEAD (S-98).
+
 ## v9.59.0
 
 **Release train 4: council readers hardened, a Tier A fast test gate, and a release script that bumps every file.**
