@@ -21516,9 +21516,14 @@ except (json.JSONDecodeError, KeyError, TypeError, OSError):
                 mv "$state_file" "${state_file}.corrupt.$(date +%s)" 2>/dev/null || true
                 # Starts at iteration 0: drop the previous session's test
                 # evidence, as the iteration-0 block at the end does.
+                # S-124 follow-up: static-analysis.pass has no freshness
+                # marker of its own (same reasoning as the block below), so
+                # this corrupted-state restart must drop it too, or a stale
+                # copy survives this sibling iteration-0 trigger.
                 rm -f "${TARGET_DIR:-.}/.loki/quality/.test-results.iter" \
                       "${TARGET_DIR:-.}/.loki/quality/unit-tests.pass" \
-                      "${TARGET_DIR:-.}/.loki/quality/test-results.json" 2>/dev/null || true
+                      "${TARGET_DIR:-.}/.loki/quality/test-results.json" \
+                      "${TARGET_DIR:-.}/.loki/quality/static-analysis.pass" 2>/dev/null || true
                 return
             fi
 

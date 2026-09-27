@@ -88,5 +88,49 @@ else
     bad "static-analysis.pass was dropped on a non-zero iteration -- too aggressive"
 fi
 
+# ---- CORRUPTED STATE FILE (sibling iteration-0 trigger, S-124 rework) -----
+# load_state() has a second reset-to-iteration-0 path for a corrupted/invalid
+# state file that returns before the block above ever runs. It must drop
+# static-analysis.pass too, or a stale copy survives this trigger.
+CORRUPT_BLOCK="$TMP/corrupt-block.sh"
+python3 - "$RUN_SH" > "$CORRUPT_BLOCK" <<'PYEOF'
+import sys
+s = open(sys.argv[1]).read()
+start_marker = '            if [ "$state_valid" != "valid" ]; then'
+end_marker = "            fi\n"
+try:
+    start = s.index(start_marker)
+    end = s.index(end_marker, start) + len(end_marker)
+except ValueError:
+    sys.exit(1)
+print("run_corrupt_block() {")
+print(s[start:end])
+print("}")
+print("run_corrupt_block")
+PYEOF
+
+if [ ! -s "$CORRUPT_BLOCK" ]; then
+    bad "could not extract the corrupted-state-file block from run.sh (moved or renamed?)"
+else
+    ICORRUPT="$TMP/icorrupt"
+    setup_quality_dir "$ICORRUPT"
+    STATE_FILE="$ICORRUPT/.loki/autonomy-state.json"
+    printf '{not valid json' > "$STATE_FILE"
+    TARGET_DIR="$ICORRUPT" state_valid="invalid" state_file="$STATE_FILE" \
+        bash -c 'log_warn() { :; }; source "$1"' _ "$CORRUPT_BLOCK" >/dev/null 2>&1
+    if [ ! -f "$ICORRUPT/.loki/quality/static-analysis.pass" ]; then
+        ok "corrupted-state-file restart drops a stale static-analysis.pass"
+    else
+        bad "corrupted-state-file restart left a previous session's static-analysis.pass in place"
+    fi
+    if [ ! -f "$ICORRUPT/.loki/quality/unit-tests.pass" ] \
+       && [ ! -f "$ICORRUPT/.loki/quality/test-results.json" ] \
+       && [ ! -f "$ICORRUPT/.loki/quality/.test-results.iter" ]; then
+        ok "corrupted-state-file restart still drops the original three evidence files"
+    else
+        bad "corrupted-state-file restart regressed one of the original evidence drops"
+    fi
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
