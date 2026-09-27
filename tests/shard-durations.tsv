@@ -922,3 +922,4 @@ v10-pulse anti-drift status/violation reporter	10
 v10 drift-audit turn counter (every-6th-turn signal)	0
 ShellCheck Linting	133
 prune-worktrees treats cherry-picked branches as merged (S-154)	2
+auto-capture shadow-write skips empty PROJECT_DIR and never splices importance (S-156)	32

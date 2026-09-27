@@ -21378,14 +21378,17 @@ PYEOF
     # v6.83.0 Phase 1: RARV-C REFLECT/VERIFY shadow-write. Only when both
     # managed flags are on AND the episode meets the consolidation importance
     # threshold (>= 0.6). Fully non-blocking (backgrounded subprocess).
-    if [ "$LOKI_MANAGED_AGENTS" = "true" ] && [ "$LOKI_MANAGED_MEMORY" = "true" ] \
+    # S-156: skip when PROJECT_DIR is empty (bash 3.2 `cd ""` succeeds and
+    # would run a memory package from the cwd), and pass importance via argv.
+    if [ -n "${PROJECT_DIR:-}" ] \
+        && [ "$LOKI_MANAGED_AGENTS" = "true" ] && [ "$LOKI_MANAGED_MEMORY" = "true" ] \
         && [ -s "$episode_path_file" ]; then
         local _ep_path _ep_imp
         _ep_path=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('path',''))" "$episode_path_file" 2>/dev/null || echo "")
         _ep_imp=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('importance',0.0))" "$episode_path_file" 2>/dev/null || echo "0")
         if [ -n "$_ep_path" ] && [ -f "$_ep_path" ]; then
             local _above_threshold
-            _above_threshold=$(python3 -c "print('yes' if float('$_ep_imp') >= 0.6 else 'no')" 2>/dev/null || echo "no")
+            _above_threshold=$(python3 -c 'import sys; print("yes" if float(sys.argv[1]) >= 0.6 else "no")' "$_ep_imp" 2>/dev/null || echo "no")
             if [ "$_above_threshold" = "yes" ]; then
                 (
                     cd "$PROJECT_DIR" 2>/dev/null && \
