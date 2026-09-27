@@ -3,11 +3,23 @@
 # (S-91 Tier A selector). Drives the selector via --files (no real commits
 # needed) so each rule R0-R7 has a deterministic scenario, plus the
 # unparseable-diff fallback in git mode.
+#
+# Perf (S-136): scripts/select-tests.sh is a pure function of its changed-file
+# list against a fixed repo state, but each invocation is its own process
+# (~5-6s of grep/xargs fan-out over the test tree). ~30 distinct inputs run
+# serially blew past the 60s cap. Every distinct input below is queued up
+# front (deduped by content), run MAX_PAR-wide in the background, then each
+# case reads its answer back from cache instead of re-invoking the selector.
+# The prefetch list for `sel 'X'` cases is extracted from this file's own
+# source (self-inspection) so it can never drift from the call sites below;
+# assertions and their messages are all unchanged, so a dropped rule in
+# scripts/select-tests.sh still fails the exact case it always did.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SELECT="$REPO_ROOT/scripts/select-tests.sh"
+SELF="$SCRIPT_DIR/test-select-tests.sh"
 
 PASS=0
 FAIL=0
@@ -46,9 +58,124 @@ expect_not_contains() {
     fi
 }
 
-sel() { printf '%s\n' "$1" | bash "$SELECT" --files -; }
+# --- parallel selector cache ------------------------------------------------
+# ponytail: plain background jobs + a job-count throttle, no new dependency
+# (GNU parallel etc). JOBDIR holds one .in/.out/.err/.launched fileset per
+# distinct invocation; cleaned up on exit like every other test-local temp
+# dir in this suite (see tests/test-agent-readiness.sh's mktemp -d usage).
+JOBDIR="$(mktemp -d)"
+trap 'rm -rf "$JOBDIR"' EXIT
+MAX_PAR="${SELECT_TESTS_MAX_PAR:-4}"
+JOB_COUNT=0
 
-# R0: broad-blast-radius file triggers run-everything.
+cache_key() { printf '%s' "$1" | shasum -a 1 | awk '{print $1}'; }
+
+throttle() {
+    JOB_COUNT=$((JOB_COUNT + 1))
+    if [ "$JOB_COUNT" -ge "$MAX_PAR" ]; then
+        wait -n 2>/dev/null || wait
+        JOB_COUNT=$((JOB_COUNT - 1))
+    fi
+}
+
+# files_launch/files_result: a `--files <list>` invocation, keyed by the
+# exact file-list content (so two cases with the same changed files share
+# one selector run, e.g. migration-hooks.sh or dashboard/api_runs.py above,
+# each reused across 2-3 cases).
+files_launch() {
+    local content="$1" key
+    key="$(cache_key "F:$content")"
+    [ -e "$JOBDIR/$key.launched" ] && return 0
+    : >"$JOBDIR/$key.launched"
+    printf '%s' "$content" >"$JOBDIR/$key.in"
+    (bash "$SELECT" --files "$JOBDIR/$key.in" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
+    throttle
+}
+
+files_result() {
+    local content="$1" key tmp
+    key="$(cache_key "F:$content")"
+    if [ ! -e "$JOBDIR/$key.launched" ]; then
+        # Not prefetched (a case added later with no matching files_launch) --
+        # fall back to a direct, uncached call so it still works, just slower.
+        tmp="$(mktemp)"
+        printf '%s' "$content" >"$tmp"
+        bash "$SELECT" --files "$tmp"
+        rm -f "$tmp"
+        return
+    fi
+    cat "$JOBDIR/$key.out" 2>/dev/null
+}
+
+# args_launch/args_result: a direct invocation with no stdin (the --base
+# cases), keyed by its argument list.
+args_launch() {
+    local key
+    key="$(cache_key "A:$*")"
+    [ -e "$JOBDIR/$key.launched" ] && return 0
+    : >"$JOBDIR/$key.launched"
+    (bash "$SELECT" "$@" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
+    throttle
+}
+
+args_result() {
+    local key
+    key="$(cache_key "A:$*")"
+    if [ ! -e "$JOBDIR/$key.launched" ]; then
+        bash "$SELECT" "$@"
+        return
+    fi
+    cat "$JOBDIR/$key.out" 2>/dev/null
+}
+
+# sel() keeps its original one-file-per-call shape and call sites unchanged;
+# only its plumbing changed (cache lookup instead of a live process).
+sel() { files_result "$(printf '%s\n' "$1")"; }
+
+# Repro 3's SAMPLE_PY_FILES / py_test_files, hoisted up from their original
+# spot below so their guard-loop candidates can be prefetched here too; the
+# guard loop further down still computes truth itself and calls sel() (now
+# cache-backed) exactly as before.
+SAMPLE_PY_FILES="$(
+    { find "$REPO_ROOT/autonomy/lib" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
+      find "$REPO_ROOT/dashboard" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
+    } | sed "s#^$REPO_ROOT/##"
+)"
+
+# --- prefetch: queue every distinct selector invocation this file makes ----
+
+# Every `sel 'X'` call below is extracted from this script's own source, so
+# this list can never drift from the actual call sites.
+mapfile -t _SEL_ARGS < <(grep -oE "sel '[^']*'" "$SELF" | sed -E "s/^sel '//; s/'\$//")
+for _arg in "${_SEL_ARGS[@]}"; do
+    files_launch "$(printf '%s\n' "$_arg")"
+done
+
+# The guard-loop candidates (repro 3): only prefetch ones the loop below will
+# actually call sel() on (it skips a candidate with no real import anywhere,
+# same truth check as here) -- a live selector call is the expensive part
+# (all_test_files() fans out a grep per candidate test file), so launching one
+# for a candidate the loop would have skipped is pure waste.
+mapfile -t _guard_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
+while IFS= read -r _pyfile; do
+    [ -n "$_pyfile" ] || continue
+    _stem="$(basename "$_pyfile" .py)"
+    _truth="$(grep -lE "^[[:space:]]*(import|from)[[:space:]].*(^|[^A-Za-z0-9_.])${_stem}([^A-Za-z0-9_]|$)" \
+        "${_guard_test_files[@]}" 2>/dev/null)"
+    [ -n "$_truth" ] && files_launch "$(printf '%s\n' "$_pyfile")"
+done <<<"$SAMPLE_PY_FILES"
+
+# The 4 direct (non-sel()) invocations further down.
+files_launch ""
+files_launch "$(printf 'skills/testing.md\nautonomy/hooks/migration-hooks.sh\n')"
+args_launch --base this-ref-does-not-exist-zzz
+if git -C "$REPO_ROOT" rev-parse --verify -q 72afa3e9 >/dev/null && git -C "$REPO_ROOT" rev-parse --verify -q 72afa3e9^ >/dev/null; then
+    args_launch --base 72afa3e9^ --head 72afa3e9
+fi
+
+wait
+
+# --- R0: broad-blast-radius file triggers run-everything. -------------------
 out="$(sel 'package.json')"
 expect_contains "R0 package.json" "$out" "$(printf 'R0\tALL')"
 
@@ -72,7 +199,7 @@ expect_contains "R0 run-all-tests.sh" "$out" "$(printf 'R0\tALL')"
 
 # R0 (unknown/unparseable diff): a bad base ref in git mode must fall back to
 # everything, never to nothing.
-out="$(bash "$SELECT" --base this-ref-does-not-exist-zzz)"
+out="$(args_result --base this-ref-does-not-exist-zzz)"
 expect_contains "R0 unparseable base ref" "$out" "unparseable diff"
 
 # R0 (unknown path shape): a file under no recognized area and with no
@@ -140,7 +267,7 @@ out="$(sel 'docs/some-notes.md')"
 expect_empty "R7 docs-only is silent (nothing to R1-check)" "$out"
 
 # R7 does not apply to skills/ or SKILL.md -- those still get full selection.
-out="$(printf 'skills/testing.md\nautonomy/hooks/migration-hooks.sh\n' | bash "$SELECT" --files -)"
+out="$(files_result "$(printf 'skills/testing.md\nautonomy/hooks/migration-hooks.sh\n')")"
 expect_contains "R7 exemption: skills/ still selects R3" "$out" "$(printf 'R3\tshell_test\ttests/test-healing-hooks-safety.sh')"
 
 # R3 (git mode, real historical commit): autonomy/run.sh's hunk-function path
@@ -149,7 +276,7 @@ expect_contains "R7 exemption: skills/ still selects R3" "$out" "$(printf 'R3\ts
 # shell files (no .gitattributes driver), so this exercises the changed_functions()
 # fallback that scans "name() {" definitions directly.
 if git -C "$REPO_ROOT" rev-parse --verify -q 72afa3e9 >/dev/null && git -C "$REPO_ROOT" rev-parse --verify -q 72afa3e9^ >/dev/null; then
-    out="$(bash "$SELECT" --base 72afa3e9^ --head 72afa3e9)"
+    out="$(args_result --base 72afa3e9^ --head 72afa3e9)"
     n=$(printf '%s\n' "$out" | grep -c '^R3	shell_test	')
     if [ "$n" -gt 0 ] && [ "$n" -lt 20 ]; then
         PASS=$((PASS + 1))
@@ -162,7 +289,7 @@ else
 fi
 
 # No changed files at all: nothing to run, and that's not "unknown".
-out="$(printf '' | bash "$SELECT" --files -)"
+out="$(files_result "")"
 expect_empty "no changes -> no output" "$out"
 expect_not_contains "no changes -> not R0" "$out" "R0"
 
@@ -205,21 +332,17 @@ expect_not_contains "repro3: never bash-kinded" "$out" "$(printf 'shell_test\tda
 # module (an "import x" / "from x import" / "from pkg import x" line,
 # independently found on disk here, not by calling into the selector's own
 # matcher) must appear in the selector's output for that file.
-SAMPLE_PY_FILES="$(
-    { find "$REPO_ROOT/autonomy/lib" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
-      find "$REPO_ROOT/dashboard" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
-    } | sed "s#^$REPO_ROOT/##"
-)"
+# (SAMPLE_PY_FILES is computed above, prefetch-side, from the same find.)
 
 guard_pass=0
 guard_fail=0
+mapfile -t py_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
 while IFS= read -r pyfile; do
     [ -n "$pyfile" ] || continue
     stem="$(basename "$pyfile" .py)"
     # Ground truth: any .py file under tests/ whose import line names this
     # module ("import stem", "from stem import", "from pkg import stem",
     # "pkg.stem"), found independently of scripts/select-tests.sh.
-    mapfile -t py_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
     truth="$(grep -lE "^[[:space:]]*(import|from)[[:space:]].*(^|[^A-Za-z0-9_.])${stem}([^A-Za-z0-9_]|$)" \
         "${py_test_files[@]}" 2>/dev/null | sed "s#^$REPO_ROOT/##")"
     [ -z "$truth" ] && continue
