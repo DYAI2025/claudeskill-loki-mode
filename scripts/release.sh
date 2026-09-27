@@ -165,11 +165,17 @@ apply_sed() {
 # After writing, asserts the new version now appears in that exact slot, so
 # a pattern that stops matching (a reformatted file, a typo in this script)
 # fails the release instead of silently shipping a stale file.
+#
+# $5 (optional, default "false"): pass "true" for a slot the checklist itself
+# marks as conditional ("if present"). A conditional slot that fails to match
+# is a documented case, not drift -- warn and move on instead of aborting the
+# release, the same way a missing file already does above.
 update_version_slot() {
     local file="$1"
     local expr="$2"
     local assert_pattern="$3"
     local description="$4"
+    local optional="${5:-false}"
 
     if [[ ! -f "$file" ]]; then
         log_warn "File not found: $file"
@@ -191,6 +197,10 @@ update_version_slot() {
     apply_sed "$file" "$expr"
 
     if ! grep -qE "$assert_pattern" "$file"; then
+        if [ "$optional" = "true" ]; then
+            log_warn "$description not present in $file, skipping (checklist marks this slot optional)"
+            return
+        fi
         log_error "Failed to update $description in $file (slot pattern no longer matches after edit)"
         exit 1
     fi
@@ -267,10 +277,15 @@ bump_all_version_files() {
         "^      \"version\": \"${new}\"" \
         "server.json packages[].version"
 
+    # Optional: the release checklist lists this as "if present". CLAUDE.md
+    # (S-78) now points at VERSION instead of carrying its own version
+    # literal, so this slot legitimately has nothing to match most of the
+    # time -- that is not drift, so it must not fail-close the release.
     update_version_slot "$ROOT_DIR/CLAUDE.md" \
         "s/^(- Current: v)${digits}( )/\\1${new}\\2/" \
         "^- Current: v${new} " \
-        "CLAUDE.md Version Numbering"
+        "CLAUDE.md Version Numbering" \
+        "true"
 
     update_version_slot "$ROOT_DIR/dashboard/__init__.py" \
         "s/^(__version__ = \")${digits}(\")\$/\\1${new}\\2/" \
