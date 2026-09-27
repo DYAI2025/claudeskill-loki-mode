@@ -1035,3 +1035,18 @@ else should take priority over.
     mean the SAME OS family as the failing CI job, not just "my own
     machine" -- a macOS-only local repro is not sufficient evidence to
     rule out a Linux-specific regression, ever.
+
+- 2026-09-27T14:13Z: Tests rerun of shard 0 on `c31cb1e8` completed
+  success (`gh run view 36321857199 --json status,conclusion` ->
+  `completed success`). Train 1 verified: Tests and Bun Parity green on
+  the frozen SHA.
+- 2026-09-27T14:16:24Z: pushed release commit `b651b98d` (v9.56.0,
+  `c31cb1e8..b651b98d`). Only version strings, CHANGELOG and a fresh
+  deterministic dist build on top of docs-only commits. Release run
+  36325316189, Tests 36325316218, Bun Parity 36325316184, Security
+  Audit 36325316176 all started on `b651b98d`. Main frozen until publish.
+- Found while releasing: the committed loki-ts/dist was not a fresh
+  build of src (a second local build was byte-identical to the first,
+  so the build is deterministic; after normalizing minified identifiers
+  the only semantic difference is the version string). Shipped the
+  fresh build.
