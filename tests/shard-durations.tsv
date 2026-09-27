@@ -324,6 +324,7 @@ web-app workspace panels surface fetch failures (node --test)	1
 web-app chat completion never says Done. for a silent failure (node --test)	1
 dashboard checkpoint viewer shows a failed read, not empty (node --test)	0
 dashboard council transcripts show a failed hook-events read (node --test)	0
+dashboard task board keeps a server load error visible (node --test)	1
 shipped agent roles reach the review pool	0
 policy present but unevaluable refuses fail-closed	0
 audit entries attribute an actor honestly	0
