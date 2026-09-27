@@ -1050,3 +1050,24 @@ else should take priority over.
   so the build is deterministic; after normalizing minified identifiers
   the only semantic difference is the version string). Shipped the
   fresh build.
+
+## Drift audit, turn 174
+
+**Matched:** the CEO directive's Part A shipped first: train 1 was
+verified on its frozen SHA and released as v9.56.0 before any Part C
+work merged. Leader lock taken (`.loki/v10-leader`, PID 74619). 6
+engineers and 10 reviewers dispatched in parallel on the named items;
+pulse `Active builder worktrees` rose from 5 to 19, clearing
+IDLE_BUILDERS. Trivial ops (committing finished builds, BOARD edits,
+version bump) were done directly, not by agents (D26 guard 2).
+
+**Drifted, self-caught:** two builders (S-74, S-82) stopped short of
+committing and asked for approval, following the global
+approve-before-commit rule the repo's standing authorization waives.
+Fixed by committing their work directly; S-78 (CLAUDE.md trim) is the
+real fix, since it moves the operating model into every session.
+The release also surfaced a stale committed loki-ts/dist that no gate
+caught on train 1's own commit; the fast-tier dist-freshness check
+exists but the train skipped local-ci. Correction: run
+`bash scripts/local-ci.sh` (fast tier) on every train's freeze commit
+before pushing it, not only on release commits.
