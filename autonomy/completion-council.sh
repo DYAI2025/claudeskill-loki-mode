@@ -3742,11 +3742,19 @@ except (json.JSONDecodeError, IOError, KeyError, ValueError):
 runner = d.get('runner', 'none')
 passed = d.get('pass')
 status = d.get('status', '')
+# S-157 (BACKLOG 89): same failed-count rule as council_evidence_gate. A
+# numeric failed_count above zero is a failure whatever pass says; legacy
+# numeric failed is the fallback; null, missing or a bool is unmeasured.
+def _count(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+failed_n = _count(d.get('failed_count'))
+if failed_n is None:
+    failed_n = _count(d.get('failed'))
 if status == 'no_tests_run':
     print('inconclusive:%s' % runner)
 elif runner == 'none':
     print('pass:none')
-elif passed is False:
+elif passed is False or (failed_n or 0) > 0:
     print('fail:%s' % runner)
 elif passed is not True:
     print('inconclusive:%s' % runner)
@@ -4602,9 +4610,18 @@ runner = d.get('runner', 'none')
 passed = d.get('pass')
 # Affirmative green requires a REAL suite (runner != none) that recorded a
 # boolean True pass. A missing/null/non-boolean pass key or a zero-test run
-# (status no_tests_run) is inconclusive, which is not green.
+# (status no_tests_run) is inconclusive, which is not green. S-157 (BACKLOG
+# 98): a recorded failure count above zero is never green, by the same rule
+# as council_evidence_gate (numeric failed_count wins, legacy numeric failed
+# is the fallback, null/missing/bool is unmeasured).
+def _count(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+failed_n = _count(d.get('failed_count'))
+if failed_n is None:
+    failed_n = _count(d.get('failed'))
 print('yes' if (runner != 'none' and passed is True
-                and d.get('status') != 'no_tests_run') else 'no')
+                and d.get('status') != 'no_tests_run'
+                and (failed_n or 0) <= 0) else 'no')
 " 2>/dev/null || echo "no")
     [ "$tr_state" = "yes" ] || return 1
 

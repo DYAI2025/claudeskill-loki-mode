@@ -601,6 +601,7 @@ run_test "Code-review gitignore filter + oversized-diff loud-fail (client fix)" 
 run_test "Code-review compact lockfile context and explicit size rejection" "$SCRIPT_DIR/test-review-lockfile-context.sh"
 run_test "Code-review size caps derive from PROVIDER_CONTEXT_WINDOW" "$SCRIPT_DIR/test-review-context-window-caps.sh"
 run_test "Council Convergence Floor (rank 15 no-claim early check)" "$SCRIPT_DIR/test-council-convergence-floor.sh"
+run_test "Council failed_count honesty (S-157 member vote + convergence)" "$SCRIPT_DIR/test-council-failed-count-honesty.sh"
 run_test "Acceptance-oracle source-grounded (rank 2 routes/LSP-symbols/invariant)" "$SCRIPT_DIR/test-oracle-source-grounded.sh"
 
 # Batch-3 verify.sh: rank 10 code-scope/locality record (advisory-first) + rank 7
