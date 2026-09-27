@@ -203,6 +203,13 @@ case, verified both ways:
 | Mutation (`contents: read` -> `contents: write`) | `bash tests/moat/p9-rule-of-two.sh` -> `CASE P9.issue-workflows-separate-untrusted-from-push FAIL ... holds write permissions and restores actions/setup-python cache: pip, oven-sh/setup-bun ..., actions/setup-node cache: npm` (the guard names exactly the 3 caches added here) |
 | Mutation reverted | `bash tests/moat/p9-rule-of-two.sh` -> all 4 cases PASS, exit 0 again |
 
-Also added an explicit `timeout-minutes: 20` on the "Run selected suites"
-step (where the R0 full-suite path executes), so R0 has its own budget
-instead of only the job-level 25.
+Rework (post-review): an earlier draft of this commit added an explicit
+`timeout-minutes: 20` on the "Run selected suites" step (where the R0
+full-suite path executes). Review found this false-budgeted: this repo's own
+measured data (test.yml, scripts/local-ci.sh, CLAUDE.md) converges on
+~24-27 minutes for `tests/run-all-tests.sh` run serially, so a 20-minute step
+cap was tighter than even the existing 25-minute job-level ceiling, not a
+looser purpose-built budget as the commit claimed, and was never checked
+against a real R0 `--run`. Removed; the job-level `timeout-minutes: 25`
+remains the only cap on this step. Guarded by
+`tests/test-tier-a-r0-timeout-budget.sh` (S-96 rework).

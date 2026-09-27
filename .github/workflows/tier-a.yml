@@ -67,11 +67,13 @@ jobs:
         run: |
           bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}"
 
-      # R0 (broad-blast-radius or unrecognized-path diff) runs the full
-      # tests/run-all-tests.sh suite here instead of the capped per-suite
-      # selection; give that path its own explicit budget rather than
-      # relying only on the job-level timeout.
+      # R0 (broad-blast-radius or unrecognized-path diff) runs the full,
+      # unsharded, serial tests/run-all-tests.sh suite here instead of the
+      # capped per-suite selection. This repo's own measured data (test.yml,
+      # scripts/local-ci.sh, CLAUDE.md) converges on ~24-27 minutes for that
+      # exact serial run, so no step-level timeout is set here: the
+      # job-level timeout-minutes above is the only cap, and it is already
+      # sized generously for this path (see the file header comment).
       - name: Run selected suites
-        timeout-minutes: 20
         run: |
           bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}" --run
