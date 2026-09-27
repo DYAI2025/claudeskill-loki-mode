@@ -127,7 +127,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-export PULSE_SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+PULSE_SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+export PULSE_SELF
 
 PULSE_PYTHON="${PULSE_PYTHON:-python3}"
 PULSE_REPO_ROOT="${PULSE_REPO_ROOT:-$DEFAULT_REPO_ROOT}"
