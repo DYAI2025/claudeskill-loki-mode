@@ -1384,6 +1384,7 @@ run_test "the build's learnings are visible" "$SCRIPT_DIR/test-learnings-panel.s
 run_test "the spend-cap state is visible" "$SCRIPT_DIR/test-budget-banner.sh"
 run_test "the Cost page budget banner has its own id" "$SCRIPT_DIR/test-budget-banner-dedup.sh"
 run_test "trust-core tests detect their regressions" "$SCRIPT_DIR/test-trust-core-tests-detect.sh"
+run_test "trust-core probes never mutate the shared tree" "$SCRIPT_DIR/test-trust-core-probe-isolation.sh"
 run_test "a user-installed reviewer takes part in a run" "$SCRIPT_DIR/test-installed-agent-reviewer.sh"
 # Skill modules are loaded INTO the agent's context and acted on, so a false
 # claim there is worse than no claim. Asserts the load-bearing ones against source.

@@ -522,6 +522,7 @@ the evidence receipt is reachable from the dashboard	0
 the build's learnings are visible	1
 the spend-cap state is visible	1
 trust-core tests detect their regressions	130
+trust-core probes never mutate the shared tree	21
 a user-installed reviewer takes part in a run	1
 skill docs match source (gate flags, providers, tiers, index routing, seam)	0
 proof md (paste-able receipt, one renderer)	0
