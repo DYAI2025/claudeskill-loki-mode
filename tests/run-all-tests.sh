@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 TESTS_RUN=0
+TIMED_OUT_SUITES=""
+_current_suite_pid=""
 
 # Colors
 RED='\033[0;31m'
@@ -15,6 +17,119 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# Per-suite timeout (BACKLOG 143). CI's "Shell tests" shard 2 was repeatedly
+# cancelled by the workflow's `cancel-in-progress` concurrency group before it
+# could finish, because it was still running tests/test-ci-json-argmax.sh when
+# the next push arrived (github.com/.../actions/runs/36304977243 and 3 more,
+# 2026-09-27). On the one run that WAS allowed to finish
+# (github.com/.../actions/runs/36299762731, shard 2 job 108565132341),
+# test-ci-json-argmax.sh alone took 1327s (22m07s); every other suite across
+# all 4 shards on that same green run finished in <=191s
+# (test-trust-core-tests-detect.sh's real `bun test` mutation probes). The
+# suite was added in b842a332 (2026-09-26) and its fixture was resized in
+# 5c9d4373 the same day to actually clear Linux CI's measured ~4 MiB ARG_MAX
+# (~116K findings there vs ~29K on macOS's ~1 MiB ARG_MAX); no shard-2-only
+# timing from before either commit was captured, so this cannot pin the
+# runtime on one commit over the other -- only that the measured 1327s is real
+# and current. Follow-up: shrink the fixture or move the suite out of the
+# sharded job. A hang in any OTHER suite now fails LOUD and FAST instead of
+# silently consuming the rest of the shard's budget until a human notices and
+# cancels the run.
+#
+# LOKI_TEST_SUITE_TIMEOUT overrides the default (seconds); 0 disables entirely
+# (including the override list below). No runner sets this today; an operator
+# can export it before invoking tests/run-all-tests.sh directly or via
+# scripts/local-ci.sh, e.g. to raise it when running shards in parallel on one
+# machine inflates each suite's wall-clock.
+_suite_timeout_default="${LOKI_TEST_SUITE_TIMEOUT:-450}"
+case "$_suite_timeout_default" in '' | *[!0-9]*) _suite_timeout_default=450 ;; esac
+
+# Resolve a timeout binary ONCE. macOS ships no `timeout`; Homebrew's coreutils
+# provides `gtimeout`. Missing entirely -> run untimed (today's behavior) with
+# one notice, never rc 127 masquerading as a suite failure. Verified against
+# GNU coreutils 9.11 (default process-group kill, -k for a trapped TERM); BSD
+# timeout (macOS without coreutils, if ever added to PATH) is not verified here.
+_timeout_bin=""
+if command -v timeout >/dev/null 2>&1; then
+    _timeout_bin="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    _timeout_bin="gtimeout"
+else
+    echo -e "${YELLOW}Note: no 'timeout'/'gtimeout' on PATH -- suites run without a per-suite timeout.${NC}"
+fi
+
+# Forward Ctrl-C (and a `kill`'s SIGTERM) to whichever suite is currently
+# running under the timeout wrapper below. `timeout` makes ITSELF the leader
+# of a new process group and the suite inherits that group, so a signal sent
+# to the RUNNER's own process group (an interactive Ctrl-C) never reaches it.
+# Without this trap, stopping a run stuck in a timeout-wrapped hang means
+# waiting out the full per-suite budget (up to 2400s for the argmax override)
+# instead of a normal Ctrl-C.
+#
+# Installed ONLY when a real per-suite timeout is in play (a timeout binary
+# exists AND the default is not 0): bash defers a caught signal until the
+# current FOREGROUND command returns, so installing this trap unconditionally
+# would change the untimed/disabled path too -- a `kill -TERM` on the runner
+# would wait for the running (foreground, unbackgrounded) suite to finish
+# instead of stopping immediately, which is not what the original runner did.
+if [ -n "$_timeout_bin" ] && [ "$_suite_timeout_default" -gt 0 ]; then
+    _forward_signal() {
+        local _exit_code="$1"
+        # Always forward TERM, never the signal the runner itself received.
+        # Verified directly (not assumed): under the `&`-backgrounded launch
+        # below, sending an external SIGINT straight to `timeout` did NOT
+        # reach its child -- because bash starts every asynchronous (`&`)
+        # command with SIGINT and SIGQUIT already ignored, and an ignored
+        # signal can never be caught by a trap set up afterward, in this
+        # script OR inside the suite. TERM is not one of the two signals bash
+        # ignores for an async command, so it always reaches `timeout`
+        # (confirmed directly) regardless of which signal the runner itself
+        # caught.
+        if [ -n "$_current_suite_pid" ] && kill -0 "$_current_suite_pid" 2>/dev/null; then
+            kill -TERM "$_current_suite_pid" 2>/dev/null || true
+            wait "$_current_suite_pid" 2>/dev/null || true
+        fi
+        exit "$_exit_code"
+    }
+    trap '_forward_signal 143' TERM
+    trap '_forward_signal 130' INT
+fi
+
+# Suites whose real, legitimate work exceeds the default. Keyed on basename so
+# the override survives the suite moving between shards. Every entry must name
+# why, and the measured time it is sized against.
+#
+# LOKI_TEST_SUITE_TIMEOUT=0 must disable EVERY suite's timeout, including
+# these overrides -- an operator asking for no timeout means none, not "none
+# except the suites we specifically chose to still kill."
+_suite_timeout_for() {
+    if [ "$_suite_timeout_default" -eq 0 ]; then
+        echo 0
+        return
+    fi
+    case "$(basename -- "$1")" in
+        # 1327s (22m07s) measured on CI (shard 2 job 108565132341, run
+        # 36299762731, 2026-09-27): builds a real ~116K-finding diff on Linux
+        # CI's ARG_MAX and runs `loki ci --format json` over it end to end.
+        # This is the suite BACKLOG 143 is about: it is slow, not hung, and
+        # its runtime should be brought down in a follow-up (smaller fixture,
+        # or move it out of the sharded job) rather than budgeted around
+        # forever. ~1.8x margin over the measured time, not a round number.
+        test-ci-json-argmax.sh) echo 2400 ;;
+        # Real `bun test` mutation probes (trust-core regression detection),
+        # not a fixed-size fixture. Measured: 191s solo (CI shard 2, run
+        # 36299762731); locally on this machine, 281s solo (4-shard parallel
+        # local run, first pass), 248s and 228s in two later 4-way-parallel
+        # runs (scripts/local-ci.sh's full tier runs all shards at once,
+        # which inflates every suite's wall-clock the same way, and this
+        # machine also had other unrelated sessions running concurrently).
+        # 450s (the default) is only ~1.6x the highest local figure (281s);
+        # this override gives it the same >=2x margin the other suites get.
+        test-trust-core-tests-detect.sh) echo 900 ;;
+        *) echo "$_suite_timeout_default" ;;
+    esac
+}
 
 echo ""
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
@@ -106,6 +221,15 @@ run_test() {
 
     TESTS_RUN=$((TESTS_RUN + 1))
 
+    local _suite_timeout
+    _suite_timeout="$(_suite_timeout_for "$_script_path")"
+    local _timeout_label="${_suite_timeout}s"
+    if [ -z "$_timeout_bin" ] || [ "$_suite_timeout" -eq 0 ]; then
+        _timeout_label="untimed"
+    fi
+    echo "[$(date -u +%FT%TZ)] START: ${test_name} (timeout ${_timeout_label})"
+    local _t0=$SECONDS
+
     # Most callers pass a bare path; two pass a full command line
     # ("python3 .../x.py"). `bash "$cmd"` treats the whole string as ONE
     # filename, so those two died with "No such file or directory" and reported
@@ -114,19 +238,96 @@ run_test() {
     # Deliberately NOT `bash -c "$test_file"` for everything: -c execve's the
     # file, which requires the exec bit, and 46 shell suites here are committed
     # mode 100644. That swap turns every one of them into rc 126.
-    if [ -f "$test_file" ]; then
-        _run_suite() { bash "$test_file"; }
+    local _rc=0
+    local _elapsed
+    if [ -n "$_timeout_bin" ] && [ "$_suite_timeout" -gt 0 ]; then
+        # Launch `timeout` via `exec` inside a subshell -- never through an
+        # intermediate shell FUNCTION. `$!` after backgrounding a function is
+        # the PID of the subshell running that function, not of `timeout`
+        # itself (verified directly: they end up in different process
+        # groups), so forwarding a signal to it would kill the wrapper and
+        # leave `timeout` and the suite as orphans. `exec` inside this
+        # subshell keeps `$!` as `timeout`'s own PID.
+        #
+        # Backgrounding a command is not signal-neutral (verified directly,
+        # not assumed): bash starts every `&` job with SIGINT and SIGQUIT
+        # already ignored (POSIX/bash async-command default) -- an ignored
+        # signal can never be caught by a trap set up afterward, in this
+        # script OR inside the suite. `trap - INT QUIT` resets both to their
+        # inherited (default) disposition before `timeout` replaces this
+        # subshell. This is why `_forward_signal` always sends TERM (never
+        # INT) to `timeout`: TERM is not one of the two signals bash ignores
+        # for an async command.
+        #
+        # Explicit `</dev/null` (not the caller's real stdin): the suite runs
+        # in `timeout`'s own backgrounded process group, and if stdin were a
+        # real TTY, any read from it would stop the suite with SIGTTIN --
+        # producing a false TIMEOUT that neither CI (never a TTY) nor the
+        # original foreground dispatch would ever hit. /dev/null matches
+        # CI's actual non-TTY stdin, which every suite already runs under.
+        if [ -f "$test_file" ]; then
+            ( trap - INT QUIT; exec "$_timeout_bin" -k 10 "$_suite_timeout" bash "$test_file" ) </dev/null &
+        else
+            ( trap - INT QUIT; exec "$_timeout_bin" -k 10 "$_suite_timeout" bash -c "$test_file" ) </dev/null &
+        fi
+        _current_suite_pid=$!
+        # bash defers a trap until the current foreground command returns;
+        # backgrounding + `wait` is what lets the INT/TERM trap above run
+        # WHILE the suite is still executing, so it has a live PID to forward
+        # the signal to, instead of only after the suite (or its timeout)
+        # already exited on its own.
+        wait "$_current_suite_pid" || _rc=$?
+        _current_suite_pid=""
+        _elapsed=$((SECONDS - _t0))
     else
-        _run_suite() { bash -c "$test_file"; }
+        # No timeout in play: run exactly as the original dispatch did
+        # (foreground, no backgrounding) so this path is byte-identical to
+        # pre-existing behavior -- `test-run-all-dispatch.sh` pins this exact
+        # if/else shape, and backgrounding here would also make bash ignore
+        # SIGINT/SIGQUIT for the suite (job-control default for an
+        # asynchronous command), which the untimed/disabled path must not do.
+        if [ -f "$test_file" ]; then
+            bash "$test_file" || _rc=$?
+        else
+            bash -c "$test_file" || _rc=$?
+        fi
+        _elapsed=$((SECONDS - _t0))
     fi
 
-    if _run_suite; then
+    # GNU timeout exits 124 on its own SIGTERM kill, 137 if -k's SIGKILL
+    # was needed. Only call it a TIMEOUT when the exit code matches AND the
+    # suite actually ran the full budget -- several suites here legitimately
+    # test timeout paths and may pass through 124/137 on their own well under
+    # the limit, and that must stay a normal pass/fail, not get relabeled.
+    local _timed_out=0
+    if [ -n "$_timeout_bin" ] && [ "$_suite_timeout" -gt 0 ] && [ "$_elapsed" -ge "$_suite_timeout" ]; then
+        case "$_rc" in 124 | 137) _timed_out=1 ;; esac
+    fi
+
+    if [ "$_rc" -eq 0 ]; then
         echo ""
         echo -e "${GREEN}✓ ${test_name} PASSED${NC}"
+        echo "[$(date -u +%FT%TZ)] END: ${test_name} (${_elapsed}s)"
         TOTAL_PASSED=$((TOTAL_PASSED + 1))
+    elif [ "$_timed_out" -eq 1 ]; then
+        echo ""
+        # Must contain the literal substring "FAILED" (not just the ✗ glyph):
+        # scripts/local-ci.sh scrapes suite output with
+        # grep -aE '(✗.*FAILED|Passed: {5,}[0-9]|Failed: {5,}[0-9])' and tails
+        # the result. A timeout line missing "FAILED" is invisible to that
+        # scraper -- it would show "Failed: 1" with no suite name, exactly the
+        # silent-culprit problem this feature exists to fix.
+        echo -e "${RED}✗ ${test_name} FAILED: TIMED OUT after ${_suite_timeout}s (killed, not a normal failure)${NC}"
+        echo -e "${RED}  This suite was terminated by the per-suite watchdog, not by its own assertions.${NC}"
+        echo -e "${RED}  It is hanging or has regressed to run past its budget -- diagnose ${_script_path##*/} directly.${NC}"
+        echo "::error title=Suite timeout::${test_name} (${_script_path##*/}) killed after ${_suite_timeout}s"
+        echo "[$(date -u +%FT%TZ)] END: ${test_name} TIMEOUT (${_elapsed}s)"
+        TIMED_OUT_SUITES="${TIMED_OUT_SUITES}${test_name} (${_script_path##*/}, ${_elapsed}s)"$'\n'
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
     else
         echo ""
         echo -e "${RED}✗ ${test_name} FAILED${NC}"
+        echo "[$(date -u +%FT%TZ)] END: ${test_name} FAILED (${_elapsed}s)"
         TOTAL_FAILED=$((TOTAL_FAILED + 1))
     fi
 
@@ -967,6 +1168,11 @@ echo -e "Tests Run:    ${TESTS_RUN}"
 echo -e "${GREEN}Passed:       ${TOTAL_PASSED}${NC}"
 echo -e "${RED}Failed:       ${TOTAL_FAILED}${NC}"
 echo ""
+
+if [ -n "$TIMED_OUT_SUITES" ]; then
+    echo -e "${RED}Timed out (killed by the per-suite watchdog, not a normal failure):${NC}"
+    echo -e "${RED}${TIMED_OUT_SUITES}${NC}"
+fi
 
 if [ $TOTAL_FAILED -eq 0 ]; then
     echo -e "${GREEN}╔════════════════════════════════════════════════════════════════╗${NC}"
