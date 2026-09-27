@@ -132,11 +132,21 @@ bump_version() {
 # Apply a sed -E expression to a file in place, portably (no BSD/GNU -i
 # difference), via a temp file + mv so a mid-write failure can't truncate
 # the original.
+#
+# mktemp always creates its file at mode 600 regardless of umask, and mv
+# (same-directory rename) keeps the temp file's own mode rather than the
+# original's -- so without the `cp -p` below, every bumped file (VERSION,
+# package.json, Dockerfile, etc.) would silently end up at 600 instead of
+# its original 644 after every release. `cp -p` copies the original's mode
+# (and timestamps) onto the temp file before sed's `>` redirect overwrites
+# its content; a `>` redirect opens and truncates the existing inode, it
+# does not recreate the file, so the mode `cp -p` set survives the redirect.
 apply_sed() {
     local file="$1"
     local expr="$2"
     local tmp
     tmp="$(mktemp "${file}.XXXXXX")"
+    cp -p "$file" "$tmp"
     if sed -E "$expr" "$file" > "$tmp"; then
         mv "$tmp" "$file"
     else
