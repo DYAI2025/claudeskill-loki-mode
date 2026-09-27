@@ -2478,8 +2478,9 @@ export function ProjectWorkspace({ session, onClose }: ProjectWorkspaceProps) {
             <CostEstimator
               complexity={buildMode === 'quick' ? 'simple' : buildMode === 'max' ? 'complex' : 'standard'}
               provider={selectedProvider}
-              // No cap configured: 0 makes the estimator use its labelled per-complexity estimate.
-              estimatedIterations={buildStatus.maxIterations ?? 0}
+              // The iteration cap is a ceiling, not an estimate (a cap of 1000 priced
+              // 1000 iterations). 0 uses the labelled per-complexity estimate.
+              estimatedIterations={0}
               onConfirm={async () => {
                 setShowCostEstimator(false);
                 try {
