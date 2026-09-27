@@ -726,3 +726,36 @@ merged, treat continuing to wait for it as itself the wrong call --
 consider whether a smaller, faster mitigation (e.g., just increasing
 the job-level timeout-minutes as an interim workaround) would unblock
 the release sooner while S-44's fuller fix continues in the background.
+
+### Drift audit (turn 96, 6-hour window)
+
+**Matched CONTROL.md:** priority order held under the sharpest test
+this session has faced -- S-18's builder found a real, live, currently
+EXPLOITED credential-exfiltration vulnerability mid-build (GH CLI's
+hosts.yml, fully unprotected by the existing Rule-of-Two withhold),
+and it was escalated to HIGH tier and fixed within the same turn it
+was discovered, correctly jumping every other item in the queue
+(routine P7-scanner rework, the release-blocker chase, S-44's CI fix).
+The fix itself is well-verified: correct precedence reasoning
+(GH_CONFIG_DIR over XDG/HOME), dist rebuilt and verified (learned
+from two earlier stale-dist incidents this session), symmetric
+re-grant for trusted operations, honest disclosure of residual gaps
+rather than overclaiming full closure.
+
+**Drifted, and this is now the turn-90 correction's own predicted
+trigger firing exactly as stated:** S-44 is STILL not merged at turn
+96, now over 2 hours of build time -- by far the longest single build
+this entire session, roughly triple the next-longest. NO_RECENT_RELEASE
+has now stood for well over 6 hours. The turn-90 correction explicitly
+said to stop waiting passively at this point and consider a faster
+interim mitigation.
+
+**Correction for the next 6 hours:** per the turn-90 correction's own
+trigger, stop waiting on S-44 as the sole path to a release. Consider
+this the point to check in with S-44 directly for a status/ETA, and if
+it can't report a near-term completion, evaluate a minimal interim
+mitigation (e.g., bump the job's timeout-minutes as a stopgap, letting
+a hung shard fail slower but not block releases indefinitely) so a
+release can ship while S-44's fuller per-suite fix continues in the
+background. Do not let "S-44 will fix this properly" become an
+indefinite excuse to keep NO_RECENT_RELEASE unresolved.
