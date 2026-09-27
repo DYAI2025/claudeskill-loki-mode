@@ -1187,3 +1187,8 @@ sample.
 - Pulse NO_RECENT_RELEASE reads npm, so it stays red until 9.56.0 is visible there. That is correct: npm is the channel users install from.
 - Drift caught: two MEDIUM builders (S-87, S-91) ran past 30 min without check-in. The newly merged S-75 pulse flagged them within minutes of landing. Guard 3 works.
 - Train 2 assembled on main: S-71, S-75, S-78, S-80, S-86, S-90 (8 commits). S-81 is held for S-79 (same runner file, and the argmax suite duration decides its packing); S-82 is held for shard times under 10 min.
+
+## Train 1 shipped to npm (2026-09-27T15:00Z)
+- npm: `curl registry.npmjs.org/loki-mode` gives dist-tags latest 9.56.0, time["9.56.0"] = 2026-09-27T15:00:06.452Z. publish-npm reported acceptance at 14:44:51Z, so npm took 15m15s to make it available. The 404s in between were npm's processing delay, not a failed publish; not republishing was correct.
+- publish-docker is still in_progress at 15:08 (run 36325316189).
+- Measurement for the Part C release-lookup target (2 min verified-to-npm): GitHub Release to npm availability was 16m16s, of which about 15 min is npm-side processing we do not control. The S-84 reuse only shortens required-ci.
