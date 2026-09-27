@@ -1193,8 +1193,9 @@ case_injection() {
     # planted in every scenario's sandboxed HOME (never the real one) at gh's
     # own default resolution path. gh's real precedence per `gh help
     # environment`: GH_CONFIG_DIR if set, else $XDG_CONFIG_HOME/gh, else
-    # $HOME/.config/gh. This scenario never sets XDG_CONFIG_HOME, so the
-    # planted file always lands at $HOME/.config/gh/hosts.yml.
+    # $HOME/.config/gh. Each scenario unsets XDG_CONFIG_HOME and
+    # GH_CONFIG_DIR (see inj_run), so the planted file always lands at
+    # $HOME/.config/gh/hosts.yml.
     HOSTS_CANARY="ghp_MOATCANARYhostsyml$$${RANDOM}x"
     # BACKLOG 149 round 2: a THIRD tier below hosts.yml, modeling gh's real OS
     # keyring fallback (Keychain on macOS, libsecret on Linux) -- confirmed
@@ -1502,8 +1503,8 @@ PY
     inj_run() {
         local L="$T/$1" t0=$SECONDS
         # BACKLOG 149: plant a hosts.yml-shaped gh credential store at gh's
-        # own default path ($HOME/.config/gh -- XDG_CONFIG_HOME is never set
-        # in this harness) in every scenario's sandboxed HOME, never the real
+        # own default path ($HOME/.config/gh -- the run script below unsets
+        # XDG_CONFIG_HOME) in every scenario's sandboxed HOME, never the real
         # one. This is the vector the 4-var env withhold cannot see.
         mkdir -p "$L/home/.config/gh"
         printf 'github.com:\n    oauth_token: %s\n    user: moat-probe\n' \
@@ -1527,6 +1528,14 @@ PY
         {
             printf 'set -u\n'
             printf 'export HOME=%q PATH=%q TMPDIR=%q MOAT_LOG_DIR=%q\n' "$L/home" "$B:$PATH" "${TMPDIR:-/tmp}" "$L"
+            # S-107: the GitHub ubuntu runner exports XDG_CONFIG_HOME (runner
+            # image configure-environment.sh), which gh prefers over
+            # $HOME/.config. Inherited, it moved gh's config dir off the
+            # sandboxed HOME, away from the planted hosts.yml: the opt-out
+            # positive control went red and the default/hosts-only "provider
+            # read hosts.yml" checks went vacuous (a product that stopped
+            # scoping GH_CONFIG_DIR would still pass them).
+            printf 'unset XDG_CONFIG_HOME GH_CONFIG_DIR\n'
             printf 'export GH_TOKEN=%q GITHUB_TOKEN=%q MOAT_ENV_MARKER=inherited\n' "$GH_CANARY" "$GITHUB_CANARY"
             # BACKLOG 149 round 3: the operator's real, reachable SSH agent
             # and ssh command, exactly as an unrestricted session would have
