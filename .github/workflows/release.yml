@@ -771,7 +771,7 @@ jobs:
   # for details.
 
   update-homebrew:
-    needs: [release, publish-npm, publish-docker]
+    needs: [release]
     if: needs.release.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_republish == 'true')
     runs-on: ubuntu-latest
     permissions:
