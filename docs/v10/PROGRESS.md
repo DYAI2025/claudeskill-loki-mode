@@ -634,3 +634,34 @@ lever that can end this diagnostic loop, over other ready-queue work.
 If the shard hangs a 6th time AFTER S-44 is confirmed merged and its
 fix is live in the workflow, that is the actual trigger for a fresh
 investigation, not the count alone.
+
+### Drift audit (turn 72, 6-hour window)
+
+**Matched CONTROL.md:** review discipline continued catching real,
+non-obvious defects at high volume this window -- S-29's second rework
+round got a fresh CONCERN for a parenthesization/type-cast bypass that
+defeats exactly the evasion the scanner's own docstring claims to
+resist; S-14's TAMPERED/FAILED fix got independently re-verified for
+a shared-computation claim rather than trusted on the builder's word.
+The P7 scanner group has now survived 3+ full CONCERN/rework cycles
+without ever being waved through on volume or builder confidence alone.
+
+**Drifted:** S-44 is still not merged (builder finished, review not
+yet dispatched/complete at last check), so the turn-66/turn-60
+diagnostic condition remains correctly un-triggered. Shard 2/4 has now
+hung a 7th time, still before S-44's fix is live. NO_RECENT_RELEASE has
+now stood for over 5 hours -- the longest single-cause violation this
+entire session. A second, independent status-tracking-lag instance
+surfaced (S-14's review-ready build existed only in an unpersisted
+worktree, never actually committed) -- now 5+ occurrences of this
+exact class across the session (S-07, S-10, S-12, GF-4, S-14).
+
+**Correction for the next 6 hours:** get S-44 through review and
+merged as the single highest-priority action, ahead of any further P7
+rework dispatch, since it is now the confirmed sole remaining lever on
+the release blocker. On the status-tracking-lag pattern: given 5+
+occurrences, treat "confirm the actual git ref exists" as a mandatory
+checklist item before writing ANY `review@`/`merged@` status, not an
+occasional spot-check -- this has now cost real review-agent time
+(S-14's reviewer had to reconstruct via Read across worktrees) on top
+of the tracking confusion itself.
