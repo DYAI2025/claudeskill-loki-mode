@@ -5,6 +5,17 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.65.0
+
+**Honest proofs, a louder release tag step, and fewer vacuous tests.** Released from green tree 55521236 (Tests run 36337415795 and Bun Parity run 36337415765 both success before the bump).
+
+- A proof is never sealed VERIFIED when `.loki/quality/ablation.json` says the checks are not load-bearing; the ablation facts are copied verbatim onto the receipt (S-113, moat P8).
+- The budget breaker marks unmeasured spend as unmeasured and warns when a cap is set, instead of treating it as $0 (S-131).
+- The release workflow's tag step reuses a tag the Release Manager pre-pushed at the right commit and otherwise fails loudly, instead of printing "continuing" and failing later at the GitHub Release step (S-105).
+- Three dashboard scope-audit tests assert they actually audited routes, so a FastAPI upgrade can no longer make them pass while checking nothing (S-127).
+- The runtime-gate port test waits for its listener before the positive control, and leaves quarantine (S-106).
+- The pulse flags more than 15 worktrees (S-94).
+
 ## v9.64.0
 
 **Pulse machine protection and a 10x faster pulse.** Released from green tree c2b84c36 (Tests run 36336659599 and Bun Parity run 36336659592 both success before the bump).
