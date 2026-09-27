@@ -615,18 +615,31 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  publish-docker:
+  # NATIVE PER-ARCH BUILD, NOT QEMU EMULATION (S-85).
+  #
+  # `docker/build-push-action` with `platforms: linux/amd64,linux/arm64` on a
+  # single ubuntu-latest runner built arm64 under QEMU user-mode emulation,
+  # which is slow enough to dominate this job's runtime. GitHub-hosted
+  # ubuntu-24.04-arm runners build arm64 natively, so each architecture now
+  # builds on its own native runner and pushes only its own digest (no tag);
+  # the publish-docker job below assembles the two digests into the one
+  # multi-arch manifest that carries every tag.
+  publish-docker-build:
     needs: release
     if: needs.release.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_republish == 'true')
-    runs-on: ubuntu-latest
-    # id-token: write is what makes cosign KEYLESS signing possible -- it mints
-    # the short-lived OIDC token that Fulcio exchanges for a signing
-    # certificate, so no private key is ever stored or rotated by us. Scoped to
-    # this job rather than the workflow: every other job here publishes
-    # artifacts and has no business minting identity tokens.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -650,7 +663,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13
-          # Rule of Two: this job holds a write token or publish secret, so it
+          # Rule of Two: this job holds a Docker Hub publish secret, so it
           # never restores a cache an issue-triggered job could have written.
           no-cache: true
 
@@ -662,11 +675,12 @@ jobs:
           test -f dist/loki.js || { echo "FATAL: loki-ts/dist/loki.js not built"; exit 1; }
           ls -la dist/
 
-      - name: Set up QEMU (multi-arch)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx (multi-arch)
+      - name: Set up Docker Buildx (native, no QEMU)
         uses: docker/setup-buildx-action@v3
+        with:
+          # Rule of Two: this job holds a Docker Hub publish secret, so it
+          # never restores a cache an issue-triggered job could have written.
+          cache-binary: false
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -674,17 +688,90 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push (amd64 + arm64)
+      - name: Build and push by digest (${{ matrix.platform }}, native)
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            asklokesh/loki-mode:v${{ needs.release.outputs.version }}
-            asklokesh/loki-mode:${{ needs.release.outputs.version }}
-            asklokesh/loki-mode:latest
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=asklokesh/loki-mode,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest" || { echo "FATAL: build step produced no digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-docker:
+    needs: [release, publish-docker-build]
+    if: needs.release.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_republish == 'true')
+    runs-on: ubuntu-latest
+    # id-token: write is what makes cosign KEYLESS signing possible -- it mints
+    # the short-lived OIDC token that Fulcio exchanges for a signing
+    # certificate, so no private key is ever stored or rotated by us. Scoped to
+    # this job rather than the workflow: every other job here publishes
+    # artifacts and has no business minting identity tokens.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Rule of Two: this job holds a Docker Hub publish secret, so it
+          # never restores a cache an issue-triggered job could have written.
+          cache-binary: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Every tag the single-runner QEMU build used to push, unchanged.
+      - name: Create and push multi-arch manifest
+        id: build
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=(
+            "asklokesh/loki-mode:v${{ needs.release.outputs.version }}"
+            "asklokesh/loki-mode:${{ needs.release.outputs.version }}"
+            "asklokesh/loki-mode:latest"
+          )
+          tag_args=()
+          for t in "${tags[@]}"; do tag_args+=(-t "$t"); done
+          sources=()
+          for d in *; do sources+=("asklokesh/loki-mode@sha256:${d}"); done
+          test "${#sources[@]}" -ge 2 || { echo "FATAL: expected 2 per-arch digests, found ${#sources[@]}"; exit 1; }
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          # The manifest LIST's own digest (what the registry serves for the
+          # tag, and what gets signed below) is the sha256 of the exact bytes
+          # `imagetools inspect --raw` returns for it -- content-addressable,
+          # so no separate API call to resolve it can race what was just
+          # pushed.
+          digest="sha256:$(docker buildx imagetools inspect "asklokesh/loki-mode:v${{ needs.release.outputs.version }}" --raw | sha256sum | cut -d' ' -f1)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       # SIGNING AND SBOM LIVE HERE, NOT IN provenance.yml, AND THAT IS THE POINT.
       #
@@ -706,7 +793,8 @@ jobs:
       # We sign the DIGEST rather than a tag. Tags are mutable -- `latest` and
       # even a version tag can be repointed -- so a signature bound to a tag
       # attests to whatever that tag happens to mean today. A digest is the
-      # content itself.
+      # content itself. It is the manifest LIST digest: the same one every tag
+      # above now resolves to.
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
         with:
