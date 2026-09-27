@@ -5,6 +5,15 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.68.0
+
+**A faster release gate, honest dashboard states, and a current Footer version.** Released from green tree b7a8dd50 (Tests run 36341812369 and Bun Parity run 36341812334 both success before the bump).
+
+- The release workflow's required-ci polls every 10 seconds instead of 30, so a green commit is released sooner (S-133).
+- `scripts/release.sh --bump-only` also updates the web-app Footer version, which had been stuck at v9.55.0 (S-144).
+- GET /api/checklist/waivers returns 500 with an error when waivers.json is corrupt, instead of an empty list that looked like "no waivers" (S-145).
+- The prompt optimizer distinguishes "never ran" from a corrupt version file, and migration progress reports unknown rather than 0 of 0 when its plan is missing or corrupt (S-149, S-150).
+
 ## v9.67.0
 
 **Delegate pushes never target the default branch, verdict honesty fixes, and https-only attestation keys.** Released from green tree 28926937 (Tests run 36341205226 and Bun Parity run 36341205233 both success before the bump).
