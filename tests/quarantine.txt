@@ -15,3 +15,6 @@
 #
 # Entries below are time-boxed; remove each one when its fix lands.
 test-runtime-gate-port-scoping.sh	asklokesh	2026-10-03	S-106 (positive control races its own background listener; failed shard 0 in trains 1 and 4)
+test-add-dir-reaches-provider.sh	asklokesh	2026-10-03	S-110 (newly registered by S-93; --add-dir does not reach provider argv on CI, 3 passed 4 failed, job 108662926880)
+test-static-analysis-tsconfig.sh	asklokesh	2026-10-03	S-110 (newly registered by S-93; tsc --noEmit -p . fails on a path-aliased import on CI, job 108662926920)
+test-doctor-json-skills.sh	asklokesh	2026-10-03	S-110 (newly registered by S-93; fails on CI, job 108662926920)
