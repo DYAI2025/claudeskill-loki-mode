@@ -912,3 +912,33 @@ is not a review to rush). Once that review lands (APPROVE or a
 fixable CONCERN), and one Tests run on the resulting main tip is
 confirmed green, cut the release immediately. This is the single
 highest-priority action remaining in the swarm.
+
+## Drift audit, turn 138
+
+**Matched CONTROL.md:** five more slices landed this window (S-57,
+S-58, S-59, S-60, S-62), each independently verified with its own test
+suite directly on main post-merge. Every one of this window's dispatch
+prompts explicitly instructed builders to verify their target backlog
+item is still actually broken before editing (matching the S-48
+stale-duplicate discipline) -- none turned out to be stale this round,
+but two (S-59, S-62) found the real bug lived in a different location
+or needed a subtly different distinction than the backlog description
+implied, and correctly adapted rather than blindly following the
+description.
+
+**Recurring, now well-understood pattern:** the pre-push gate's full
+pytest run has failed identically 5+ times this window on the single
+confirmed pre-existing BACKLOG 21 seatbelt test. Each time, verified no
+overlapping push process before killing a redundant run and pushing
+directly with the disclosed D24 skip, rather than waiting out a
+20-minute run whose outcome is already known. S-61 (dispatched this
+window) is investigating the actual root cause now, which should
+retire this pattern once it lands.
+
+**NO_RECENT_RELEASE, final blocker identified precisely:** every other
+violation is clear. S-18/BACKLOG 149's dedicated adversarial HIGH-tier
+reviewer has now run 40+ minutes on the live credential-exfiltration
+fix -- the single remaining gate before a release. No other work should
+take priority over collecting that review, merging on APPROVE (or
+addressing a CONCERN/REJECT immediately if found), and cutting the
+release the moment a clean Tests run confirms the resulting main tip.
