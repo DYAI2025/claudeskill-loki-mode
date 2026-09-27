@@ -8614,16 +8614,27 @@ async def get_pricing():
 # Completion Council API (v5.25.0)
 # =============================================================================
 
+def council_state(loki_dir: _Path) -> dict:
+    """Read council state.json, distinguishing "no state yet" from "unreadable".
+
+    A missing state.json means the council genuinely has not recorded a vote:
+    total_votes is really 0. A state.json that exists but fails to parse (torn
+    write, corruption) means we do not know how many votes were recorded --
+    total_votes must be None, not a fabricated 0 that reads as a real count.
+    """
+    state_file = loki_dir / "council" / "state.json"
+    if not state_file.exists():
+        return {"enabled": False, "total_votes": 0, "verdicts": []}
+    try:
+        return json.loads(state_file.read_text())
+    except Exception:
+        return {"enabled": None, "total_votes": None, "verdicts": None, "error": "unreadable_state"}
+
+
 @app.get("/api/council/state", dependencies=[Depends(auth.require_scope("read"))])
 async def get_council_state():
     """Get current Completion Council state."""
-    state_file = _get_loki_dir() / "council" / "state.json"
-    if state_file.exists():
-        try:
-            return json.loads(state_file.read_text())
-        except Exception:
-            pass
-    return {"enabled": False, "total_votes": 0, "verdicts": []}
+    return council_state(_get_loki_dir())
 
 
 @app.get("/api/council/verdicts", dependencies=[Depends(auth.require_scope("read"))])
@@ -8873,30 +8884,41 @@ async def get_context():
 # Notification Trigger API (v5.40.0)
 # =============================================================================
 
+_EMPTY_NOTIFICATION_SUMMARY = {"total": 0, "unacknowledged": 0, "critical": 0, "warning": 0, "info": 0}
+
+
+def read_active_notifications(loki_dir: _Path) -> dict:
+    """Read notifications/active.json, distinguishing "none yet" from "unreadable".
+
+    A missing active.json means there genuinely are no active notifications:
+    the zero summary is real. A file that exists but fails to parse (torn
+    write, corruption) means we do not know what is active -- summary must be
+    None, not a fabricated all-zero summary that reads as "nothing active".
+    """
+    active_file = loki_dir / "notifications" / "active.json"
+
+    if not active_file.exists():
+        return {"notifications": [], "summary": dict(_EMPTY_NOTIFICATION_SUMMARY)}
+
+    try:
+        data = json.loads(active_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"notifications": None, "summary": None, "error": "unreadable_active_notifications"}
+
+    return {"notifications": data.get("notifications", []), "summary": data.get("summary", {})}
+
+
 @app.get("/api/notifications", dependencies=[Depends(auth.require_scope("read"))])
 async def get_notifications(
     severity: Optional[str] = Query(None, pattern="^(critical|warning|info)$"),
     unread_only: bool = Query(False),
 ):
     """Get notification list from .loki/notifications/active.json."""
-    loki_dir = _get_loki_dir()
-    active_file = loki_dir / "notifications" / "active.json"
+    result = read_active_notifications(_get_loki_dir())
+    notifications = result["notifications"]
 
-    if not active_file.exists():
-        return {
-            "notifications": [],
-            "summary": {"total": 0, "unacknowledged": 0, "critical": 0, "warning": 0, "info": 0},
-        }
-
-    try:
-        data = json.loads(active_file.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {
-            "notifications": [],
-            "summary": {"total": 0, "unacknowledged": 0, "critical": 0, "warning": 0, "info": 0},
-        }
-
-    notifications = data.get("notifications", [])
+    if notifications is None:
+        return result
 
     # Apply filters
     if severity:
@@ -8906,7 +8928,7 @@ async def get_notifications(
 
     return {
         "notifications": notifications,
-        "summary": data.get("summary", {}),
+        "summary": result["summary"],
     }
 
 
