@@ -470,35 +470,18 @@ print(" ".join(sorted(c["method"]+":"+c["path"] for c in d["calls"])), "unresolv
 # P7.webapp-client-routes-exist
 # ---------------------------------------------------------------------------
 case_webapp_routes() {
-    local why ex mt root rc
+    local why ex mt rc
     why="$(route_prereqs)" || { echo "FAIL|$why"; return 0; }
     why="$(route_control webapp /api/sessions/history)" || { echo "FAIL|positive control failed: $why"; return 0; }
 
-    # Part 1: the existing fetchJSON guard helpers, run against THIS checkout.
-    # They hardcode an absolute checkout root; a copy with that root rewritten to
-    # REPO_ROOT is the only way to measure this tree instead of another one.
-    ex="$MOAT_TMP/lib-extract-client-paths.mjs"; mt="$MOAT_TMP/lib-match-client-routes.py"
-    [ -f "$REPO_ROOT/tests/lib-extract-client-paths.mjs" ] && [ -f "$REPO_ROOT/tests/lib-match-client-routes.py" ] \
+    # Part 1: the existing fetchJSON guard helpers, run in place from the repo.
+    # Both helpers resolve their own repo root dynamically (import.meta.url /
+    # __file__), so invoking them directly from $REPO_ROOT already measures
+    # this tree; no copy or literal-rewrite is needed (or possible, since
+    # neither file has a hardcoded root left to rewrite).
+    ex="$REPO_ROOT/tests/lib-extract-client-paths.mjs"; mt="$REPO_ROOT/tests/lib-match-client-routes.py"
+    [ -f "$ex" ] && [ -f "$mt" ] \
         || { echo "FAIL|prerequisite missing: tests/lib-extract-client-paths.mjs or tests/lib-match-client-routes.py"; return 0; }
-    root="$(sed -n 's/^REPO = "\(.*\)"$/\1/p' "$REPO_ROOT/tests/lib-match-client-routes.py" | head -n 1)"
-    cp "$REPO_ROOT/tests/lib-extract-client-paths.mjs" "$ex"; cp "$REPO_ROOT/tests/lib-match-client-routes.py" "$mt"
-    if [ -n "$root" ] && [ "$root" != "$REPO_ROOT" ]; then
-        if ! python3 - "$root" "$REPO_ROOT" "$ex" "$mt" <<'PY'
-import sys
-old, new = sys.argv[1], sys.argv[2]
-for f in sys.argv[3:]:
-    s = open(f).read().replace(old, new)
-    open(f, 'w').write(s)
-    # The rewrite held only if the new root is present and no bare old root is
-    # left once every new-root occurrence is removed (new may contain old).
-    if new not in s or old in s.replace(new, ''):
-        sys.exit(1)
-PY
-        then
-            echo "FAIL|could not retarget the existing helpers at this checkout"; return 0
-        fi
-        diag "rewrote hardcoded helper root $root -> $REPO_ROOT"
-    fi
     rc=0
     ( cd "$MOAT_TMP" && node "$ex" > "$MOAT_TMP/fetchjson.json" 2> "$MOAT_TMP/fetchjson.err" ) || rc=$?
     [ "$rc" = 0 ] || { echo "FAIL|existing client.ts extractor failed: $(head -c 160 "$MOAT_TMP/fetchjson.err" | tr '\n' ' ')"; return 0; }
