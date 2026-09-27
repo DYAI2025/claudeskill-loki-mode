@@ -773,7 +773,21 @@ case_council_readers_not_shadowed() {
     need python3 git || return
     local fail='{"runner":"jest","pass":false,"summary":"1 failed"}'
     local green='{"runner":"jest","pass":true,"summary":"green"}'
-    local leg d b fn rc want out want_out bad=""
+    local leg d b fn rc want out want_out bad="" managed_stub="$RUN/managed-stub"
+    mkdir -p "$managed_stub/providers" "$managed_stub/memory/managed_memory"
+    : > "$managed_stub/providers/__init__.py"
+    : > "$managed_stub/memory/__init__.py"
+    : > "$managed_stub/memory/managed_memory/__init__.py"
+    printf '%s\n' 'def emit_managed_event(*a, **k): pass' > "$managed_stub/memory/managed_memory/events.py"
+    cat > "$managed_stub/providers/managed.py" <<'EOF'
+import os
+class ManagedUnavailable(Exception): pass
+def run_completion_council(**k): raise ManagedUnavailable("stub")
+def is_enabled():
+    with open(os.environ["MOAT_CC_CAPTURE"], "w") as fh:
+        fh.write(os.environ.get("_CC_TEST", ""))
+    return False
+EOF
     for leg in shadow-fail shadow-green plain-fail plain-green; do
         d="$RUN/shadow-$leg"
         case "$leg" in *-fail) b="$(council_repo "$d" "$fail")" ;; *) b="$(council_repo "$d" "$green")" ;; esac \
@@ -835,6 +849,25 @@ case_council_readers_not_shadowed() {
         esac
         out="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_devils_advocate_review)"
         [ "$out" = "$want_out" ] || bad="$bad [$leg council_devils_advocate_review: got '$out' want $want_out]"
+        # BACKLOG 135: the 6th reader, council_managed_should_stop, reads the
+        # test-results summary into the managed session's context behind three
+        # flags. PROJECT_DIR points at a stub providers.managed whose
+        # is_enabled() records the summary it was handed and declines, so the
+        # call stays hermetic (rc 1, Bash fallback). The captured summary must
+        # be the real file's; the shadow json.py would hand over '' and mark.
+        # cwd-shadow class only: this reader is still python3 -E, so a .pth leg
+        # would redden it until the production fix (alternate A2) lands.
+        rm -f "$d.cc-test"
+        rc="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark" MOAT_CC_CAPTURE="$d.cc-test" \
+            PROJECT_DIR="$managed_stub" LOKI_EXPERIMENTAL_MANAGED_COUNCIL=true \
+            LOKI_EXPERIMENTAL_MANAGED_AGENTS=true LOKI_MANAGED_AGENTS=true;
+            council_call "$d" "$b" council_managed_should_stop)"
+        case "$leg" in *-fail) want_out="1 failed" ;; *) want_out="green" ;; esac
+        if [ ! -f "$d.cc-test" ]; then
+            bad="$bad [$leg council_managed_should_stop: stub never reached (rc $rc)]"
+        elif [ "$(cat "$d.cc-test")" != "$want_out" ] || [ "$rc" != 1 ]; then
+            bad="$bad [$leg council_managed_should_stop: summary '$(cat "$d.cc-test")' rc $rc, want '$want_out' rc 1]"
+        fi
         [ ! -s "$d.mark" ] || bad="$bad [$leg: a repo module ran in the council: $(sort -u "$d.mark" | tr '\n' ' ')]"
     done
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
