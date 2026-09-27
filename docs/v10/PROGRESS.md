@@ -942,3 +942,36 @@ fix -- the single remaining gate before a release. No other work should
 take priority over collecting that review, merging on APPROVE (or
 addressing a CONCERN/REJECT immediately if found), and cutting the
 release the moment a clean Tests run confirms the resulting main tip.
+
+## Drift audit, turn 144
+
+**Matched CONTROL.md:** S-61 landed and genuinely resolved the BACKLOG
+21/D5 seatbelt gap that had generated 5+ disclosed pre-push skips this
+session -- verified directly by letting a full pre-push pytest run
+proceed uninterrupted for the first time, which passed clean end to
+end with the fix in place.
+
+**A real CI failure investigated immediately, correctly diagnosed as
+the already-known load-flaky test, not a regression:** commit 1e708115
+(S-62's merge) showed a genuine (non-cancelled) Tests failure on shard
+2/4: "Review deadline, requirements, and speculative assurance tail"
+FAILED on subtest "malformed shard coverage was accepted or hidden by
+completed siblings". Per the standing rule (fails-then-passes is not
+proof; check before blaming concurrency), reproduced this exact test
+locally rather than assuming -- ran the full 46-case suite locally and
+it passed 46/46, including the specific subtest that failed in CI. This
+matches the already-documented `feedback-review-assurance-tail-is-load-
+flaky` pattern: a genuinely load-sensitive test (shard-lineage timing
+under a constrained CI runner), not a regression from S-62 or any
+other change in this window. A fresh Tests run for the next push (S-61's
+merge) is already in progress independently and will further confirm.
+
+**Dispatched 2 more builders (S-63, S-65) clearing IDLE_BUILDERS**, both
+correctly instructed to read a recently-merged sibling commit to the
+same file first (S-60's path-base fix for S-63's target file; S-47's
+merged diff for S-65's frontend-expectation baseline) before making
+changes, to avoid conflicting with or duplicating already-landed work.
+
+**NO_RECENT_RELEASE remains the sole real blocker.** S-18's dedicated
+adversarial reviewer continues; this remains the single item nothing
+else should take priority over.
