@@ -1051,6 +1051,10 @@ run_test "Audit Chain Multiprocess (cross-process flock + tip re-read)" "$SCRIPT
 # a green suite emitted no TAP "ok N -" lines and was mislabeled "no_tests_run".
 run_test "Coverage Gate Fail-Open (node-test detector)" "$SCRIPT_DIR/test-coverage-gate-fail-open.sh"
 
+# BACKLOG 62 (S-175): a whitelist-rejected LOKI_MONOREPO_TEST_CMD ran nothing and
+# must record inconclusive/not_run with no unit-tests.pass, never pass:true.
+run_test "Monorepo rejected test cmd is inconclusive (S-175)" "$SCRIPT_DIR/test-monorepo-rejected-cmd-inconclusive.sh"
+
 # `loki init` surface, including --json. Registered with the stdout/stderr fix
 # (2026-07-27): the reinit banner was written to stdout, so the SECOND init in a
 # directory emitted invalid JSON to any tool parsing it.

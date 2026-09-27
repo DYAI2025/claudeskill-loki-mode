@@ -13875,7 +13875,20 @@ sys.stdout.write(t.strip())
                    echo "$LOKI_MONOREPO_TEST_CMD" | grep -qE '[;|`$]|&&|\|\||>>|<<'; then
                     log_error "LOKI_MONOREPO_TEST_CMD rejected (only [A-Za-z0-9_./= -] allowed): $LOKI_MONOREPO_TEST_CMD"
                     test_runner="monorepo-custom-rejected"
-                    details="monorepo-custom: rejected by whitelist (gate skipped, inconclusive)"
+                    # BACKLOG 62: nothing ran, so record the no-runner shape
+                    # (see the runner=="none" return below) instead of falling
+                    # through with test_passed=true, which wrote pass:true and
+                    # touched unit-tests.pass. The runner label stays distinct:
+                    # the council reads a non-boolean pass on a named runner as
+                    # NO_PASS (inconclusive pass-through). The command itself is
+                    # not echoed into the JSON (it failed the whitelist).
+                    rm -f "$quality_dir/unit-tests.pass" 2>/dev/null || true
+                    cat > "$quality_dir/test-results.json" << TREOF
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","runner":"monorepo-custom-rejected","pass":"inconclusive","summary":"LOKI_MONOREPO_TEST_CMD rejected by whitelist (not run)","command":null,"exit_code":null,"status":"not_run","passed_count":null,"failed_count":null,"verification_gap":"test_command_rejected"}
+TREOF
+                    printf '%s\n' "${ITERATION_COUNT:-0}" > "$quality_dir/.test-results.iter" 2>/dev/null || true
+                    _LOKI_TEST_SUITE_STATUS=not_run
+                    return 0
                 else
                     test_runner="monorepo-custom"
                     local output
