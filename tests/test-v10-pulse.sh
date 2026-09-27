@@ -1182,6 +1182,69 @@ else
     printf '%s\n' "$OUT"
 fi
 
+# assert_bad_ts_row <fixture-slug> <building|review> <bad-timestamp> <description>
+# -- builds an 8-row BOARD.md with S-01 at the given token@timestamp and 7
+# ready rows, then asserts: no PULSE ERROR, normal violation exit code (1,
+# from LOW_READY), no AGENT_OVER_BUDGET violation, and the row reports
+# UNKNOWN for agent_budget; for a review@ row, also asserts no REVIEW_STALE
+# violation and the row reports UNKNOWN for review_pending_age too.
+assert_bad_ts_row() {
+    local slug="$1" token="$2" ts="$3" desc="$4"
+    local board="$WORK/BOARD-$slug.md" pass=1
+    {
+        echo "| ID | Owner | File set | Tier | Status | Notes |"
+        echo "|---|---|---|---|---|---|"
+        echo "| S-01 | a | x | LOW | ${token}@${ts} | |"
+        for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+    } > "$board"
+    if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$board"; then rc=0; else rc=$?; fi
+    printf '%s\n' "$OUT" | grep -q "PULSE ERROR" && pass=0
+    [ "$rc" = "1" ] || pass=0
+    printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET" && pass=0
+    printf '%s\n' "$OUT" | grep -qF "Agent budget: UNKNOWN for S-01 (no parseable Status timestamp on an active row)" || pass=0
+    printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*agent_budget" || pass=0
+    if [ "$token" = "review" ]; then
+        printf '%s\n' "$OUT" | grep -q "^VIOLATION: REVIEW_STALE" && pass=0
+        printf '%s\n' "$OUT" | grep -qF "Review-pending age: UNKNOWN for S-01 (no parseable Status timestamp on a review-pending row)" || pass=0
+        printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*review_pending_age" || pass=0
+    fi
+    if [ "$pass" = "1" ]; then
+        ok "$desc"
+    else
+        bad "$desc: rc=$rc output follows"
+        printf '%s\n' "$OUT"
+    fi
+}
+
+echo "T25 -- S-75 rework round 2 (re-review REJECT, reproduced): calendar.timegm validates the"
+echo "      MONTH via datetime.date(y, mo, 1) but adds day/hour/minute as unchecked arithmetic --"
+echo "      a valid month with an out-of-range day must still downgrade to UNKNOWN"
+assert_bad_ts_row "bad-day-build" "building" "2026-09-99T10:00Z" \
+    "building@ with day=99 (valid month, invalid day): UNKNOWN, no silent false green"
+assert_bad_ts_row "bad-day-review" "review" "2026-09-99T10:00Z" \
+    "review@ with day=99 (valid month, invalid day): UNKNOWN, no silent false green"
+
+echo "T26 -- round 2: hour=24 (calendar.timegm's unchecked arithmetic would otherwise accept it)"
+assert_bad_ts_row "bad-hour24-build" "building" "2026-09-27T24:00Z" \
+    "building@ with hour=24: UNKNOWN, no silent false green"
+assert_bad_ts_row "bad-hour24-review" "review" "2026-09-27T24:00Z" \
+    "review@ with hour=24: UNKNOWN, no silent false green"
+
+echo "T27 -- round 2: minute=61 (the exact reported repro: '2026-09-27T24:61Z' parsed with a"
+echo "      negative age and no error before this fix)"
+assert_bad_ts_row "bad-min61-build" "building" "2026-09-27T23:61Z" \
+    "building@ with minute=61: UNKNOWN, no silent false green"
+assert_bad_ts_row "bad-min61-review" "review" "2026-09-27T23:61Z" \
+    "review@ with minute=61: UNKNOWN, no silent false green"
+
+echo "T28 -- round 2: Feb 30 (day 30 does not exist in February; before this fix,"
+echo "      calendar.timegm's unchecked day arithmetic silently normalized it to March 2"
+echo "      and fabricated a real AGENT_OVER_BUDGET violation)"
+assert_bad_ts_row "feb30-build" "building" "2026-02-30T10:00Z" \
+    "building@ Feb 30: UNKNOWN, never silently normalized to March 2"
+assert_bad_ts_row "feb30-review" "review" "2026-02-30T10:00Z" \
+    "review@ Feb 30: UNKNOWN, never silently normalized to March 2"
+
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
 if command -v /bin/sh >/dev/null 2>&1 && /bin/sh -c 'case "$BASH_VERSION" in 3.2*) exit 0;; *) exit 1;; esac' 2>/dev/null; then

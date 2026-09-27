@@ -138,6 +138,7 @@ def _pulse_excepthook(exc_type, exc, tb):
 sys.excepthook = _pulse_excepthook
 
 import calendar
+import datetime
 import json
 import re
 import shlex
@@ -282,6 +283,22 @@ def parse_time_value(raw):
     if not m:
         return None
     y, mo, d, h, mi, se = (int(x) if x else 0 for x in m.groups(default="0"))
+    # The regex above only checks digit SHAPE (\d{2} matches "99" or "61"),
+    # never calendar range. calendar.timegm does NOT reject every bad range
+    # itself: it builds datetime.date(year, month, 1) -- which does catch a
+    # bad MONTH -- then adds day/hour/minute/second as plain unchecked
+    # arithmetic, so a bad day/hour/minute silently produces a wrong-but-valid
+    # epoch instead of raising (reproduced: "2026-09-27T24:61Z" parsed with no
+    # error and a negative age; "2026-02-30T10:00Z" silently normalized to
+    # March 2 and fabricated a real AGENT_OVER_BUDGET violation). Validate the
+    # FULL tuple with datetime.datetime first -- it enforces day-within-month
+    # (catches Feb 30), hour 0-23, minute/second 0-59 -- before calendar.timegm
+    # ever runs, so every one of those bad values is rejected here instead of
+    # downstream.
+    try:
+        datetime.datetime(y, mo, d, h, mi, se)
+    except ValueError:
+        return None
     # All timestamps this parses (BOARD.md, PULSE_NOW/PULSE_SWARM_START
     # overrides) are explicit UTC ('Z' suffix). calendar.timegm treats the
     # tuple as UTC directly -- time.mktime() - time.timezone is WRONG here:
@@ -291,15 +308,12 @@ def parse_time_value(raw):
     try:
         return float(calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0)))
     except (ValueError, OverflowError):
-        # The regex above only checks digit SHAPE (\d{2} matches "99"), not
-        # calendar range -- calendar.timegm builds a datetime.date() inside
-        # itself, which raises on an out-of-range month/day (e.g. BOARD.md's
-        # "building@2026-99-99T99:99Z"). Every caller already treats None as
-        # "could not parse this value" and either falls back or skips the row
-        # (see now_epoch, parse_npm_releases, REVIEW_STALE, AGENT_OVER_BUDGET
-        # below), so folding a bad-range timestamp into that same None return
-        # downgrades one bad row to UNKNOWN instead of crashing the whole
-        # script through sys.excepthook's exit-2 backstop above.
+        # Belt-and-suspenders: the datetime.datetime validation above already
+        # rejects every range calendar.timegm itself could still choke on, but
+        # every caller already treats None as "could not parse this value" and
+        # either falls back or skips the row (see now_epoch, parse_npm_releases,
+        # REVIEW_STALE, AGENT_OVER_BUDGET below), so keep this catch as the
+        # same safe fallback rather than relying solely on the check above.
         return None
 
 
