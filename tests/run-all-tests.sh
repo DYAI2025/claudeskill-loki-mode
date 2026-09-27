@@ -1449,6 +1449,7 @@ run_test "State versioning (SYN-015)" "$SCRIPT_DIR/test-state-versioning.sh"
 run_test "Welcome opener (terminal + browser)" "$SCRIPT_DIR/test-welcome-opener.sh"
 
 run_test "Browser-open guard (tests never open a browser, S-103)" "$SCRIPT_DIR/test-browser-open-guard.sh"
+run_test "prune-worktrees treats cherry-picked branches as merged (S-154)" "$SCRIPT_DIR/test-prune-worktrees.sh"
 run_test "ShellCheck Linting" "$SCRIPT_DIR/run-shellcheck.sh"
 
 # Summary

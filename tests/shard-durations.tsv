@@ -921,3 +921,4 @@ the moat runner enforces every ratchet rule	10
 v10-pulse anti-drift status/violation reporter	10
 v10 drift-audit turn counter (every-6th-turn signal)	0
 ShellCheck Linting	133
+prune-worktrees treats cherry-picked branches as merged (S-154)	2
