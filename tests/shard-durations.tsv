@@ -613,3 +613,4 @@ web-app CI/CD panel shows unknown status as unknown (node --test)	1
 Council failed_count honesty (S-157 member vote + convergence)	2
 run_test missing or empty argument does not stop the runner (S-174)	3
 Monorepo rejected test cmd is inconclusive (S-175)	3
+proof headline ignores a stale test-results.json (S-176)	3

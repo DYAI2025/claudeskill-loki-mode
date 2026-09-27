@@ -911,6 +911,7 @@ def _collect_tests(loki_dir):
         "status": "not_run",
         "duration_sec": None,
     }
+    empty = dict(out)
     if not isinstance(raw, dict):
         return out
     out["runner"] = str(raw.get("runner") or "")
@@ -944,6 +945,12 @@ def _collect_tests(loki_dir):
             out["status"] = "inconclusive"
     else:
         out["status"] = "not_run"
+    # BACKLOG 98: a test-results.json left by an earlier iteration is not this
+    # run's evidence, so it cannot lift the headline (the gates' rule). An
+    # earlier red is never discarded: a stale failure still reads failed.
+    if out["status"] != "failed" and not _test_results_fresh(
+            os.path.join(loki_dir, "quality")):
+        return empty
     return out
 
 
