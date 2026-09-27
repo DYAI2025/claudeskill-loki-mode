@@ -215,6 +215,7 @@ export function ExecutionCockpit({ sessionId, onClose }: Props) {
                 <RiskPanel
                   sessionId={sessionId}
                   checkpoints={s.checkpoints}
+                  checkpointsError={s.checkpointsError}
                   changedFiles={s.changedFiles}
                   checklist={s.checklist}
                   isLive={s.isLive}
@@ -230,6 +231,7 @@ export function ExecutionCockpit({ sessionId, onClose }: Props) {
                   sessionId={sessionId}
                   files={s.changedFiles}
                   clean={s.git?.clean ?? s.changedFiles.length === 0}
+                  gitError={s.gitError}
                 />
               </div>
               <div className="grid gap-4 lg:grid-cols-2">
