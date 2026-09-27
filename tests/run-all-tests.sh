@@ -965,6 +965,7 @@ run_test "shipped agent roles reach the review pool" "$SCRIPT_DIR/test-agent-typ
 run_test "policy present but unevaluable refuses fail-closed" "$SCRIPT_DIR/test-policy-node-failclosed.sh"
 run_test "audit entries attribute an actor honestly" "$SCRIPT_DIR/test-audit-actor-attribution.sh"
 run_test "shipped modules have a recorded reachability verdict" "$SCRIPT_DIR/test-no-unreachable-shipped.sh"
+run_test "dashboard HTML strings escape run-written values" "$SCRIPT_DIR/test-no-unescaped-innerhtml.sh"
 run_test "loki proof chain fronts the buyer verifier" "$SCRIPT_DIR/test-proof-chain-command.sh"
 run_test "workflow RC handlers are reachable under bash -e" "$SCRIPT_DIR/test-workflow-rc-capture.sh"
 run_test "issue-to-PR action and workflow ship, gate and split agent from publish" "$SCRIPT_DIR/test-issue-to-pr-action.sh"

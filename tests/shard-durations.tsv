@@ -213,6 +213,7 @@ shipped agent roles reach the review pool	0
 policy present but unevaluable refuses fail-closed	0
 audit entries attribute an actor honestly	0
 shipped modules have a recorded reachability verdict	95
+dashboard HTML strings escape run-written values	1
 loki proof chain fronts the buyer verifier	1
 workflow RC handlers are reachable under bash -e	0
 issue-to-PR action and workflow ship, gate and split agent from publish	0
