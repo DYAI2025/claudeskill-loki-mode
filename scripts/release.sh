@@ -336,6 +336,11 @@ bump_all_version_files() {
         "s/^(  \"version\": \")${digits}(\",?)\$/\\1${new}\\2/" \
         "^  \"version\": \"${new}\"" \
         "wiki/API-Reference.md example version"
+
+    update_version_slot "$ROOT_DIR/web-app/src/components/Footer.tsx" \
+        "s/^([[:space:]]*v)${digits}\$/\\1${new}/" \
+        "^[[:space:]]*v${new}\$" \
+        "Footer.tsx version badge"
 }
 
 # Files staged into the release commit. Kept as its own list, sourced from

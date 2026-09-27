@@ -33,7 +33,7 @@ trap cleanup EXIT
 # Every file bump_all_version_files() touches (the checklist minus
 # CHANGELOG.md, which update-changelog.sh handles separately, and
 # vscode-extension/package.json, which is deliberately skipped as DEPRECATED).
-FILES="VERSION package.json SKILL.md Dockerfile Dockerfile.sandbox plugins/loki-mode/.claude-plugin/plugin.json server.json CLAUDE.md dashboard/__init__.py mcp/__init__.py docs/INSTALLATION.md wiki/Home.md wiki/_Sidebar.md wiki/API-Reference.md"
+FILES="VERSION package.json SKILL.md Dockerfile Dockerfile.sandbox plugins/loki-mode/.claude-plugin/plugin.json server.json CLAUDE.md dashboard/__init__.py mcp/__init__.py docs/INSTALLATION.md wiki/Home.md wiki/_Sidebar.md wiki/API-Reference.md web-app/src/components/Footer.tsx"
 
 mkdir -p "$WORK/scripts"
 cp "$REPO_ROOT/scripts/release.sh" "$WORK/scripts/release.sh"
@@ -292,6 +292,9 @@ done
 grep -q "1.2.4" "$REPO2/loki-ts/dist/loki.js" 2>/dev/null \
     && ok "green: loki-ts/dist/loki.js embeds the new version" \
     || bad "green: dist not rebuilt with new version"
+grep -q "1.2.4" "$REPO2/web-app/src/components/Footer.tsx" 2>/dev/null \
+    && ok "green: web-app/src/components/Footer.tsx version badge bumped" \
+    || bad "green: web-app/src/components/Footer.tsx not bumped"
 if grep -q -- "--commit $STUB_SHA" "$WORK2/gh-calls.log" \
     && grep -q -- "--workflow Tests" "$WORK2/gh-calls.log" \
     && grep -q -- "--workflow Bun Parity" "$WORK2/gh-calls.log"; then
