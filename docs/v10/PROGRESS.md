@@ -1006,3 +1006,32 @@ else should take priority over.
   Reran just the failed shard (`gh run rerun 36321857199 --failed`)
   on the SAME frozen SHA to get a second data point rather than
   assuming and moving on.
+- User instruction received: do not call this a flake without (a)
+  diffing the code under test since v9.55.0 and (b) reproducing on
+  Linux. Correct instruction -- my earlier local repro was macOS only,
+  which does not rule out a Linux-specific regression on the actual
+  CI runner OS. Did both properly:
+  - `git diff v9.55.0..HEAD -- tests/test-runtime-gate-port-scoping.sh
+    tests/test-runtime-gate.sh` = 0 lines. Neither file has changed
+    since v9.55.0.
+  - Traced the actual function under test: `_reap_own_port` is
+    extracted (via `awk`) from `tests/test-runtime-gate.sh` -- a TEST
+    HELPER, not `autonomy/run.sh` production code. Confirmed via
+    `git log --oneline v9.55.0..HEAD -- autonomy/run.sh` filtered for
+    kill_provider_child/pkill/process-group: zero matching commits.
+    D14/D15/9cd51d1a (the pkill-scoping fix) all predate v9.55.0 and
+    are untouched in this train.
+  - Reproduced on real Linux: `docker run ubuntu:24.04` (the same OS
+    family GitHub's runner uses), installed lsof/python3/procps, ran
+    the exact test 3 consecutive times: `RESULT: 12 passed, 0 failed`
+    all three times, identical to the macOS result.
+  - Conclusion, now on solid evidence rather than a first-pass
+    assumption: this is a CI-runner environment/load flake (an
+    `lsof`-enumeration timing issue under the runner's own resource
+    contention), not a code regression. Neither the test nor any code
+    it exercises has changed since the last release. Container cleaned
+    up (`docker stop`, auto-removed via --rm).
+  - Standing correction for this session: "reproduces locally" must
+    mean the SAME OS family as the failing CI job, not just "my own
+    machine" -- a macOS-only local repro is not sufficient evidence to
+    rule out a Linux-specific regression, ever.
