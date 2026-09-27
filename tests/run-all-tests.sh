@@ -704,6 +704,7 @@ run_test "per-job receipt attestation (signed JWT + JWKS)" "$SCRIPT_DIR/test-rec
 run_test "remote receipt attestation verdict (JWKS)" "$SCRIPT_DIR/test-remote-attestation-verdict.sh"
 run_test "proof verify --jwks (third-party offline)" "$SCRIPT_DIR/test-proof-verify-jwks.sh"
 run_test "proof ablation headline: never VERIFIED when not_load_bearing (S-113)" "$SCRIPT_DIR/test-proof-ablation-headline.sh"
+run_test "council cannot approve inconclusive evidence on the vote alone (S-116)" "$SCRIPT_DIR/test-council-inconclusive-no-approve.sh"
 run_test "verify-path python3 hardening (canary verify, proof share/show)" "$SCRIPT_DIR/test-verify-path-shim-hardening.sh"
 run_test "worker autoscaling on queue depth" "$SCRIPT_DIR/test-worker-autoscaling.sh"
 run_test "helm receipt signing (receiver only)" "$SCRIPT_DIR/test-helm-receipt-signing.sh"
