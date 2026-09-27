@@ -14246,7 +14246,12 @@ TREOF
     # TAP "# fail 1" and the spec reporter's "<info sign> fail 1", counted only
     # right after the matching pass line (node TAP echoes a test's own stdout
     # as "# ..." lines, which must not count), mocha "1 failing", go "--- FAIL:"
-    # lines. A read summary with no failures is a measured 0. With no recognised
+    # lines. BACKLOG 103 (S-140): jest's "Test Suites: 1 failed, 1 total" and
+    # vitest's "Test Files  1 failed | 2 passed" lines are matched too -- a
+    # whole crashed suite/file can carry the ONLY failed count while the
+    # "Tests:" line above reports just the tests that ran elsewhere ("Tests: 2
+    # passed"), which previously left failed_count at 0. A read summary with no
+    # failures is a measured 0. With no recognised
     # summary the old best-effort parse of the tail still applies (null when it
     # finds nothing). Either way a recorded count above zero is a failure: the
     # council evidence gate and the Bun gate both read failed_count > 0 as one.
@@ -14265,6 +14270,7 @@ TREOF
     _tr_failed_n=$(printf '%s\n' "${output:-}" | LC_ALL=C sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" | LC_ALL=C awk '
         function upd(n) { if (n > f) f = n; seen = 1 }
         /^Tests:[ \t]/ || /^[ \t]*Tests[ \t]+[0-9]/ ||
+        /^Test Suites:[ \t]/ || /^[ \t]*Test Files[ \t]+[0-9]/ ||
         /^=+ .*[0-9]+ (passed|failed|errors?)/ || /^[0-9]+ (passed|failed|errors?).* in [0-9.]+s/ {
             n = 0
             if (match($0, /[0-9]+ failed/)) n = substr($0, RSTART, RLENGTH) + 0
