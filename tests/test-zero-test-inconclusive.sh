@@ -655,6 +655,21 @@ Ran all test suites."
     ef_expect pytest-red "$RED_WANT" "FAILED test_x.py::test_a - assert 1 == 2
 ========================= 1 failed, 2 passed in 0.03s ========================="
     ef_expect pytest-green "True|0|verified|0|marker" "========================= 3 passed in 0.02s ========================="
+    # BACKLOG 111: a genuine fixture/collection/setup error is pytest's own
+    # distinct outcome, neither "passed" nor "failed" text. Confirmed live
+    # against real pytest: a broken fixture prints "1 passed, 1 error in Xs",
+    # and a bad import at collection time prints "1 error in Xs" alone (no
+    # "passed" at all). Both must gate the same as a "failed" count.
+    ef_expect pytest-error-red "$RED_WANT" "ERROR test_x.py::test_a - RuntimeError: fixture setup failed
+========================= 1 passed, 1 error in 0.02s ========================="
+    ef_expect pytest-error-only-red "False|1|failed|0|nomarker" "ERROR test_x.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 0.05s ==============================="
+    # failed and error are independent outcomes within one summary line (a
+    # regular assertion failure plus a separate fixture error): the recorded
+    # count is their sum, not either alone.
+    ef_expect pytest-error-sum-red "False|4|failed|0|nomarker" "FAILED test_x.py::test_a - assert 1 == 2
+========================= 1 failed, 3 errors in 0.1s ========================="
     ef_expect node-tap-red "$RED_WANT" "TAP version 13
 not ok 1 - adds
 ok 2 - subs

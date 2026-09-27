@@ -13607,14 +13607,26 @@ TREOF
     # summary the old best-effort parse of the tail still applies (null when it
     # finds nothing). Either way a recorded count above zero is a failure: the
     # council evidence gate and the Bun gate both read failed_count > 0 as one.
+    # BACKLOG 111: pytest's summary line also reports a distinct "error" outcome
+    # for a fixture/collection/setup error ("1 passed, 1 error in 0.5s"), which
+    # is neither "passed" nor "failed" text, so the [0-9]+ failed match alone
+    # found nothing and printed n=0 even though seen=1 -- a real error gated
+    # PASS. pytest pluralizes it ("2 errors"), so match errors? and ADD it to
+    # the failed count on that line ("2 failed, 3 errors" is 5 distinct broken
+    # tests, not 3 -- failed and error are independent outcomes within one
+    # summary line, unlike the separate cross-line max below, which exists to
+    # stop a later green summary from hiding an earlier failed run).
     # LC_ALL=C: bytes, so any runner output parses; [ \t] not [[:space:]] for
     # old mawk.
     local _tr_passed_n _tr_failed_n _tr_summary_red=false
     _tr_failed_n=$(printf '%s\n' "${output:-}" | LC_ALL=C sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" | LC_ALL=C awk '
         function upd(n) { if (n > f) f = n; seen = 1 }
         /^Tests:[ \t]/ || /^[ \t]*Tests[ \t]+[0-9]/ ||
-        /^=+ .*[0-9]+ (passed|failed)/ || /^[0-9]+ (passed|failed).* in [0-9.]+s/ {
-            n = 0; if (match($0, /[0-9]+ failed/)) n = substr($0, RSTART, RLENGTH) + 0; upd(n) }
+        /^=+ .*[0-9]+ (passed|failed|errors?)/ || /^[0-9]+ (passed|failed|errors?).* in [0-9.]+s/ {
+            n = 0
+            if (match($0, /[0-9]+ failed/)) n = substr($0, RSTART, RLENGTH) + 0
+            if (match($0, /[0-9]+ errors?/)) n += substr($0, RSTART, RLENGTH) + 0
+            upd(n) }
         /^[^ A-Za-z0-9]+ fail [0-9]+[ \t]*$/ { if (prev ~ /^[^ A-Za-z0-9]+ pass [0-9]+[ \t]*$/) upd($3 + 0) }
         /^[ \t]*[0-9]+ passing \(/ { upd(0) }
         /^[ \t]*[0-9]+ failing[ \t]*$/ { upd($1 + 0) }
