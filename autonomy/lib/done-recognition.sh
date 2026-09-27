@@ -461,8 +461,14 @@ def tests_axis(path):
         if ec != 0:
             return "red"
         # exit 0 alone is green only if nothing else contradicts it (checked below).
+    def _nonzero_int(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v != 0
     p = d.get("pass")
     if p is True:
+        # A self-reported pass contradicted by a nonzero failure count (under
+        # either key production/legacy shapes use) is not authoritative green.
+        if _nonzero_int(d.get("failed")) or _nonzero_int(d.get("failed_count")):
+            return "red"
         # A clean pass:true with no contradicting red signal is authoritative green.
         if d.get("failed") in (None, 0) and (ec in (None, 0)):
             return "green"
@@ -470,6 +476,9 @@ def tests_axis(path):
         return "red"
     # Legacy / generic shapes.
     failed = d.get("failed")
+    total = d.get("total")
+    if isinstance(total, int) and total == 0:
+        return "unknown"  # zero-test record: nothing actually ran
     if isinstance(failed, int):
         return "green" if failed == 0 else "red"
     if status in ("pass", "passed", "green", "ok", "success", "verified"):
