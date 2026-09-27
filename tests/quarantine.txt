@@ -13,5 +13,5 @@
 # code, are unaffected). Suites under tests/moat/ or matching *review* can
 # never be quarantined, no matter what this file says.
 #
-# No entries below -- keep this file empty until a real, time-boxed
-# quarantine is needed.
+# Entries below are time-boxed; remove each one when its fix lands.
+test-runtime-gate-port-scoping.sh	asklokesh	2026-10-03	S-106 (positive control races its own background listener; failed shard 0 in trains 1 and 4)
