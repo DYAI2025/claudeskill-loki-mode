@@ -32,6 +32,7 @@ Subcommands:
       Exit 0 if the working tree (staged + unstaged) is clean, 1 if dirty,
       2 if git itself failed (no .git, corrupt index, permission error --
       never printed as CLEAN). Prints a one-line summary in all cases.
+      Untracked files count as dirty (same as `git status --porcelain`).
 
   commit-msg-template <type> <summary...>
       Formats a repo-convention commit message to stdout:
@@ -47,9 +48,19 @@ Subcommands:
       Flips exactly one BOARD.md row's Status cell to
       "<new-status-token>@<UTC timestamp>". Line-anchored: matches the row
       whose first pipe-delimited cell (ID) equals <slice-id> exactly. Fails
-      loudly (exit 2) if zero or more than one row matches. Verifies the
-      file's total line count is unchanged before/after (never adds/drops
-      lines). Default board-md-path: docs/v10/BOARD.md.
+      loudly (exit 2) if zero or more than one row matches. <new-status-token>
+      must match ^[a-z][a-z-]*$ and be one of the documented lifecycle
+      tokens (ready building review review-blocked approved merged released
+      blocked rejected parked) -- rejected before the file is touched, exit 2,
+      so it can never carry an "@", "|", whitespace, or a newline into the
+      table. Reads and writes the file with no newline translation, so a
+      CRLF board keeps CRLF. Writes atomically (temp file + fsync + rename)
+      so a kill mid-write cannot leave BOARD.md empty. After the replace,
+      re-reads the file from disk and verifies every non-target line plus
+      the total line count are byte-identical to the pre-image; on any
+      mismatch it restores the original content and exits 3. A directory
+      that refuses new files (a read-only board) is reported as a clean
+      error, not a traceback. Default board-md-path: docs/v10/BOARD.md.
 
   version-check
       Prints VERSION file contents and, if network/gh access works, the
@@ -100,12 +111,36 @@ cmd_commit_msg_template() {
 }
 
 # Precise, line-anchored single-row status flip. Never a blind find/replace:
-# matches on the row's ID cell only, refuses on 0 or >1 matches, and verifies
-# every other line is byte-identical before/after (the anti-D18 property).
+# matches on the row's ID cell only, refuses on 0 or >1 matches, validates
+# the new token before touching the file, writes atomically, and re-reads
+# the result from disk to verify every other line is byte-identical
+# (the anti-D18 property -- checked against disk, not memory).
+V10_OPS_BOARD_TOKENS="ready building review review-blocked approved merged released blocked rejected parked"
+
 cmd_board_row_status() {
     local slice_id="${1:-}" new_token="${2:-}" board="${3:-$REPO_ROOT/docs/v10/BOARD.md}"
     if [ -z "$slice_id" ] || [ -z "$new_token" ]; then
         echo "usage: v10-ops.sh board-row-status <slice-id> <new-status-token> [board-md-path]" >&2
+        return 2
+    fi
+    # Validated before anything on disk is touched. The shape check alone
+    # (lowercase letters and hyphens only) already excludes "@", "|",
+    # whitespace and newlines -- a token carrying any of those could grow a
+    # table column or a line count instead of just flipping a cell.
+    if ! [[ "$new_token" =~ ^[a-z][a-z-]*$ ]]; then
+        echo "board-row-status: invalid status token '$new_token' -- must match ^[a-z][a-z-]*\$" \
+             "(lowercase letters and hyphens only; no @, |, whitespace, or newline)" >&2
+        return 2
+    fi
+    local token_ok="" t
+    for t in $V10_OPS_BOARD_TOKENS; do
+        if [ "$new_token" = "$t" ]; then
+            token_ok=1
+            break
+        fi
+    done
+    if [ -z "$token_ok" ]; then
+        echo "board-row-status: unknown status token '$new_token' -- must be one of: $V10_OPS_BOARD_TOKENS" >&2
         return 2
     fi
     if [ ! -f "$board" ]; then
@@ -113,12 +148,20 @@ cmd_board_row_status() {
         return 2
     fi
     python3 -E -S -c '
-import sys, re, datetime
+import sys, os, re, tempfile, datetime
 
 board, slice_id, new_token = sys.argv[1], sys.argv[2], sys.argv[3]
 
-with open(board, "r", encoding="utf-8") as f:
-    lines = f.readlines()
+# newline="" disables newline translation on both read and write, so a CRLF
+# board keeps its CRLF bytes untouched instead of every line getting
+# rewritten as LF.
+try:
+    with open(board, "r", encoding="utf-8", newline="") as f:
+        lines = f.readlines()
+except OSError as e:
+    print("board-row-status: cannot read " + board + ": " + str(e), file=sys.stderr)
+    sys.exit(2)
+
 before_count = len(lines)
 before_lines = list(lines)
 
@@ -159,29 +202,86 @@ timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%
 cells[status_idx] = " " + new_token + "@" + timestamp + " "
 lines[idx] = "|".join(cells)
 
-with open(board, "w", encoding="utf-8") as f:
-    f.writelines(lines)
-
 after_count = len(lines)
 if after_count != before_count:
     print("board-row-status: FATAL line-count mismatch (" + str(before_count)
-          + " -> " + str(after_count) + "), aborting write is too late -- "
-          "restore from git", file=sys.stderr)
+          + " -> " + str(after_count) + ") before write -- aborting, board untouched",
+          file=sys.stderr)
     sys.exit(3)
 
-# The anti-D18 property: every line other than the target row must be
-# byte-identical to the pre-image. This is checked AFTER the write (so a
-# real corruption is caught, not just prevented in theory) and reported
-# loudly if it ever fires -- it should be structurally impossible given the
-# single-line replacement above, but the whole point of this subcommand is
-# to never trust that without checking.
-for i in range(after_count):
-    if i == idx:
-        continue
-    if lines[i] != before_lines[i]:
-        print("board-row-status: FATAL unrelated line " + str(i + 1)
-              + " changed -- restore from git", file=sys.stderr)
-        sys.exit(3)
+# TEST ONLY: corrupts an unrelated in-memory line right before the write, so
+# the post-write disk-verification below has a real corruption to catch
+# without needing to simulate an actual disk fault. Never set in normal use.
+if os.environ.get("V10_OPS_TEST_CORRUPT_WRITE") == "1" and after_count > 1:
+    victim = 0 if idx != 0 else after_count - 1
+    lines[victim] = lines[victim].rstrip("\r\n") + " CORRUPTED\n"
+
+# Atomic write: a temp file in the same directory, fsync, then rename over
+# the original. A kill mid-write leaves either the old file (rename never
+# happened) or the new one (rename is atomic on the same filesystem) -- never
+# an empty BOARD.md. Writing to a fresh temp file also means a read-only
+# board.md itself is not what stands in the way; only a non-writable
+# directory is, and that is reported cleanly below instead of a traceback.
+board_dir = os.path.dirname(os.path.abspath(board)) or "."
+tmp_path = None
+try:
+    fd, tmp_path = tempfile.mkstemp(prefix=".v10-ops-board-", dir=board_dir)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.writelines(lines)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, board)
+    tmp_path = None
+except OSError as e:
+    if tmp_path is not None and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    print("board-row-status: cannot write " + board + ": " + str(e), file=sys.stderr)
+    sys.exit(2)
+
+# The anti-D18 property, checked against DISK, never memory: every line
+# other than the target row must be byte-identical to the pre-image, the
+# target row must match what was intended, and the total line count must be
+# unchanged. Comparing the in-memory list to itself cannot catch a
+# corrupted write -- even deleting the board entirely would still pass that
+# check. Re-reading from disk after the atomic replace is what makes it real.
+try:
+    with open(board, "r", encoding="utf-8", newline="") as f:
+        disk_lines = f.readlines()
+except OSError as e:
+    print("board-row-status: FATAL cannot re-read " + board + " after write: "
+          + str(e), file=sys.stderr)
+    sys.exit(3)
+
+corrupted = len(disk_lines) != before_count
+if not corrupted:
+    for i in range(before_count):
+        expected = lines[idx] if i == idx else before_lines[i]
+        if disk_lines[i] != expected:
+            corrupted = True
+            break
+
+if corrupted:
+    restore_ok = True
+    try:
+        rfd, rtmp = tempfile.mkstemp(prefix=".v10-ops-board-restore-", dir=board_dir)
+        with os.fdopen(rfd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(before_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(rtmp, board)
+    except OSError as e:
+        restore_ok = False
+        print("board-row-status: FATAL post-write verification failed AND restore "
+              "failed (" + str(e) + ") -- restore " + board + " from git immediately",
+              file=sys.stderr)
+    if restore_ok:
+        print("board-row-status: FATAL post-write verification failed for " + slice_id
+              + " -- disk content diverged from the expected write, original restored",
+              file=sys.stderr)
+    sys.exit(3)
 
 print("board-row-status: " + slice_id + " -> " + new_token + "@" + timestamp)
 ' "$board" "$slice_id" "$new_token"

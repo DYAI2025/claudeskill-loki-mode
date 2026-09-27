@@ -216,6 +216,111 @@ else
     bad "board-row-status missing-file rc=$rc out=$out"
 fi
 
+# --- board-row-status: new-token validation ---------------------------------
+# Reviewer-found gaps: an unvalidated token could carry "@", "|", whitespace,
+# or a newline straight into the table, adding a column or a line. All of
+# these must be rejected with exit 2 before the file is touched at all.
+
+BOARD_VALID="$WORK/BOARD-valid.md"
+cat > "$BOARD_VALID" <<'EOF'
+# Board
+
+| ID | Owner | Notes | Status |
+|---|---|---|---|
+| S-49 | henry | first row | building@2026-09-27T01:00Z |
+EOF
+cp "$BOARD_VALID" "$WORK/BOARD-valid.before.md"
+
+echo "== board-row-status: rejects an embedded @ (a token@timestamp value) =="
+out="$(bash "$OPS_SH" board-row-status "S-49" "building@2026-09-27T14:00Z" "$BOARD_VALID" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q -- "->"; then
+    ok "board-row-status rejects an embedded @ in the new token"
+else
+    bad "board-row-status embedded-@ case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-valid.before.md" "$BOARD_VALID" >/dev/null 2>&1; then
+    ok "embedded-@ rejection left the file untouched"
+else
+    bad "embedded-@ rejection modified the file"
+fi
+
+echo "== board-row-status: rejects an embedded | =="
+out="$(bash "$OPS_SH" board-row-status "S-49" "a|b" "$BOARD_VALID" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ]; then
+    ok "board-row-status rejects an embedded pipe in the new token"
+else
+    bad "board-row-status embedded-pipe case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-valid.before.md" "$BOARD_VALID" >/dev/null 2>&1; then
+    ok "embedded-pipe rejection left the file untouched (no extra column)"
+else
+    bad "embedded-pipe rejection modified the file"
+fi
+
+echo "== board-row-status: rejects an embedded newline =="
+out="$(bash "$OPS_SH" board-row-status "S-49" "$(printf 'a\nb')" "$BOARD_VALID" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ]; then
+    ok "board-row-status rejects an embedded newline in the new token"
+else
+    bad "board-row-status embedded-newline case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-valid.before.md" "$BOARD_VALID" >/dev/null 2>&1; then
+    ok "embedded-newline rejection left the file untouched (line count unchanged)"
+else
+    bad "embedded-newline rejection modified the file"
+fi
+
+echo "== board-row-status: rejects a shape-valid but undocumented token =="
+out="$(bash "$OPS_SH" board-row-status "S-49" "bogus-token" "$BOARD_VALID" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "unknown status token"; then
+    ok "board-row-status rejects a token outside the documented lifecycle set"
+else
+    bad "board-row-status undocumented-token case: rc=$rc out=$out"
+fi
+
+# --- board-row-status: CRLF preservation ------------------------------------
+
+echo "== board-row-status: a CRLF board keeps CRLF line endings =="
+BOARD_CRLF="$WORK/BOARD-crlf.md"
+printf '# Board\r\n\r\n| ID | Owner | Notes | Status |\r\n|---|---|---|---|\r\n| S-95 | fay | first row | ready@2026-09-27T00:00Z |\r\n| S-96 | gus | second row | building@2026-09-27T01:00Z |\r\n' > "$BOARD_CRLF"
+bash "$OPS_SH" board-row-status "S-96" "merged" "$BOARD_CRLF" >/dev/null 2>&1
+total_lines=$(wc -l < "$BOARD_CRLF")
+cr_lines=$(grep -c $'\r' "$BOARD_CRLF")
+if [ "$total_lines" -eq 6 ] && [ "$cr_lines" -eq 6 ]; then
+    ok "board-row-status preserves CRLF on every line, including untouched ones ($cr_lines/$total_lines)"
+else
+    bad "board-row-status CRLF case: total_lines=$total_lines cr_lines=$cr_lines"
+fi
+
+# --- board-row-status: post-write disk verification -------------------------
+# The verification must re-read from disk, not compare the in-memory list to
+# itself. V10_OPS_TEST_CORRUPT_WRITE is a test-only seam that corrupts an
+# unrelated line right before the write, so this exercises the real
+# catch-and-restore path without simulating an actual disk fault.
+
+echo "== board-row-status: detects a corrupted write via disk re-read and restores =="
+BOARD_FAULT="$WORK/BOARD-fault.md"
+cat > "$BOARD_FAULT" <<'EOF'
+# Board
+
+| ID | Owner | Notes | Status |
+|---|---|---|---|
+| S-90 | dave | first row | ready@2026-09-27T00:00Z |
+| S-91 | erin | second row | building@2026-09-27T01:00Z |
+EOF
+cp "$BOARD_FAULT" "$WORK/BOARD-fault.before.md"
+out="$(V10_OPS_TEST_CORRUPT_WRITE=1 bash "$OPS_SH" board-row-status "S-91" "merged" "$BOARD_FAULT" 2>&1)"; rc=$?
+if [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -qi "verification failed"; then
+    ok "board-row-status detects a disk-corrupted write and exits 3"
+else
+    bad "board-row-status fault-injection case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-fault.before.md" "$BOARD_FAULT" >/dev/null 2>&1; then
+    ok "board-row-status restores the original content after a detected corruption"
+else
+    bad "board-row-status did not restore original content after corruption"
+fi
+
 # --- version-check / ci-status: PATH shadowing -----------------------------
 # A minimal PATH containing only the external binaries each subcommand
 # genuinely needs, so `command -v npm` / `command -v gh` reliably fail
