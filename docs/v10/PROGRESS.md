@@ -1140,3 +1140,25 @@ BOARD reader and writer.
 **Matched:** release still gated only on Tests shard 0 at b651b98d;
 every finished build this turn went straight to review; three
 engineers again stopped short of committing, committed directly.
+
+- 2026-09-27T14:42Z: Tests on b651b98d completed success (run
+  36325316218); Bun Parity (36325316184) and Security Audit
+  (36325316176) also success. required-ci passed.
+- 2026-09-27T14:43:50Z: GitHub Release v9.56.0 published
+  (`gh release view v9.56.0` publishedAt).
+- 2026-09-27T14:44:53Z: publish-npm job step "Publish to npm" success
+  (`gh api .../jobs/108641497036`). At 14:45:06Z the registry still
+  returned 404 for loki-mode@9.56.0: propagation window, re-checking.
+  Docker publish still running.
+
+## Drift audit, turn 204
+
+**Train 1 measured:** freeze push 13:17:07Z -> Tests green 14:13Z (one
+flaky-shard rerun) -> release commit push 14:16:24Z -> gates green
+14:42Z -> GitHub Release 14:43:50Z -> npm publish step 14:44:53Z. About
+26 min from release push to publish, almost all of it Tests on the
+release SHA re-running what c31cb1e8 had already verified. That is
+exactly the cost S-84 (verdict reuse) removes.
+
+**Matched:** the release did not wait for any HIGH slice (S-18 is in
+round 4 and did not block, per D25).
