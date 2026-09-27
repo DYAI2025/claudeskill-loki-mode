@@ -449,6 +449,7 @@ install_gh_stub() {
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$log"
 case "\$*" in
+    "repo view "*) echo main ;;  # S-100: default-branch lookup before the push
     *"pr list"*)
         cat "$prlist_out" 2>/dev/null || true
         ;;

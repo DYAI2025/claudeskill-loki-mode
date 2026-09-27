@@ -473,6 +473,8 @@ mkdir -p "$GH_STUB_DIR"
 cat > "$GH_STUB_DIR/gh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$GH_ARGV"
+# S-100: the trusted push resolves the default branch first.
+[ "\$1 \$2" = "repo view" ] && echo main
 exit 0
 EOF
 chmod +x "$GH_STUB_DIR/gh"

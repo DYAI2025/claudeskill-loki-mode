@@ -185,6 +185,7 @@ cat > "$GH_DIR/gh" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$GH_ARGV"
 case "\$1 \${2:-}" in
+    "repo view") echo main; exit 0 ;;  # S-100: default-branch lookup before the push
     "pr list")
         # Emit the existing PR url, if one has been "created".
         [ -s "$GH_STATE" ] && cat "$GH_STATE"

@@ -55,6 +55,10 @@ mkdir -p "$HOME" "$W/bin"
 export PATH="$W/bin:$PATH"
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 unset GIT_SSH_COMMAND GH_TOKEN GITHUB_TOKEN SSH_AUTH_SOCK GIT_CONFIG_COUNT
+# S-100: _loki_trusted_push resolves the default branch (gh repo view
+# OWNER/REPO --jq) before pushing; the stub answers main.
+printf '#!/bin/sh\n[ "$1 $2" = "repo view" ] && [ -n "${3:-}" ] && echo main\nexit 0\n' > "$W/bin/gh"
+chmod +x "$W/bin/gh"
 mkbare() {
     git init -q --bare "$1"
     printf '#!/bin/sh\necho "%s token=${GH_TOKEN:-none}" >> "%s"\n[ "${GH_TOKEN:-}" = "%s" ]\n' \
@@ -260,7 +264,8 @@ cat > "$W/bin/gh" <<EOF
 #!/bin/sh
 case "\$1 \$2" in
     "auth status") exit 0 ;;
-    "repo view") git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repository" >&2; exit 1; }
+    "repo view") [ -n "\${3:-}" ] && [ "\${3#-}" = "\$3" ] && { echo main; exit 0; }  # S-100 lookup
+                 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repository" >&2; exit 1; }
                  echo "octocat/hello" ;;
     "pr view") echo "0123456789abcdef0123456789abcdef01234567" ;;
     "api "*) echo "api \$*" >> "$GHLOG" ;;

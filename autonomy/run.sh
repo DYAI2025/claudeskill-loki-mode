@@ -5911,6 +5911,27 @@ _loki_trusted_push() {
         log_warn "Not pushing branch '$_branch': origin changed during the run (it was $(_loki_github_repo_from_url "$_LOKI_PINNED_ORIGIN" 2>/dev/null || echo "not a GitHub repository") when the run started). Loki does not push to a destination the agent could have chosen."
         return 2
     fi
+    # S-100: never push a default branch, for every caller (on_run_complete,
+    # create_session_pr): the branch name can come from agent-writable state.
+    # The default branch is resolved for the origin just validated (the pinned
+    # one when pinned), gh run from / with an explicit OWNER/REPO. An
+    # unresolvable default branch refuses: fail closed.
+    local _repo _def=""
+    case "$_branch" in
+        main|master|HEAD)
+            log_warn "Not pushing branch '$_branch': Loki never pushes directly to a default branch."
+            return 2 ;;
+    esac
+    _repo="$(_loki_github_repo_from_url "$_url")"
+    _def="$(_loki_run_neutral "$_repo" "$_runner" gh repo view "$_repo" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null)" || _def=""
+    if [ -z "$_def" ]; then
+        log_warn "Not pushing branch '$_branch': could not resolve the default branch of $_repo, and Loki never risks a direct push to it."
+        return 2
+    fi
+    if [ "$_branch" = "$_def" ]; then
+        log_warn "Not pushing branch '$_branch': it is the default branch of $_repo, and Loki never pushes directly to the default branch."
+        return 2
+    fi
     _tmp="$(mktemp -d "${TMPDIR:-/tmp}/loki-push.XXXXXX")" || return 1
     # --update-shallow: a shallow agent repo's history ends in shallow roots,
     # which a plain fetch rejects while still exiting 0. The rev-parse makes a
@@ -6070,24 +6091,8 @@ on_run_complete() {
     case "$branch" in
         ""|main|master|HEAD) return 0 ;;
     esac
-    # S-100: also never push the repository's ACTUAL default branch (develop,
-    # trunk, ...). Resolved for the pinned origin (the only one the push
-    # accepts), OWNER/REPO read as data, gh run from / with an explicit repo.
-    # Unresolvable means refuse: fail closed.
-    local _def_url="$remote_url" _def_repo _def_branch=""
-    [ -z "$_LOKI_ORIGIN_PINNED" ] || _def_url="$_LOKI_PINNED_ORIGIN"
-    _def_repo="$(_loki_github_repo_from_url "$_def_url" 2>/dev/null || true)"
-    if [ -n "$_def_repo" ]; then
-        _def_branch="$(_loki_net gh repo view "$_def_repo" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
-    fi
-    if [ -z "$_def_branch" ]; then
-        log_warn "LOKI_DELEGATE_PR=1: not pushing branch '$branch': could not resolve the repository's default branch, and Loki never risks a direct push to it."
-        return 0
-    fi
-    if [ "$branch" = "$_def_branch" ]; then
-        log_warn "LOKI_DELEGATE_PR=1: not pushing branch '$branch': it is the default branch of $_def_repo, and Loki never pushes directly to the default branch."
-        return 0
-    fi
+    # S-100: the repository's ACTUAL default branch (develop, trunk, ...) is
+    # refused inside _loki_trusted_push, for every caller.
     log_info "LOKI_DELEGATE_PR=1: opening a local pull request for branch '$branch'..."
     # Push, then create. Non-interactive (no tty in --bg). Best-effort, each
     # network call bounded by the timeout guard above.

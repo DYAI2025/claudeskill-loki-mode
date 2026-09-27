@@ -58,7 +58,11 @@ case "\$1 \$2" in
     "repo view")
         [ "\$3" = "octocat/hello" ] || exit 1
         [ -n "\${STUB_DEFAULT:-}" ] || { echo "HTTP 502" >&2; exit 1; }
-        echo "\$STUB_DEFAULT" ;;
+        # Like real gh: the bare name only through --jq, JSON otherwise.
+        case " \$* " in
+            *" --jq .defaultBranchRef.name "*) echo "\$STUB_DEFAULT" ;;
+            *) echo "{\\"defaultBranchRef\\":{\\"name\\":\\"\$STUB_DEFAULT\\"}}" ;;
+        esac ;;
     "pr list") ;;
     "pr create") echo "https://github.com/octocat/hello/pull/7" ;;
 esac
@@ -103,6 +107,28 @@ pushed feature2 && bad "pushed although the default branch could not be resolved
     || ok "default branch unresolvable: push refused (fail closed)"
 grep -q "could not resolve" "$W/out" && ok "unresolvable: visible reason" \
     || bad "unresolvable: no visible reason ($(tr '\n' ' ' < "$W/out"))"
+
+# create_session_pr (LOKI_AUTO_PR=1) takes its branch from agent-writable
+# state and calls the shared push directly: the refusal must live there.
+csp_push() {  # <branch> <stub-default>: create_session_pr's exact push line
+    : > "$GHLOG"
+    ( cd "$A" && export STUB_DEFAULT="$2" && _loki_trusted_push _loki_with_github_tokens . "$1" ) > "$W/out" 2>&1
+}
+git -C "$A" branch trunk
+csp_push trunk trunk; rc=$?
+[ "$rc" -eq 2 ] && ! pushed trunk && ok "create_session_pr path: default branch trunk refused (rc=2)" \
+    || bad "create_session_pr path pushed default branch trunk (rc=$rc, $(tr '\n' ' ' < "$W/out"))"
+csp_push main main; rc=$?
+[ "$rc" -eq 2 ] && ! pushed main && ok "create_session_pr path: main refused (rc=2)" \
+    || bad "create_session_pr path pushed main (rc=$rc)"
+git -C "$A" branch feature3
+csp_push feature3 trunk; rc=$?
+[ "$rc" -eq 0 ] && pushed feature3 && ok "create_session_pr path: feature3 pushed" \
+    || bad "create_session_pr path: feature3 not pushed (rc=$rc, $(tr '\n' ' ' < "$W/out"))"
+git -C "$A" branch feature4
+csp_push feature4 ""; rc=$?
+[ "$rc" -eq 2 ] && ! pushed feature4 && ok "create_session_pr path: unresolvable default refused" \
+    || bad "create_session_pr path: pushed with unresolvable default (rc=$rc)"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
