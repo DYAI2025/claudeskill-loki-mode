@@ -9239,6 +9239,12 @@ setup_agent_branch() {
         log_warn "Left uncommitted from an earlier unfinished session, now treated as your files: $leftover"
     fi
     rm -f .loki/state/session-created.z 2>/dev/null
+    # BACKLOG 130(c): seal the now-empty session-created.z record so this
+    # fresh mint's OWN in-process memory of "absent" is what every later
+    # record call and commit_session_changes verify against for the rest of
+    # this run -- not the file's on-disk content, which an agent process could
+    # otherwise repopulate with a planted path before this run ever trusts it.
+    _loki_session_created_seal  # BACKLOG-130C-MINT-SEAL
     # BACKLOG 68 rework: a fresh mint starts with no tracked-since anchor and no
     # in-flight marker (never seed the anchor from session-start-sha -- an
     # anchor==start would let a later resume's "anchor..HEAD" diff include this
@@ -9294,6 +9300,40 @@ _loki_snapshot_or_fail_closed() {
 # over silently. Cleared whenever the files are deliberately removed (line
 # ~9165) so that path is never reported as tampering.
 _LOKI_SNAPSHOT_SEAL=""
+
+# BACKLOG 130(c): .loki/state/session-created.z is NOT one of the two files
+# _LOKI_SNAPSHOT_SEAL above covers. It records the paths THIS session created
+# (unioned after every provider turn by _loki_record_session_created), and
+# _loki_snapshot_preexisting's resume union (line ~9683) trusts its content
+# directly: any path it lists is EXCLUDED from the new preexisting-untracked.z
+# snapshot, i.e. treated as "the session's own, never the user's". An agent
+# that plants a user's file path into session-created.z therefore gets that
+# exact path permanently exempted from pre-existing-file protection on the
+# next resume -- the file is swept into `git add -A` and the session commit as
+# if the session had created it. A separate seal, sibling to
+# _LOKI_SNAPSHOT_SEAL, closes this WITHIN one process's lifetime: sealed right
+# after every legitimate write this process makes (a successful record, the
+# fresh-mint delete, and this process's first look at the file on resume),
+# verified before any LATER point in the SAME process trusts the content,
+# fail-closed (delete the file, clear the seal) on a mismatch. Kept SEPARATE
+# from _LOKI_SNAPSHOT_SEAL rather than folded into one combined digest: this
+# file legitimately changes every provider turn, so a shared digest would
+# falsely flag tampering on every normal turn, and the fresh-mint `rm` (line
+# ~9241) runs after preexisting-untracked.z is sealed, which would falsely
+# flag every fresh mint too.
+# ACCEPTED GAP (disclosure, not prevention, same bar as BACKLOG 70's own): a
+# seal lives only in this process's memory, so it cannot verify content a
+# PRIOR process wrote before this one starts (setup_agent_branch's resume path
+# seals its own first read of the file rather than verifying it, since no
+# prior seal survives to check against) -- tampering already on disk before
+# this process begins is trusted at that one read, same as
+# _LOKI_SNAPSHOT_SEAL's own resume-time trust of preexisting-untracked.z's
+# prior content. What this DOES close: an agent process co-located with THIS
+# run can no longer plant a path into session-created.z between this run's own
+# writes and its own later reads (the resume union's exclude use, the next
+# record's merge, or the commit-time gate) without it being caught before that
+# content is trusted.
+_LOKI_SESSION_CREATED_SEAL=""
 
 # BACKLOG 129 (follow-up to BACKLOG 70/BACKLOG 70-awk): the DIGEST computation
 # above is hardened (fixed-root-path-first, no awk), but until this function
@@ -9561,6 +9601,141 @@ for path in sys.argv[1:]:
         out.append("-")
 print(" ".join(out))' \
         ".loki/state/preexisting-untracked.z" ".loki/state/preexisting-untracked.sha.z" 2>/dev/null
+}
+
+# _loki_session_created_digest: sha256 of session-created.z alone ("-" for
+# absent, "?" for present-but-unreadable/unhashable, same sentinel contract as
+# _loki_snapshot_digest above). Deliberately a thin sibling, not a parameterized
+# reuse of _loki_snapshot_digest: that function's exact text (the `for path in
+# ...` line and the python fallback's trailing argv line) is matched by
+# tests/test-branch-lifecycle.sh's RED mutation harness, so leaving it
+# untouched keeps that harness's anchors valid. Resolved via the SAME hardened
+# tool resolvers (_loki_snapshot_hash_tool, _loki_snapshot_py_tool) as the
+# sibling above -- no fresh/unhardened python3 or shasum call site.
+_loki_session_created_digest() {
+    local tool
+    tool="$(_loki_snapshot_hash_tool)" || tool=""
+    local path=".loki/state/session-created.z"
+    if [ -n "$tool" ]; then
+        local h=""
+        if [ -f "$path" ]; then
+            case "${tool##*/}" in
+                shasum) h="$("$tool" -a 256 -- "$path" 2>/dev/null)" || h="" ;;
+                *)      h="$("$tool" -- "$path" 2>/dev/null)" || h="" ;;
+            esac
+            h="${h%% *}"
+            if [ "${#h}" -eq 64 ]; then
+                case "$h" in
+                    *[!0123456789abcdef]*) h="?" ;;
+                esac
+            else
+                h="?"
+            fi
+            printf '%s\n' "$h"
+        else
+            printf '%s\n' "-"
+        fi
+        return 0
+    fi
+    # Fallback: neither sha256sum nor shasum found anywhere (same rare-host
+    # case _loki_snapshot_digest's own fallback documents). Resolved via
+    # _loki_snapshot_py_tool, run with -I -S (see that function's comment for
+    # why -S, not just -I, is required to close the .pth vector).
+    local pytool=""
+    pytool="$(_loki_snapshot_py_tool)" || return 1
+    "$pytool" -I -S -c 'import sys, hashlib
+sys.path[:] = [p for p in sys.path if p not in ("", ".")]
+try:
+    with open(sys.argv[1], "rb") as fh:
+        print(hashlib.sha256(fh.read()).hexdigest())
+except OSError:
+    print("-")' \
+        "$path" 2>/dev/null
+}
+
+# _loki_session_created_seal: record this process's own memory of the current
+# session-created.z content, right after every point that legitimately changes
+# it (a successful union in _loki_record_session_created, the fresh-mint
+# delete, a resume, and the post-commit/no-op delete in
+# commit_session_changes). Same fail-closed shape as _loki_snapshot_seal: an
+# empty or "?" digest at seal time is itself suspicious (a legitimate write or
+# delete should never immediately be unreadable), so it is rejected rather
+# than sealed, which would let seal and a later verify silently agree on the
+# sentinel and disarm the guard for the rest of the session.
+_loki_session_created_seal() {
+    local d
+    d="$(_loki_session_created_digest)"
+    case "$d" in
+        ""|*'?'*)
+            # Fail closed, not just "untrusted": an empty seal makes
+            # _loki_session_created_verify's `[ -n "$_LOKI_SESSION_CREATED_SEAL" ]
+            # || return 0` skip every later check for the rest of this
+            # process's life. Leaving the file on disk here would fail OPEN --
+            # unreadable-but-present content would then be silently trusted by
+            # every later read site with no seal ever able to catch it. Delete
+            # it instead, matching _loki_session_created_verify's own
+            # fail-closed action on a real mismatch -- and, like that function's
+            # own re-seal after its delete, set the seal to the digest's real
+            # "absent" sentinel ("-"), not empty: an EMPTY seal here re-arms
+            # nothing (the guard above short-circuits as "never sealed" on
+            # every later check for the rest of this process), so an agent that
+            # recreates the file with a planted path in this window would get
+            # it silently merged in as trusted on the next successful record.
+            # "-" is a real, non-empty seal value that the next verify's live
+            # digest of a freshly-recreated file cannot match, keeping the
+            # guard armed against exactly that recreation.
+            rm -f .loki/state/session-created.z 2>/dev/null
+            _LOKI_SESSION_CREATED_SEAL="-"
+            log_warn "Could not seal the session-created record (hash tool failed or produced no readable digest); discarding it (its files are treated as yours, left uncommitted)"
+            audit_log "SESSION_CREATED_SEAL_FAILED" "_loki_session_created_digest returned empty or an unreadable-file sentinel at seal time"
+            ;;
+        *)
+            _LOKI_SESSION_CREATED_SEAL="$d"
+            ;;
+    esac
+}
+
+# _loki_session_created_verify: compare the live session-created.z digest
+# against the sealed one. No seal recorded (never sealed this process, or
+# deliberately cleared) is not tampering: returns success, does nothing --
+# EVERY caller that trusts session-created.z's content must therefore have
+# sealed it first (mint, resume, and after each successful record all do). A
+# seal that no longer matches IS tampering: logs and discloses it (same
+# DISCLOSURE bar as BACKLOG 70, not prevention against a same-UID process), and
+# fails closed by deleting the untrusted file outright -- its entries then
+# become "the user's, not recorded as this session's", the safe direction,
+# since a false claim of user ownership only leaves a file uncommitted on disk,
+# never deletes it, while a false claim of session ownership can get a user's
+# file swept into a commit and removed from disk on a later checkout of the
+# base. Called BEFORE any later point in the SAME process treats the file's
+# content as trustworthy (verify-before-trust, not verify-after-use):
+# _loki_record_session_created verifies at its very top, before its own
+# self-referential merge (base="$out"), and unconditionally -- not gated on
+# _LOKI_SNAPSHOT_THIS_RUN, since an interrupt/cleanup call can still fire after
+# that flag was cleared mid-session; commit_session_changes verifies at its
+# very top, before every one of its several early returns (the untrack
+# failure, the git 2.25 unstage failure, a secret-scan abort, a failed `git
+# commit`) that would otherwise skip its own rm -f cleanup and leave a
+# tampered file on disk for the next resume. _loki_resume_snapshot does NOT
+# call this function: it is this process's FIRST read of a file the PREVIOUS
+# (dead) process wrote, so there is no seal from that process to verify
+# against here; it instead calls _loki_session_created_seal directly to
+# establish THIS process's own baseline before anything (including
+# _loki_snapshot_preexisting's resume-union exclude use, right after) reads
+# the file. See the ACCEPTED GAP note at _LOKI_SESSION_CREATED_SEAL above.
+_loki_session_created_verify() {
+    local live="" path=".loki/state/session-created.z"
+    [ -n "$_LOKI_SESSION_CREATED_SEAL" ] || return 0
+    live="$(_loki_session_created_digest)"
+    if [ "$live" = "$_LOKI_SESSION_CREATED_SEAL" ]; then
+        return 0
+    fi
+    log_warn "session-created.z changed after this session recorded it (possible tampering by an agent process); discarding the record (its files are treated as yours, left uncommitted)"
+    audit_log "SESSION_CREATED_TAMPERED" "session-created.z changed after being sealed: live=$live,sealed=$_LOKI_SESSION_CREATED_SEAL"
+    rm -f "$path" 2>/dev/null
+    _LOKI_SESSION_CREATED_SEAL=""
+    _loki_session_created_seal
+    return 1
 }
 
 # _loki_snapshot_seal: record this process's own memory of what it just wrote.
@@ -9919,6 +10094,36 @@ _loki_advance_tracked_since_anchor() {
 # disk, not committed).
 _loki_record_session_created() {
     local snap=".loki/state/preexisting-untracked.z" out=".loki/state/session-created.z"
+    # BACKLOG 130(c): verify session-created.z BEFORE this run's THIS_RUN gate
+    # or its own merge trust the file -- verify-before-trust, not verify-after-
+    # use. Runs unconditionally (not gated on THIS_RUN=1): an interrupt/cleanup
+    # call can still fire after THIS_RUN was cleared mid-session (e.g. by
+    # _loki_snapshot_verify below on an earlier turn), and that call must not
+    # skip this check just because the gate below is about to return early. On
+    # a mismatch the file is already deleted by the time this returns (fail
+    # closed inside _loki_session_created_verify itself, not via this return
+    # value alone -- every call site of this function ignores its return with
+    # `|| true`, same as _loki_snapshot_verify above); the merge below then
+    # recomputes cleanly from a clean slate (base="$out" is now absent), so a
+    # legitimate record right after a caught tamper still records this turn's
+    # real files instead of hard-failing the whole call.
+    # ACCEPTED GAP (verify-to-use window, disclosed here since ordering is the
+    # whole point of this fix): this verify call and the merge's own read of
+    # "$out" as `base` (inside _loki_untracked_merge, below) are not atomic --
+    # _loki_advance_tracked_since_anchor, a git rev-parse, and a whole-repo
+    # `git status` all run in between. A same-UID write landing in that window
+    # is merged, then sealed as trusted by the seal call after a successful
+    # merge. This is the SAME shape of gap _LOKI_SNAPSHOT_SEAL's own
+    # verify/merge pair already accepts for preexisting-untracked.z (see
+    # _loki_untracked_merge's own BACKLOG 129 comment). Closing it would mean
+    # re-verifying again immediately before _loki_untracked_merge's read, inside
+    # that function -- deliberately not done here: _loki_untracked_merge's exact
+    # text is what tests/test-branch-lifecycle.sh's RED mutation harness matches
+    # by name-anchor, and threading a second, narrower verify through its
+    # shared codepath (also called with mode=exact for the OTHER snapshot) risks
+    # that anchor for a gap this narrow. Disclosure, not full prevention, is the
+    # same bar BACKLOG 70 itself accepts.
+    _loki_session_created_verify || true
     [ "${_LOKI_SNAPSHOT_THIS_RUN:-0}" = 1 ] || return 0
     # BACKLOG 70: detect tampering with the sealed snapshot as early as
     # possible (this runs after every provider turn, not just at commit time).
@@ -9932,6 +10137,11 @@ _loki_record_session_created() {
     if [ -f "$snap" ] && _loki_untracked_status "$out.status" \
        && _loki_untracked_merge "$out.status" "$out" "$snap" cover "$out"; then
         rm -f "$out.status"
+        # BACKLOG 130(c): seal this process's own memory of the record it just
+        # wrote, so the NEXT call to this function (or commit_session_changes)
+        # verifies against what THIS process actually wrote, not whatever an
+        # agent process may write to the file in between.
+        _loki_session_created_seal
         return 0
     fi
     rm -f "$out.status" "$out.tmp" 2>/dev/null
@@ -9943,6 +10153,19 @@ _loki_record_session_created() {
 # from an unfinished previous session (this session's commit includes them).
 _loki_resume_snapshot() {
     local carried=""
+    # BACKLOG 130(c): seal THIS process's own first look at session-created.z
+    # before anything below reads or trusts it (verify-before-trust). This is
+    # a resuming process picking up a file the PREVIOUS (now-dead) process
+    # wrote; there is no seal from that process to verify against here (a
+    # seal never survives past the process that set it) -- sealing now is what
+    # lets THIS process detect an agent tampering with the file for the rest
+    # of ITS OWN lifetime (every subsequent record call, and the commit-time
+    # check), the same disclosure bar BACKLOG 70 already accepts for the
+    # sibling snapshot: tampering already on disk before this process starts
+    # is an accepted gap, never silently trusted forever after. Unconditional
+    # (not gated on the union below succeeding): the union does not modify
+    # session-created.z, so this process's view of it is stable either way.
+    _loki_session_created_seal
     if ! _loki_snapshot_or_fail_closed union; then
         log_warn "Could not add your current untracked files to the pre-existing list; this session will commit nothing (review and commit manually)"
         return 0
@@ -10102,6 +10325,18 @@ commit_session_changes() {
     # left with committed work to inspect/PR. Clean no-op when nothing changed.
     command -v git >/dev/null 2>&1 || return 0
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    # BACKLOG 130(c): verify session-created.z BEFORE any of this function's
+    # several early returns below (the untrack failure, the git 2.25 unstage
+    # failure, the secret-scan abort, a failed `git commit`) -- every one of
+    # them skips the two rm -f .loki/state/session-created.z cleanup sites
+    # further down, so a tampered file left on disk by any of those paths
+    # would otherwise survive untouched into the next session's resume union.
+    # Placed at the very top, before even the branch-protection/PARALLEL_MODE/
+    # branch-name checks below, so no early return in this function can skip
+    # it. On a mismatch the file is deleted here already; nothing downstream
+    # needs its own check.
+    _loki_session_created_verify || true  # BACKLOG-130C-COMMIT-TOP-VERIFY
 
     # Only act when a session feature branch was set up. This preserves the
     # LOCK A1 opt-out contract (LOKI_BRANCH_PROTECTION=false -> no agent-branch.txt

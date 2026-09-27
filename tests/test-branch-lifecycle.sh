@@ -112,7 +112,7 @@ _extract_ok=true
 # name so a future move out of range fails loudly here instead of vacuously
 # (an out-of-range _commit_path_looks_secret would be command-not-found at
 # commit time, which the `if` silently treats as "not a secret").
-for fn in setup_agent_branch _loki_snapshot_preexisting _commit_scan_secret_file _commit_path_looks_secret commit_session_changes create_session_pr; do
+for fn in setup_agent_branch _loki_snapshot_preexisting _commit_scan_secret_file _commit_path_looks_secret commit_session_changes create_session_pr _loki_session_created_seal _loki_session_created_verify _loki_record_session_created _loki_resume_snapshot; do
     grep -q "^${fn}() {" "$BRANCH_LIB" || _extract_ok=false
 done
 if [ "$_extract_ok" = true ]; then
@@ -3073,6 +3073,604 @@ else
         pass "mutation detected: removing the push print line makes test 8(b) FAIL (non-vacuous)"
     fi
 fi
+
+# =============================================================================
+# BACKLOG 130(c): session-created.z was not covered by BACKLOG 70/129/130's
+# tamper-detection seal at all. _loki_snapshot_preexisting's resume union
+# (line ~9819) trusts session-created.z's content directly as the "exclude"
+# set for the new preexisting-untracked.z snapshot: any path listed there is
+# EXEMPTED from pre-existing-file protection on the next resume. An agent that
+# plants a user's file path into session-created.z between two provider-turn
+# record calls gets that exact path permanently exempted -- the resumed
+# session's `git add -A` then sweeps it into the session commit as if the
+# session itself had created it, and a later checkout of the base deletes it.
+#
+# Test T130c-turn1-tamper-detected: tampering right after the fresh-mint seal,
+# before the FIRST record call, is caught. This proves the mint-time seal
+# (added at BACKLOG 130(c)) is load-bearing on its own, not just the seal a
+# successful record call leaves behind.
+# =============================================================================
+echo "Test T130c-turn1-tamper-detected: session-created.z tampered before the first record call is caught"
+RT1="$(make_repo t130cturn1)"
+outt1="$(
+    cd "$RT1" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    # An agent process plants a path into session-created.z before this run's
+    # first record call ever runs (the file is empty-but-present right after
+    # mint; a real attacker would need to co-write to it in this window).
+    printf 'planted-by-attacker.txt\0' > .loki/state/session-created.z
+    printf 'a user file\n' > planted-by-attacker.txt
+    _loki_record_session_created >/dev/null 2>&1
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    # After detection the record is discarded and recomputed for real from
+    # `git status`: planted-by-attacker.txt is on disk (created above) and
+    # untracked, so it IS re-recorded -- correctly, as a genuinely untracked
+    # file this session's own turn now legitimately owns, not because the
+    # forged entry survived. The record can never be empty here: the recompute
+    # always re-derives from the real, current filesystem state.
+    record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+    printf 'TAMPERED=%s RECORD=[%s]' "$tampered" "$record"
+)"
+if [ "$outt1" = "TAMPERED=yes RECORD=[planted-by-attacker.txt|]" ]; then
+    pass "turn-1 tamper of session-created.z detected via SESSION_CREATED_TAMPERED (the record was recomputed from a clean slate, not left as the forged one)"
+else
+    fail "turn-1 tamper of session-created.z was not detected" "got: $outt1"
+fi
+
+# RED proof: strip ONLY the mint-time seal call (its own BACKLOG-130C-MINT-SEAL
+# marker) and confirm the SAME turn-1 tamper then goes UNDETECTED -- proving
+# the mint-time seal specifically (not just the record function's own
+# post-merge seal) is what makes this test pass, i.e. it is load-bearing on
+# its own for turn 1.
+RED_MINTSEAL_LIB="$WORKROOT/red-mintseal-lib.sh"
+sed '/_loki_session_created_seal  # BACKLOG-130C-MINT-SEAL$/d' \
+    "$BRANCH_LIB" > "$RED_MINTSEAL_LIB"
+red_mintseal_removed="$(grep -c 'BACKLOG-130C-MINT-SEAL' "$RED_MINTSEAL_LIB")"
+if [ "$red_mintseal_removed" != "0" ]; then
+    fail "RED mutation did not remove the mint-time seal call (sed pattern drift)" "remaining=$red_mintseal_removed"
+else
+    RT1R="$(make_repo t130cturn1red)"
+    outt1r="$(
+        cd "$RT1R" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { echo "AUDIT: $1 $2"; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_MINTSEAL_LIB"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'planted-by-attacker.txt\0' > .loki/state/session-created.z
+        printf 'a user file\n' > planted-by-attacker.txt
+        _loki_record_session_created 2>&1
+    )"
+    if printf '%s' "$outt1r" | grep -q 'SESSION_CREATED_TAMPERED'; then
+        fail "RED did not reproduce: turn-1 tamper was still detected without the mint-time seal" "got: $outt1r"
+    else
+        pass "RED confirmed: without the mint-time seal, the turn-1 tamper goes undetected (mint-time seal is load-bearing, non-vacuous)"
+    fi
+fi
+rm -f "$RED_MINTSEAL_LIB"
+
+# =============================================================================
+# Test T130c-interrupt-tamper-not-adopted: the headline repro. Session 1
+# creates helper.py (its own file) across two turns, same interrupt/resume
+# shape as T-interrupt-resume-commits-agent-files above, but BETWEEN the two
+# record calls an agent process plants a path, victim.txt, into
+# session-created.z BEFORE that path exists on disk. Session 1 is then
+# interrupted (no session commit, no further record). Between sessions the
+# USER creates victim.txt for real. Session 2 resumes.
+#
+# WHY THE VICTIM MUST BE A NEW PATH, NOT AN ALREADY-EXISTING ONE: an already
+# pre-existing file (present at mint time) is ALSO already an entry in the
+# prior preexisting-untracked.z snapshot's "base" set, which the resume union
+# keeps unconditionally regardless of session-created.z ("exclude" only
+# filters NEW untracked/ignored entries found by `git status`, never removes
+# an existing base entry -- see _loki_untracked_merge). So planting an
+# ALREADY-EXISTING file's path into session-created.z changes nothing: it was
+# already protected by base and stays protected either way, which would make
+# this test pass on unfixed code for the wrong reason (an earlier, flawed
+# repro attempt hit exactly this). The real victim is a path that is untracked
+# and NEW at resume time (not yet in the prior base) whose EXACT name the
+# attacker pre-plants -- this matches the "the resume union never adds a path
+# listed in session-created.z" comment at _loki_snapshot_preexisting literally.
+#
+# UNFIXED (RED) behavior: _loki_snapshot_preexisting's resume union treats the
+# planted victim.txt as "the session's own" (excluded from the new base), so
+# when the user's real victim.txt shows up as an untracked "??" status entry
+# at resume, the exclude check matches it and it is NEVER added to the new
+# preexisting-untracked.z -- not protected from `git add -A`, and IS committed
+# by session 2 as if the agent had created it. A checkout of the base then
+# deletes it from disk -- exactly the bug BACKLOG 130(c) describes.
+#
+# FIXED (GREEN) behavior: the tamper is caught at the very next record call
+# (verify-before-trust, before the merge that would otherwise persist it), the
+# file is discarded and recomputed, so on resume the union sees no forged
+# exclusion; victim.txt is correctly recognized as the user's file, stays OUT
+# of the session commit, and survives on disk with its content intact.
+# helper.py (session 1's real, legitimate file) is still correctly carried
+# over and committed by the resumed session -- the fix must not cause
+# legitimate session files to be lost as collateral damage.
+# =============================================================================
+echo "Test T130c-interrupt-tamper-not-adopted: a path planted into session-created.z before it exists is not adopted as the session's once the user creates it"
+RT2="$(make_repo t130cinterrupt)"
+outt2="$(
+    cd "$RT2" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    s1_head="$(git rev-parse HEAD)"
+    printf 'def greet():\n    return "hi"\n' > helper.py
+    _loki_record_session_created >/dev/null 2>&1
+    # Tamper: an agent process plants the EXACT path of a file that does not
+    # exist yet (the user has not made it) into session-created.z, in between
+    # two legitimate record calls.
+    printf 'victim.txt\0' >> .loki/state/session-created.z
+    _loki_record_session_created >/dev/null 2>&1
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+    plantedgone="$( printf '%s' "$record" | grep -qF 'victim.txt' && echo no || echo yes )"
+    helperkept="$( printf '%s' "$record" | grep -qF 'helper.py' && echo yes || echo no )"
+    nocommit="$( [ "$(git rev-parse HEAD)" = "$s1_head" ] && echo yes || echo no )"
+    # Session 1 interrupted here: no commit_session_changes call (matches the
+    # real interrupt/pod-loss shape -- see T-interrupt-resume-commits-agent-files
+    # above). Between sessions the user creates the real victim.txt.
+    printf 'mine, between sessions\n' > victim.txt
+    # Session 2 resumes.
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
+    printf 'import helper\nprint(helper.greet())\n' > app.py
+    commit_session_changes >/dev/null 2>&1
+    tree="$(git ls-tree -r --name-only HEAD | tr '\n' ' ')"
+    git checkout -q develop
+    intact="$( [ "$(cat victim.txt 2>/dev/null)" = 'mine, between sessions' ] && echo yes || echo no )"
+    printf 'TAMPERED=%s PLANTEDGONE=%s HELPERKEPT=%s NOCOMMIT=%s TREE=[%s] INTACT=%s' \
+        "$tampered" "$plantedgone" "$helperkept" "$nocommit" "$tree" "$intact"
+)"
+if printf '%s' "$outt2" | grep -q "TREE=\[.gitignore app.py helper.py seed.txt \]" \
+   && printf '%s' "$outt2" | grep -q "TAMPERED=yes" \
+   && printf '%s' "$outt2" | grep -q "PLANTEDGONE=yes" \
+   && printf '%s' "$outt2" | grep -q "HELPERKEPT=yes" \
+   && printf '%s' "$outt2" | grep -q "NOCOMMIT=yes" \
+   && printf '%s' "$outt2" | grep -q "INTACT=yes"; then
+    pass "planted victim.txt not adopted as the session's once created; helper.py (real session file) still committed; victim.txt survives on disk with its content, never committed"
+else
+    fail "a planted path in session-created.z was adopted as the session's once the user created it (or legitimate session work was lost)" "got: $outt2"
+fi
+
+# RED proof: on a copy of BRANCH_LIB with the session-created verify/seal calls
+# stripped (by their own BACKLOG 130(c) trailing marker), the SAME tamper is
+# NOT caught, and victim.txt IS swept into the session 2 commit -- proving the
+# GREEN assertion above is non-vacuous and actually depends on the fix, not on
+# some other guard incidentally blocking the same outcome.
+RED_SESSCREATED_LIB="$WORKROOT/red-sesscreated-lib.sh"
+sed -e '/_loki_session_created_verify || true$/d' \
+    -e '/^[[:space:]]*_loki_session_created_seal$/d' \
+    "$BRANCH_LIB" > "$RED_SESSCREATED_LIB"
+red_sesscreated_removed="$(grep -c '_loki_session_created_verify || true$\|^[[:space:]]*_loki_session_created_seal$' "$RED_SESSCREATED_LIB")"
+if [ "$red_sesscreated_removed" != "0" ]; then
+    fail "RED mutation did not remove the session-created verify/seal calls (sed pattern drift)" "remaining=$red_sesscreated_removed"
+else
+    RT2R="$(make_repo t130cinterruptred)"
+    outt2r="$(
+        cd "$RT2R" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { return 0; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_SESSCREATED_LIB"
+        SCRIPT_DIR="$PROJECT_DIR/autonomy"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'def greet():\n    return "hi"\n' > helper.py
+        _loki_record_session_created >/dev/null 2>&1
+        printf 'victim.txt\0' >> .loki/state/session-created.z
+        _loki_record_session_created >/dev/null 2>&1
+        printf 'mine, between sessions\n' > victim.txt
+        setup_agent_branch >/dev/null 2>&1
+        printf 'import helper\nprint(helper.greet())\n' > app.py
+        commit_session_changes >/dev/null 2>&1
+        inhead="$(git ls-tree -r --name-only HEAD | grep -q '^victim.txt$' && echo yes || echo no)"
+        printf 'INHEAD=%s' "$inhead"
+    )"
+    if [ "$outt2r" = "INHEAD=yes" ]; then
+        pass "RED confirmed: without the fix, the planted victim.txt IS swept into the session commit once created (mutation is non-vacuous)"
+    else
+        fail "RED did not reproduce the pre-fix silent-adoption bug (mutation may be masked by something else)" "got: $outt2r"
+    fi
+fi
+rm -f "$RED_SESSCREATED_LIB"
+
+# =============================================================================
+# Test T130c-commit-checkpoint-early-return: commit_session_changes must
+# verify session-created.z BEFORE any of its early returns (the secret-scan
+# abort in particular), since that return skips the function's own rm -f
+# session-created.z cleanup -- a tampered file left there would otherwise
+# survive untouched into the NEXT resume. Reuses T-uri-credential's ACTUAL
+# aborting fixture (a postgres:// URI credential in dbconf.json -- an innocuous
+# filename the path heuristic does not catch, caught instead by the URI-cred
+# content pattern): a plain *.env file, tried first here, does NOT reach the
+# scan loop at all (it is excluded by commit_session_changes's own `git add -A
+# ... ':!*.env'` pathspec before staging), so it never exercises the abort path
+# this test needs -- confirmed empirically before switching fixtures.
+#
+# The victim path (victim2.txt) is created AFTER setup_agent_branch (mint), not
+# before: an already pre-existing file is already protected by the prior
+# preexisting-untracked.z snapshot's base set regardless of session-created.z,
+# the same base-overlap flaw the headline T130c-interrupt-tamper-not-adopted
+# test above had to correct for. Session 2 then resumes and must not adopt the
+# planted, later-created victim2.txt as its own.
+#
+# ACCEPTED TRADE-OFF, disclosed here rather than asserted around: deleting the
+# tampered session-created.z on this path also loses helper.py's own
+# legitimate claim (it was never re-recorded, since the abort happens inside
+# commit_session_changes, not _loki_record_session_created, so no merge runs
+# to re-derive it). helper.py is then the documented fallback outcome
+# _loki_record_session_created's own comment already names ("a failure...
+# loses paths...treated as the user's: kept on disk, not committed") -- it is
+# NOT deleted, NOT committed, and its absence from the committed tree is the
+# safe direction (silent adoption of a possibly-forged claim is the actual bug
+# this fix exists to close; losing an honest claim to the same fail-closed
+# reaction is the accepted cost). Session 1 would need one more
+# _loki_record_session_created call after clearing the secret to re-establish
+# helper.py, same as any other real interrupt.
+# =============================================================================
+echo "Test T130c-commit-checkpoint-early-return: session-created.z tamper caught even when commit_session_changes aborts early (secret scan)"
+RT3="$(make_repo t130ccommitabort)"
+outt3="$(
+    cd "$RT3" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    s1_head="$(git rev-parse HEAD)"
+    printf 'def greet():\n    return "hi"\n' > helper.py
+    _loki_record_session_created >/dev/null 2>&1
+    # Tamper right before the commit attempt (models a co-located agent
+    # process writing in the window between the last record and cleanup).
+    printf 'victim2.txt\0' >> .loki/state/session-created.z
+    # A real URI credential (innocuous filename) forces commit_session_changes
+    # down its early-return secret-abort path (git_commit_aborted), which
+    # historically skipped the rm -f cleanup.
+    printf 'DATABASE_URL=postgres://admin:S3cretP4ssw0rd@db.internal:5432/app\n' > dbconf.json
+    # commit_session_changes runs in THIS shell (redirected to a file, not
+    # captured via a command substitution): a command substitution forks a
+    # subshell whose AUDIT_CAPTURE/_LOKI_SESSION_CREATED_SEAL changes never
+    # reach back here (see the T-interrupt-resume-commits-agent-files comment
+    # above for the same trap with _LOKI_SNAPSHOT_SEAL).
+    commit_session_changes > .loki/state/.test-commit-log 2>&1
+    msg="$(cat .loki/state/.test-commit-log 2>/dev/null)"
+    rm -f .loki/state/.test-commit-log
+    aborted="$(printf '%s' "$msg" | grep -qi 'possible secret' && echo yes || echo no)"
+    nocommit="$( [ "$(git rev-parse HEAD)" = "$s1_head" ] && echo yes || echo no )"
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    stillpresent="$( [ -e .loki/state/session-created.z ] && echo yes || echo no )"
+    # Between the aborted session-1 attempt and the session-2 resume, the user
+    # creates the real victim2.txt (the exact path the attacker pre-planted).
+    printf 'mine, between sessions\n' > victim2.txt
+    setup_agent_branch >/dev/null 2>&1
+    rm -f dbconf.json
+    printf 'import helper\nprint(helper.greet())\n' > app.py
+    commit_session_changes >/dev/null 2>&1
+    tree="$(git ls-tree -r --name-only HEAD | tr '\n' ' ')"
+    helperondisk="$( [ "$(cat helper.py 2>/dev/null)" = 'def greet():
+    return "hi"' ] && echo yes || echo no )"
+    git checkout -q develop
+    intact="$( [ "$(cat victim2.txt 2>/dev/null)" = 'mine, between sessions' ] && echo yes || echo no )"
+    printf 'ABORTED=%s NOCOMMIT=%s TAMPERED=%s STILLPRESENT=%s TREE=[%s] HELPERONDISK=%s INTACT=%s' \
+        "$aborted" "$nocommit" "$tampered" "$stillpresent" "$tree" "$helperondisk" "$intact"
+)"
+# helper.py is NOT expected in TREE here: deleting the tampered
+# session-created.z on this path also discards helper.py's own un-reasserted
+# claim (see the ACCEPTED TRADE-OFF comment above) -- it is left on disk,
+# uncommitted, the same safe fallback _loki_record_session_created's own
+# comment documents for any lost record, never silently adopted OR deleted.
+if printf '%s' "$outt3" | grep -q "ABORTED=yes" \
+   && printf '%s' "$outt3" | grep -q "NOCOMMIT=yes" \
+   && printf '%s' "$outt3" | grep -q "TAMPERED=yes" \
+   && printf '%s' "$outt3" | grep -q "STILLPRESENT=no" \
+   && printf '%s' "$outt3" | grep -q "TREE=\[.gitignore app.py seed.txt \]" \
+   && printf '%s' "$outt3" | grep -q "HELPERONDISK=yes" \
+   && printf '%s' "$outt3" | grep -q "INTACT=yes"; then
+    pass "commit_session_changes catches session-created.z tampering even on its secret-abort early return (confirmed aborted, no commit), discards the file (helper.py's lost claim kept safely on disk, not adopted), and the planted victim2.txt is never adopted once created"
+else
+    fail "commit_session_changes did not catch tampering before an early return, or the abort did not actually happen, or the planted path was later adopted" "got: $outt3"
+fi
+
+# RED proof: strip ONLY the commit-function's top-of-function verify (its own
+# BACKLOG-130C-COMMIT-TOP-VERIFY marker, distinct from the record function's
+# verify line above, so this proves TOP PLACEMENT specifically -- a verify
+# placed later, just before the rm -f cleanup, would also show TAMPERED=yes
+# without ever reaching this code path since it would come after the abort's
+# early return). Reuses the record-path verify/seal (unchanged here), so the
+# planted victim2.txt is only exposed to the commit-time gate.
+RED_COMMITTOP_LIB="$WORKROOT/red-committop-lib.sh"
+sed '/_loki_session_created_verify || true  # BACKLOG-130C-COMMIT-TOP-VERIFY$/d' \
+    "$BRANCH_LIB" > "$RED_COMMITTOP_LIB"
+red_committop_removed="$(grep -c 'BACKLOG-130C-COMMIT-TOP-VERIFY' "$RED_COMMITTOP_LIB")"
+if [ "$red_committop_removed" != "0" ]; then
+    fail "RED mutation did not remove the commit-top verify call (sed pattern drift)" "remaining=$red_committop_removed"
+else
+    RT3R="$(make_repo t130ccommitabortred)"
+    outt3r="$(
+        cd "$RT3R" || exit 1
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { return 0; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_COMMITTOP_LIB"
+        SCRIPT_DIR="$PROJECT_DIR/autonomy"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'def greet():\n    return "hi"\n' > helper.py
+        _loki_record_session_created >/dev/null 2>&1
+        printf 'victim2.txt\0' >> .loki/state/session-created.z
+        printf 'DATABASE_URL=postgres://admin:S3cretP4ssw0rd@db.internal:5432/app\n' > dbconf.json
+        commit_session_changes >/dev/null 2>&1
+        stillpresent="$( [ -e .loki/state/session-created.z ] && echo yes || echo no )"
+        printf 'mine, between sessions\n' > victim2.txt
+        setup_agent_branch >/dev/null 2>&1
+        rm -f dbconf.json
+        printf 'import helper\nprint(helper.greet())\n' > app.py
+        commit_session_changes >/dev/null 2>&1
+        inhead="$(git ls-tree -r --name-only HEAD | grep -q '^victim2.txt$' && echo yes || echo no)"
+        printf 'STILLPRESENT=%s INHEAD=%s' "$stillpresent" "$inhead"
+    )"
+    if [ "$outt3r" = "STILLPRESENT=yes INHEAD=yes" ]; then
+        pass "RED confirmed: without the commit-top verify, the tampered file survives the abort and the planted victim2.txt IS swept into the next session commit (mutation is non-vacuous)"
+    else
+        fail "RED did not reproduce the pre-fix behavior for a missing commit-top verify" "got: $outt3r"
+    fi
+fi
+rm -f "$RED_COMMITTOP_LIB"
+
+# =============================================================================
+# Test T130c-positive-control: an UNTAMPERED multi-turn interrupt/resume run
+# logs no SESSION_CREATED_TAMPERED/SEAL_FAILED event and still commits the
+# session's own files normally -- proving the new seal/verify machinery does
+# not false-positive on ordinary, honest use.
+# =============================================================================
+echo "Test T130c-positive-control: untampered session-created.z lifecycle logs no tamper event"
+RT4="$(make_repo t130cpositive)"
+outt4="$(
+    cd "$RT4" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=2
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'def greet():\n    return "hi"\n' > helper.py
+    _loki_record_session_created >/dev/null 2>&1
+    printf 'import helper\nassert helper.greet() == "hi"\n' > test_helper.py
+    _loki_record_session_created >/dev/null 2>&1
+    commit_session_changes >/dev/null 2>&1
+    notamper="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED\|SESSION_CREATED_SEAL_FAILED' && echo no || echo yes)"
+    committed="$(git show --stat HEAD --name-only --format= 2>/dev/null | tr '\n' ' ')"
+    printf 'NOTAMPER=%s COMMITTED=[%s]' "$notamper" "$committed"
+)"
+if printf '%s' "$outt4" | grep -q "NOTAMPER=yes" \
+   && printf '%s' "$outt4" | grep -qE '(^|[[ ])helper\.py([] ]|$)' \
+   && printf '%s' "$outt4" | grep -q "test_helper.py"; then
+    pass "untampered lifecycle: no SESSION_CREATED_TAMPERED/SEAL_FAILED event, session files committed normally"
+else
+    fail "positive control false-flagged tampering, or failed to commit legitimate session files" "got: $outt4"
+fi
+
+# =============================================================================
+# Test T130c-seal-failure-then-recreate: rework of the 1/2 CONCERN on this
+# slice. A hash-tool failure at seal time (empty/"?" digest) took the
+# fail-closed branch in _loki_session_created_seal, which deleted the file
+# but set _LOKI_SESSION_CREATED_SEAL="" -- an EMPTY string, not the digest
+# function's own "-" (absent) sentinel. _loki_session_created_verify's very
+# first line is `[ -n "$_LOKI_SESSION_CREATED_SEAL" ] || return 0`, so an
+# empty seal makes every LATER verify call in this same process silently
+# treat the file as "never sealed" and skip the tamper check entirely --
+# not merely "unsealed", but permanently disarmed for the rest of the
+# process's life. If an agent process recreates session-created.z with a
+# planted path in that window, the next successful record call's merge (base
+# = the recreated file's content) trusts it outright, and the post-merge
+# _loki_session_created_seal call re-seals normally (real content exists
+# now), laundering the planted path into a trusted seal with no
+# SESSION_CREATED_TAMPERED ever logged.
+#
+# Contrast: _loki_session_created_verify's OWN mismatch branch (a few lines
+# above the seal function) already gets this right -- it clears the seal,
+# deletes the file, then calls _loki_session_created_seal AGAIN immediately,
+# which re-digests the now-absent file and correctly seals the real "-"
+# sentinel, keeping the guard armed. The seal function's OWN failure branch
+# did not follow that same pattern; the fix makes it set "-" directly
+# instead of "", matching the digest's documented absent-file output (see
+# _loki_session_created_digest above: "-" for absent, printed by both the
+# hash-tool and python-fallback paths).
+#
+# WHY THE FILE MUST BE RECREATED, NOT APPENDED TO: the seal-failure branch's
+# own rm -f already deleted it. Appending to a surviving file is not the
+# threat model here -- the reviewer specifically required recreation after a
+# genuine seal failure, since that is the actual window this bug opens.
+# =============================================================================
+echo "Test T130c-seal-failure-then-recreate: a hash-tool failure at seal time still leaves the guard armed against a recreated, planted file"
+RT5="$(make_repo t130csealfail)"
+outt5="$(
+    cd "$RT5" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'def greet():\n    return "hi"\n' > helper.py
+    _loki_record_session_created >/dev/null 2>&1
+
+    # Simulate a hash-tool failure on the NEXT seal call only: stub
+    # _loki_session_created_digest to return empty, matching how a real
+    # sha256sum/shasum/python3 failure surfaces to this function (see the
+    # digest function documented above: absent or unhashable sentinel
+    # contract). Call _loki_session_created_seal directly -- this targets
+    # exactly the function under test, not the unrelated verify call that
+    # _loki_record_session_created runs first.
+    eval "$(declare -f _loki_session_created_digest | sed '1s/_loki_session_created_digest/_loki_session_created_digest_real/')"
+    _loki_session_created_digest() { printf ''; }
+    _loki_session_created_seal >/dev/null 2>&1
+    unset -f _loki_session_created_digest
+    eval "$(declare -f _loki_session_created_digest_real | sed '1s/_loki_session_created_digest_real/_loki_session_created_digest/')"
+
+    sealfailed="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_SEAL_FAILED' && echo yes || echo no)"
+    sealval="[${_LOKI_SESSION_CREATED_SEAL}]"
+    filegone="$( [ -e .loki/state/session-created.z ] && echo no || echo yes )"
+
+    # Attacker window: recreate the file from scratch (the seal-failure
+    # branch above just removed it via rm -f) with a planted path, victim.txt,
+    # that does NOT exist on disk yet -- same reason as the headline
+    # T130c-interrupt-tamper-not-adopted test above: a path already on disk
+    # would ALSO already be a "??" entry `git status` reports on its own, so
+    # the record would look identical whether the guard caught the tamper or
+    # not, and this test would pass on unfixed code for the wrong reason.
+    printf 'victim.txt\0' > .loki/state/session-created.z
+
+    _loki_record_session_created >/dev/null 2>&1
+
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+    printf 'SEALFAILED=%s SEALVAL=%s FILEGONE=%s TAMPERED=%s RECORD=[%s]' \
+        "$sealfailed" "$sealval" "$filegone" "$tampered" "$record"
+)"
+if [ "$outt5" = "SEALFAILED=yes SEALVAL=[-] FILEGONE=yes TAMPERED=yes RECORD=[helper.py|]" ]; then
+    pass "seal failure seals the digest's real absent sentinel ('-'), keeping the guard armed: a recreated file planting victim.txt is caught as SESSION_CREATED_TAMPERED and the record is recomputed clean ([helper.py], not laundering victim.txt)"
+else
+    fail "seal failure did not leave the guard armed against a recreated, planted file" "got: $outt5"
+fi
+
+# RED proof: revert ONLY the seal-failure branch's sentinel back to the empty
+# string (the exact pre-rework bug) and confirm the SAME scenario silently
+# LAUNDERS victim.txt into the trusted record instead of catching it --
+# proving the GREEN assertion above is non-vacuous. Asserted positively (the
+# stub actually fired AND victim.txt IS in the record AND no TAMPERED line),
+# not just "no TAMPERED substring found": a grep-absence-only check would
+# pass just as easily if this subshell died early for an unrelated reason
+# (a source error, the eval/declare-f stub failing, setup_agent_branch
+# erroring) and printed nothing at all. The literal
+# `_LOKI_SESSION_CREATED_SEAL="-"` (double-quoted hyphen) occurs exactly once
+# in the whole extracted lib -- the seal-failure branch this fix touches --
+# so a plain single-line sed (portable across GNU and BSD sed, unlike a
+# multi-line N/{...} block) targets it precisely without touching the two
+# pre-existing, intentionally-unchanged `_LOKI_SESSION_CREATED_SEAL=""` sites
+# (the global init and the verify-mismatch branch's own re-seal-to-"-" call
+# right after, which is a separate statement this sed does not match).
+RED_SEALFAIL_LIB="$WORKROOT/red-sealfail-lib.sh"
+sed 's/_LOKI_SESSION_CREATED_SEAL="-"$/_LOKI_SESSION_CREATED_SEAL=""/' \
+    "$BRANCH_LIB" > "$RED_SEALFAIL_LIB"
+red_sealfail_reverted="$(grep -c '_LOKI_SESSION_CREATED_SEAL=""$' "$RED_SEALFAIL_LIB")"
+red_sealfail_remaining="$(grep -c '_LOKI_SESSION_CREATED_SEAL="-"$' "$RED_SEALFAIL_LIB")"
+# The extracted lib has exactly 2 pre-existing _LOKI_SESSION_CREATED_SEAL=""
+# lines (the global init and the verify-mismatch branch, both intentionally
+# unchanged by this fix); a correct revert of ONLY the seal-failure branch's
+# "-" brings the "" count from 2 to 3 and leaves zero "-" occurrences.
+if [ "$red_sealfail_reverted" != "3" ] || [ "$red_sealfail_remaining" != "0" ]; then
+    fail "RED mutation did not revert exactly the seal-failure branch's sentinel (sed pattern drift)" "empty-count=$red_sealfail_reverted dash-count=$red_sealfail_remaining"
+else
+    RT5R="$(make_repo t130csealfailred)"
+    outt5r="$(
+        cd "$RT5R" || exit 1
+        AUDIT_CAPTURE=""
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_SEALFAIL_LIB"
+        SCRIPT_DIR="$PROJECT_DIR/autonomy"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'def greet():\n    return "hi"\n' > helper.py
+        _loki_record_session_created >/dev/null 2>&1
+        eval "$(declare -f _loki_session_created_digest | sed '1s/_loki_session_created_digest/_loki_session_created_digest_real/')"
+        _loki_session_created_digest() { printf ''; }
+        _loki_session_created_seal >/dev/null 2>&1
+        unset -f _loki_session_created_digest
+        eval "$(declare -f _loki_session_created_digest_real | sed '1s/_loki_session_created_digest_real/_loki_session_created_digest/')"
+        sealfailedr="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_SEAL_FAILED' && echo yes || echo no)"
+        printf 'victim.txt\0' > .loki/state/session-created.z
+        _loki_record_session_created >/dev/null 2>&1
+        tamperedr="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+        recordr="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+        printf 'SEALFAILEDR=%s TAMPEREDR=%s RECORDR=[%s]' "$sealfailedr" "$tamperedr" "$recordr"
+    )"
+    if [ "$outt5r" = "SEALFAILEDR=yes TAMPEREDR=no RECORDR=[helper.py|victim.txt|]" ]; then
+        pass "RED confirmed: reverting the seal-failure sentinel to '' proves the stub fired (SEAL_FAILED logged) yet the recreated victim.txt is silently laundered into the trusted record with no TAMPERED ever logged (T130c-seal-failure-then-recreate is non-vacuous)"
+    else
+        fail "RED did not reproduce the pre-fix silent-laundering behavior" "got: $outt5r"
+    fi
+fi
+rm -f "$RED_SEALFAIL_LIB"
 
 echo ""
 echo "============================================"
