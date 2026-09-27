@@ -1003,6 +1003,31 @@ THIS_ARR = re.compile(r'\bthis\.([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\
 # (`+=`); `=(?![=>])` excludes `==`, `===` and `=>` the same as DECL_ARR.
 REASSIGN_ARR = re.compile(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*\[')
 DECL_KEYWORD = re.compile(r'\b(?:const|let|var)\s*$')
+# BACKLOG 125 B-2 (S-28): a default value on a destructured binding (`const {
+# rows = [rows] } = data;`) or a function parameter (`function load(rows =
+# [rows]) {}`) is neither DECL_ARR's declaration site nor a bare reassignment,
+# so it reached no arm at all when the name never flows to a setter -- the
+# shape in both board examples, which have no body at all. Unconditional, like
+# FALLBACK_ARR: gated only by add_rows/literal_rows, no flow check, since a
+# default value never needs to reach a sink to already be fabricated content.
+# Matches name = [ right after the opener of a destructuring/parameter list:
+# {, ( or ,. is_block_open below rejects the one shape that is genuinely
+# ambiguous: `{` also opens a code BLOCK (`if (...) { rows = [x]; }`), and
+# that reassignment must keep REASSIGN_ARR's own message, not this one's --
+# decided by the last non-whitespace token before the `{`: ')' or '>' (from
+# `=>`) means a block, anything else (const/let/var, '(', ',', start of file)
+# means a pattern. Placed ahead of REASSIGN_ARR below so add_rows' span-dedupe
+# lets this arm's message win when a default also happens to flow to a setter
+# (S-27's own board note on this exact overlap).
+DEFAULT_ARR = re.compile(r'[{(,]\s*([A-Za-z_$][\w$]*)\s*=(?![=>])\s*\[')
+def is_block_open(s, i):
+    """s[i] is '{'; True when the last non-whitespace token before it is ')'
+    or '>' (from '=>'), the two ways a code block opens rather than a
+    destructuring pattern."""
+    j = i - 1
+    while j >= 0 and s[j].isspace():
+        j -= 1
+    return j >= 0 and s[j] in ')>'
 FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?'
                        r'{name}\s*[,)]|\bthis\.\w+\s*=\s*{name}\b')
 # Rule 6, function-return extension (BACKLOG 125 B-7): `function getRows(d){
@@ -1830,6 +1855,11 @@ def whole_file_findings(s):
             colon_name = resolves_to_table_read(colon_branch_strip[:expr_end(colon_branch_strip)].strip())
             if colon_name and not resolved_is_literal(q_branch, colon_name):
                 flag_table_fallback(colon_name, cstart)
+    for m in DEFAULT_ARR.finditer(s):
+        opener_i = m.start()
+        if s[opener_i] == '{' and is_block_open(s, opener_i):
+            continue  # a code block's `{ name = [...] }`, not a destructuring default
+        add_rows(m.end() - 1, 'literal sample rows as a default value for ' + m.group(1))
     for m in THIS_ARR.finditer(s):
         add_rows(m.end() - 1, 'literal sample rows assigned to this.' + m.group(1))
     for m in REASSIGN_ARR.finditer(s):
@@ -2451,6 +2481,45 @@ TSX
 export function RH({ data, res }) {
   let rows = data;
   if (!rows.length) rows = [{ id: res.id, action: res.action }];
+  setRows(rows);
+  return null;
+}
+TSX
+    # BACKLOG 125 B-2 (S-28): a default value on a destructured binding or a
+    # function parameter is neither DECL_ARR's declaration site nor a bare
+    # reassignment, so it reached no arm at all -- exactly the board's own
+    # example shapes, neither of which flows anywhere (no body at all). Its own
+    # fixture and assertion block sit below, kept out of the shared want/count
+    # lists other slices are editing concurrently in this same function.
+    cat > "$d/src/components/DefaultValueFabricated.tsx" <<'TSX'
+export function AT({ activities = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }] }) {
+  return <b>{activities.length}</b>;
+}
+export function load(rows = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }]) {
+  return rows.length;
+}
+TSX
+    # Negative control: an empty-array default and a default built from a
+    # variable (not a typed-in literal) must not fire -- proves the arm gates
+    # on content via literal_rows(), not merely on the destructuring/parameter
+    # `name = [` shape.
+    cat > "$d/src/components/DefaultValueHonest.tsx" <<'TSX'
+export function AH({ activities = [] }) {
+  return <b>{activities.length}</b>;
+}
+export function loadH(rows = [{ id: res.id }]) {
+  return rows.length;
+}
+TSX
+    # Regression probe: a bare reassignment INSIDE a braced block
+    # (`if (...) { rows = [...] }`) must keep REASSIGN_ARR's own "reassigned"
+    # message, not this arm's "default value" one -- the one shape where a
+    # destructuring pattern's `{` and a code block's `{` look identical up to
+    # the name = [ text; is_block_open is what tells them apart.
+    cat > "$d/src/components/BlockReassignProbe.tsx" <<'TSX'
+export function BP({ data }) {
+  let rows = data;
+  if (!rows.length) { rows = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }]; }
   setRows(rows);
   return null;
 }
@@ -3640,6 +3709,26 @@ EOF
     grep -q "^FINDING [a-z/]*ArrayFromGenFabricated.tsx:2 fabricated static fields via Array.from() generator callback" <<<"$out" \
         || { echo "missed ArrayFromGenFabricated.tsx:2 fabricated static fields via Array.from() generator callback: $(grep '^FINDING.*ArrayFromGenFabricated' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
     for want in ArrayFromGenFabricated.tsx:1 ArrayFromGenHonest.tsx:0; do
+        f="${want%%:*}"
+        got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
+        [ "$got" = "${want##*:}" ] \
+            || { echo "$f has $got finding(s), want ${want##*:}: $(grep "^FINDING.*$f:" <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    done
+    # BACKLOG 125 B-2 (S-28) own check, kept separate from the shared loops
+    # above to stay additive against concurrent slices editing this same
+    # function. Two lines of DefaultValueFabricated.tsx must each be flagged
+    # with the new "default value" message (never DECL_ARR's or REASSIGN_ARR's
+    # wording, since neither arm can see a destructuring/parameter default);
+    # DefaultValueHonest.tsx must be clean; BlockReassignProbe.tsx must keep
+    # REASSIGN_ARR's own "reassigned" message, proving this new arm does not
+    # cannibalize the shape it was placed ahead of.
+    grep -q "^FINDING [a-z/]*DefaultValueFabricated.tsx:1 literal sample rows as a default value for activities" <<<"$out" \
+        || { echo "missed DefaultValueFabricated.tsx:1 default value for activities: $(grep '^FINDING.*DefaultValueFabricated' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    grep -q "^FINDING [a-z/]*DefaultValueFabricated.tsx:4 literal sample rows as a default value for rows" <<<"$out" \
+        || { echo "missed DefaultValueFabricated.tsx:4 default value for rows: $(grep '^FINDING.*DefaultValueFabricated' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    grep -q "^FINDING [a-z/]*BlockReassignProbe.tsx:3 literal sample rows reassigned to rows" <<<"$out" \
+        || { echo "missed BlockReassignProbe.tsx:3 reassigned to rows: $(grep '^FINDING.*BlockReassignProbe' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    for want in DefaultValueFabricated.tsx:2 DefaultValueHonest.tsx:0 BlockReassignProbe.tsx:1; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
