@@ -5,6 +5,25 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.55.0
+
+**Two more sessions could be silently killed by kill-by-name/PATH-lookup bugs; both are now fixed.** Extending the class of bug fixed in v9.54.1 (an unscoped `pkill -f`), this release closes two more real code-execution/process-isolation issues found in a repo-wide sweep, plus several trust-core correctness fixes.
+
+**Security fixes:**
+- An agent's own repository could get its own Python code imported into, or in one case EXECUTED by, the completion council's privileged environment when a `PROJECT_DIR` environment variable was unset: `council_augment_from_managed_memory` (read-only import) and `council_should_stop`'s shadow-write step (real code execution, the more severe of the two) both fell back to the agent's own working directory instead of failing closed. Both now fail closed (no-op) when `PROJECT_DIR` is unset; production is unaffected since the CLI always sets it.
+- The tamper-detection seal introduced for the pre-existing-file snapshot (below) was itself found forgeable across two review rounds: first via a malicious `.pth` file in user-writable Python site-packages, then via a fake `awk` binary placed earlier on `PATH`. Both are now closed; the digest computation uses only fixed-path system tools and pure shell string handling, with no interpreter or PATH-resolved helper program in the loop.
+- The pre-existing-file snapshot state (used to keep the agent's commits from sweeping in the user's own untracked files) lived entirely in agent-writable state with no tamper detection. It now seals a digest in the running process's own memory and refuses to commit anything if that state changes underneath it after being sealed.
+- A resume across sessions could either falsely accuse the agent of committing a file the user tracked themselves between sessions, or (in a since-caught regression during the same fix) silently let an agent's own commit of a pre-existing file through with no disclosure. Both are now handled correctly by tracking *when* a file became tracked relative to what the current session can prove it did.
+
+**Correctness fixes:**
+- `doctor --airgap` judged provider locality (whether inference stays on this machine) with a bare substring match on the model id; a remote `OLLAMA_HOST` pointed at Ollama's own cloud service still read as air-gapped. It now parses the actual host.
+- The completion council's zero-test-run detection had an ordering bug that let a project with a real test runner and zero tests pass read as affirmative evidence of completion, at two separate code paths -- contradicting the project's own anti-fake-green rule. Fixed at both sites without regressing the (unrelated, still-correct) case of a project with no test tooling at all.
+- `proof-verify.py` reported "tampered" (exit 1) for a proof it genuinely could not check (e.g. verified outside a git repository) instead of "could not check" (exit 2) -- collapsing two different meanings into one signal.
+- Attestation verification rendered an empty key set as `FAILED`/`TAMPERED` instead of `NOT CHECKED`, and rendered `attestation: false` inconsistently between the local and remote verification routes.
+- `evidence-block.json` could report a test axis as passing when it was genuinely inconclusive (no results recorded), if a different axis was the one actually blocking completion.
+
+**CI reliability:** three separate shell test files were found sourcing `autonomy/run.sh` (or a copy of it) into a shell still working out of the shared repository checkout; a side effect of sourcing it (provider auto-detection) wrote state into that shared checkout, silently breaking whichever later test in the same CI shard happened to read that state next. This intermittently broke unrelated tests depending on shard composition. All three confirmed instances are fixed.
+
 ## v9.54.2
 
 Re-cut after v9.54.1 failed the release gate's Security Audit step before

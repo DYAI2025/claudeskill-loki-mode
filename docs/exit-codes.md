@@ -75,8 +75,8 @@ codes on the Bun route and the bash route (`LOKI_LEGACY_BASH=1`).
 | Code | Meaning |
 |---|---|
 | 0 | Clean: the integrity hash matches and the recorded diff still matches the repo (and, with `--jwks`, the attestation is VERIFIED) |
-| 1 | Tampered or drifted; or, with `--jwks`, the attestation FAILED, or is ABSENT (the receipt is unsigned while a key set was supplied) |
-| 2 | Could not check: the receipt is present but unusable (malformed JSON), the verifier itself is missing, or, with `--jwks`, the attestation is NOT CHECKED (key set unreadable, or a verifier dependency missing) |
+| 1 | Tampered, or genuinely drifted (the working tree really changed since the recorded base); or, with `--jwks`, the attestation FAILED, or is ABSENT (the receipt is unsigned while a key set was supplied) |
+| 2 | Could not check: the receipt is present but unusable (malformed JSON), the verifier itself is missing, drift could not be re-derived (verified outside a git tree, or the recorded base ref no longer resolves, with every other check passing) rather than genuinely found, or, with `--jwks`, the attestation is NOT CHECKED (key set unreadable, empty, or a verifier dependency missing) |
 | 64 | Usage error: no proof id, more than one proof id, an unknown option (a mistyped `--jwk` must never skip the check), `--jwks` with no value or an empty one, or `-h`/`--help` (verify never exits 0 without a verdict; full help is `loki proof help`). `--` ends options, so `loki proof verify -- <id>` checks an id that begins with `-` |
 | 66 | Input missing: no `.loki/proofs/<id>/proof.json` for that id |
 
