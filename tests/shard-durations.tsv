@@ -320,6 +320,7 @@ dashboard unmeasured cost never renders as zero (node --test)	0
 dashboard panels render unmeasured as unknown (node --test)	0
 dashboard UI component utilities match shipped code (node --test)	0
 dashboard overview issue-to-PR journey (node --test)	1
+web-app workspace panels surface fetch failures (node --test)	1
 shipped agent roles reach the review pool	0
 policy present but unevaluable refuses fail-closed	0
 audit entries attribute an actor honestly	0

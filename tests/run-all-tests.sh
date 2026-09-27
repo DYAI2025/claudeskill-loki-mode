@@ -952,6 +952,7 @@ run_test "dashboard UI component utilities match shipped code (node --test)" "co
 run_test "dashboard overview issue-to-PR journey (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../dashboard-ui/tests/loki-overview-issue-journey.node.test.mjs"
 run_test "web-app NLSearch failed request is not no-results (S-159)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../web-app/src/components/NLSearch.state.test.mjs"
 run_test "web-app ProjectsPage poll error is not an empty list (S-161)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../web-app/src/pages/ProjectsPage.state.test.mjs"
+run_test "web-app workspace panels surface fetch failures (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../web-app/src/components/ProjectWorkspace.panels.test.mjs"
 run_test "shipped agent roles reach the review pool" "$SCRIPT_DIR/test-agent-types-loaded.sh"
 run_test "policy present but unevaluable refuses fail-closed" "$SCRIPT_DIR/test-policy-node-failclosed.sh"
 run_test "audit entries attribute an actor honestly" "$SCRIPT_DIR/test-audit-actor-attribution.sh"
