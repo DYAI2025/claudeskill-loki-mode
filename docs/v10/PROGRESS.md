@@ -887,3 +887,28 @@ underlying BACKLOG 21 investigation (macOS 27 seatbelt exit 32) should
 be picked up as its own slice soon rather than becoming a routine skip
 -- it is currently accepted as pre-existing and unrelated, which is
 true, but "routine" is not the same bar as "acceptable indefinitely."
+
+## Drift audit, turn 132
+
+**Matched CONTROL.md:** S-46 landed (status-inference honesty, BACKLOG
+115), independently corroborating the BACKLOG 21 seatbelt failure a
+third and now fourth time (once via the pre-push gate's own full run,
+matching test count exactly as expected given S-46 added one new
+passing test in between). The D24 skip pattern remains correctly
+disclosed each time it recurs, and S-61 is already cut to stop treating
+it as routine going forward.
+
+**Also matched:** dispatched 2 more builders (S-57, S-59) to clear
+IDLE_BUILDERS again, both explicitly instructed to first check whether
+their target backlog item is already fixed (matching the S-48
+stale-duplicate discipline established earlier this session) rather
+than assuming the backlog description is current.
+
+**NO_RECENT_RELEASE, now at its sharpest point this window:** every
+merge blocker except one is now cleared. S-18/BACKLOG 149's security
+rework is complete, disclosed, and has a dedicated HIGH-tier adversarial
+reviewer in flight (23+ minutes in, appropriate given the stakes -- this
+is not a review to rush). Once that review lands (APPROVE or a
+fixable CONCERN), and one Tests run on the resulting main tip is
+confirmed green, cut the release immediately. This is the single
+highest-priority action remaining in the swarm.
