@@ -68,7 +68,10 @@ printf '%s' "$_out" | grep -q "TOP_EMPTY" \
   || bad "loadBudget wrote into the top banner element: $_out"
 
 # --- 4. DOM check: initBudgetBanner (R3 top banner) still finds and updates
-#        its own budget-banner element, unaffected by the rename -----------
+#        its own budget-banner element, unaffected by the rename. The mocked
+#        /api/cost/timeline returns a warn payload, so the banner must end up
+#        with the show+warn classes and non-empty text; a failed lookup
+#        (early return) leaves both untouched and goes red. -------------------
 _out="$(node -e "
 const src=require('fs').readFileSync('$SRC','utf8');
 const m=src.match(/\(function initBudgetBanner\(\) \{[\s\S]*?\n  \}\)\(\);/);
@@ -81,16 +84,17 @@ global.document={getElementById:(id)=>{
   if(id==='budget-banner-text') return textEl;
   return null;
 }};
-global.fetch=()=>Promise.reject(new Error('no network in test'));
+global.fetch=()=>Promise.resolve({ok:true,json:()=>Promise.resolve({budget:{status:'warn',percent_used:82}})});
 global.setInterval=()=>{};
+global.location={origin:'http://127.0.0.1'};
 global.LokiDashboard={getApiClient:()=>({addEventListener(){},connect:()=>Promise.reject(new Error('no ws'))})};
 global.window=global;
 new Function('global', 'LokiDashboard', 'setInterval', m[0]).call(global, global, global.LokiDashboard, global.setInterval);
-process.stdout.write(topBanner.classList!==undefined?'BANNER_FOUND':'BANNER_MISSING');
+setTimeout(()=>process.stdout.write((cls.has('show')&&cls.has('warn')&&textEl.textContent.indexOf('82%')>=0)?'BANNER_UPDATED':'BANNER_UNTOUCHED cls='+[...cls].join(',')+' text='+textEl.textContent),50);
 " 2>/dev/null)"
-printf '%s' "$_out" | grep -q "BANNER_FOUND" \
-  && ok "initBudgetBanner still finds the top banner by id=\"budget-banner\"" \
-  || bad "initBudgetBanner could not find its banner element: $_out"
+printf '%s' "$_out" | grep -q "BANNER_UPDATED" \
+  && ok "initBudgetBanner finds id=\"budget-banner\" and renders the warn state into it" \
+  || bad "initBudgetBanner did not update its banner element: $_out"
 
 # --- 5. THE OTHER TWO 118 ITEMS: newest-first ordering, not re-reversed ----
 _out="$(node -e "

@@ -1371,6 +1371,7 @@ run_test "the Quality page shows which gates block" "$SCRIPT_DIR/test-gate-polic
 run_test "the evidence receipt is reachable from the dashboard" "$SCRIPT_DIR/test-receipts-panel.sh"
 run_test "the build's learnings are visible" "$SCRIPT_DIR/test-learnings-panel.sh"
 run_test "the spend-cap state is visible" "$SCRIPT_DIR/test-budget-banner.sh"
+run_test "the Cost page budget banner has its own id" "$SCRIPT_DIR/test-budget-banner-dedup.sh"
 run_test "trust-core tests detect their regressions" "$SCRIPT_DIR/test-trust-core-tests-detect.sh"
 run_test "a user-installed reviewer takes part in a run" "$SCRIPT_DIR/test-installed-agent-reviewer.sh"
 # Skill modules are loaded INTO the agent's context and acted on, so a false
