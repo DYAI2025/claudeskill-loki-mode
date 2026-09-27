@@ -1210,3 +1210,8 @@ sample.
 - Next: each train counts as released when its publish-npm job succeeds. Train 4 opens now: S-84 (Part C items 3 and 5) once approved, plus S-97 and S-98 (D27 hook and cadence guard). Target push by 16:13 (20-minute cadence).
 | 16:05 | Train 3 Tests run 36331204715 FAILED: test_build_supervisor lineage race on Python 3.10+3.11 (also 3.11+3.12 on 89e350bd; identical code passed on 5332bfc3), so the Release required-ci failed. Failed jobs rerun at 16:05:48Z; P0 S-102 opened | gh run view |
 | 16:06:59-07:02 | Train 4 (S-49, S-91, S-89, S-16, S-77) plus release commit v9.59.0 pushed, rc=0 | HEAD = ls-remote = 08d64f4e05b2a475ecde30a393d3f660963f95a9 |
+| 16:20 | Founder: "just release everything asap, no more tests for development work completed so far". Review workflows for S-97/S-98 and S-18 round 6 stopped | |
+| 16:22:47-51 | Train 5 (S-18 r1-6, S-84 r1-4, S-97, S-98) plus release commit v9.60.0 pushed, rc=0 | HEAD = ls-remote = 1cde81a773ae2fe3942edbc92d94abaa18b4ac3e |
+| 16:24:29-32 | Train 6 (S-54) plus release commit v9.61.0 pushed, rc=0 | HEAD = ls-remote = 64676dce0d78c9d1d1a34ef89e022846185c808e |
+| 16:25 | Train 2 Release: required-ci passed, but the release job failed. The bot token cannot push tag v9.57.0 because the release changes .github/workflows ("without workflows permission"). Release Manager pushed v9.57.0..v9.61.0 at their release commits (ls-remote ^{} verified) and fully reran train 2 Release (36331009098) at 16:25:43Z. S-105 opened | release job log |
+| 16:26 | Trains 3 and 4 Tests: the build_supervisor flake again (3.10; 3.13); failed jobs rerun at 16:26:04Z. P0 S-102 in progress | |
