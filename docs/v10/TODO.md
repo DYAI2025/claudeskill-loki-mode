@@ -7,37 +7,27 @@ docs/v10/BOARD.md; this file is the per-person view.
 
 Target: 3-5 releases per hour (CEO 2026-09-27 17:05Z), 60 per day.
 
-## Chief of Staff (orchestrator)
+## Chief of Staff (orchestrator), 19:10Z
 
-1. [done 17:05:02Z] Release v9.63.0 from green tree 1bc02bce (release.sh --bump-only guard passed; tag and main pushed, ls-remote verified).
-2. [pending] Confirm v9.63.0 publish-npm success (Release run 36335603628).
-3. [pending] Release 2: cc105687 (S-104 cache + S-109 violations) -> Tests green -> release.sh --bump-only -> push + tag.
-4. [pending] Release 3: next green content push (batch-1 slices as each is approved).
-5. [running] Keep 10+ builders busy: batch-1 pipeline (S-30, S-88, S-94, S-96, S-99, S-100, S-105, S-106, S-110, S-111), each build then review.
-6. [running] Architect cutting S-112..S-131 to keep the ready queue at 2x builders.
-7. [pending] Cherry-pick each approved slice onto main within the same turn it is approved; push content immediately (Tests start at once).
-8. [pending] Every green main SHA with unreleased code gets a --bump-only release; never bump on red (D28).
+1. [done 19:05:43Z] Release v9.69.0 from green 7ef5ca28 (main and tag both b2444763 by ls-remote).
+2. [done] v9.68.0 on npm (`npm view loki-mode version` = 9.68.0; Release run 36342384478 success).
+3. [done] v9.69.0 on npm (`npm view loki-mode version` = 9.69.0).
+4. [done 19:06-19:09Z] Train 9 content: S-132, S-134, S-137, S-142, S-143, S-151 (a39c4995), S-139, S-141 (06bf5406), S-140 (e952e1ae).
+5. [done 19:28:09Z] Release 10 = v9.70.0 from green b61045fd (main and tag 6c459dfa by ls-remote).
+6. [done 19:19Z] S-136 landed (b61045fd); S-137 fix-forward 6e48decb.
+7. [running] Batch 5 (wf_38d4e17c-211): reworks S-138, S-146, S-147, S-152; builds S-50, S-153, S-135; Architect cut S-154..S-173.
+8. [pending] Prune each worktree once its slice is merged (count now 7 of 15).
 9. [pending] Drift audit every 6 turns; guard review every 50 turns.
-
-## Release cadence loop (the mechanism for 3-5 per hour)
-
-- Content push: every approved slice lands on main as soon as it is approved (no batching wait).
-- Tier B (Tests, about 6-15 min with 8 shards) runs per SHA; nothing is cancelled on main (S-80).
-- As soon as any main SHA with unreleased code is green: `bash scripts/release.sh minor --bump-only`, commit, tag, push. The bump reuses the parent's verdict (S-84), so publish follows in minutes.
-- Pipelined: content N+1 is in Tier B while release N publishes.
 
 ## Team members
 
 | Agent | Slice | Role | TODO |
 |---|---|---|---|
-| Engineer | S-30 | P7 ternary-null bypass | build, red/green, mutate, commit; then Tech Lead review |
-| Engineer | S-88 | parallelize moat P5/P6/P9 | measure before/after, identical CASE lines, commit; then review |
-| Engineer | S-94 | WORKTREE_COUNT pulse violation | fixtures 15/16, commit; then review |
-| Engineer | S-96 | Tier A caches + 10-commit METRICS table | commit; then review |
-| Engineer | S-99 | guard follow-ups (4 fixes) | fixtures per repro, commit; then review |
-| Engineer (opus) | S-100 | refuse the repo default branch in trusted push | test develop/feature, commit; then HIGH review |
-| Engineer (opus) | S-105 | release.yml tag step: reuse a pre-pushed tag, fail loudly otherwise | stub-driven test, commit; then HIGH review |
-| Engineer | S-106 | runtime-gate port race, unquarantine | 20/20 in capped Linux, commit; then review |
-| Engineer | S-110 | fix the 3 suites S-93 registered, unquarantine | per-suite root cause, commit; then review |
-| Engineer | S-111 | bring back pytest -n auto after proving S-102 | 10 runs 0 failures in capped container, then test.yml; then review |
-| Architect (opus) | S-112..S-131 | cut 20 ready slices | read-only; returns 20 BOARD rows |
+| Engineer (opus) | S-152 | pre-push: only the Release Manager pushes main | add allowed non-main case, fix commit message; then HIGH re-review |
+| Engineer | S-146 | one id="budget-banner" in the dashboard build | fix review CONCERN, rebuild static; then re-review |
+| Engineer | S-147 | loki metrics --json nulls for unmeasured values | fix review CONCERN; then re-review |
+| Engineer | S-138 | lint: fixtures never write the real ~/.gitconfig | fix 2nd REJECT findings; then re-review |
+| Engineer | S-50 | P7 sed workaround vs dynamic repo root | build, red/green, mutate; then review |
+| Engineer (opus) | S-153 | Footer.tsx on the release reuse allowlist | stub test reuse/no-reuse; then HIGH review |
+| Engineer | S-135 | parallel trust-core probe mutations, private copy per worker | before/after wall time, same CASE lines; then review |
+| Architect (opus) | S-154..S-173 | cut 20 ready slices | read-only; returns 20 BOARD rows |
