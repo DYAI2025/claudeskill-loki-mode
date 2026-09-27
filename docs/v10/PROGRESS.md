@@ -450,3 +450,40 @@ tangential exploration. Correction: a background agent's listed status
 actual last-event timestamp against wall-clock time before assuming a
 long-running review is still doing useful work, especially once it's
 well past the review-tier's stated time budget.
+
+### Drift audit (turn 42, 6-hour window)
+
+**Matched CONTROL.md:** real throughput this window despite the raw
+docs-ratio staying flat (45/74, ~61%, essentially unchanged from the
+last two audits): S-41, GF-4, and S-09 all merged with genuine review
+rigor (S-41 unanimous 2/2 fully adversarial; GF-4's two reviewers
+independently converged on the identical commit-message defect;
+S-09's 3-round rework history is the clearest example this session of
+the anti-sycophancy discipline working as designed). S-40 surfaced a
+real production Rule-of-Two credential leak (BACKLOG 142) mid-build
+and stopped for a scope decision rather than silently expanding or
+silently shipping a known-red case as pending -- exactly right per
+D21. S-29's rework was dispatched on a genuine 2/2 CONCERN rather than
+overridden, with reviewer 2 catching a subtle bug (S-29 introducing a
+live copy of its own sibling S-30's exact defect) that a less
+adversarial review would have missed.
+
+**Drifted:** two real CI/agent-health incidents in one window (the
+Tests-run hang plus the two silently-stalled reviewers) suggests
+this class of failure is not a one-off -- worth watching for a third
+occurrence before concluding it's noise. The docs-commit ratio
+correction from two prior audits STILL has not measurably moved the
+number, though the absolute count of real merges/fixes landed this
+window (3 merges, 1 production security fix, 2 stalled-agent
+recoveries, 1 CI-hang recovery) is higher in substance than the raw
+ratio suggests -- the ratio itself may simply be a poor proxy for
+velocity in a window this eventful, rather than a real process failure
+to keep correcting against.
+
+**Correction for the next 6 hours:** stop treating the docs-commit
+ratio as the primary velocity signal -- track merged-slice count and
+real-fix count directly instead, and only worry about the ratio if
+merge/fix throughput ALSO drops. Continue the CI-health and
+agent-health vigilance from this window (checking actual job status
+and actual transcript timestamps, not just top-level run/task status)
+since it just paid off twice.
