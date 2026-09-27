@@ -855,6 +855,15 @@ def _collect_functional(loki_dir):
     return out
 
 
+def _collect_ablation(loki_dir):
+    """Copy .loki/quality/ablation.json verbatim (S-113). None when absent or
+    unreadable, so the caller attaches no key and an ablation-less receipt stays
+    byte-identical. _compute_headline reads status == not_load_bearing: a change
+    whose deletion leaves the suite green is not proven by that suite.
+    """
+    return _read_json(os.path.join(loki_dir, "quality", "ablation.json"), default=None)
+
+
 def _collect_healthcheck(loki_dir):
     """Read .loki/app-runner/health.json (the app-runner liveness probe).
 
@@ -1460,6 +1469,9 @@ def _build_proof(args, loki_dir, target_dir, repo_root):
     # only, never read by _compute_headline / _compute_degraded.
     if journey:
         facts["journey"] = journey
+    ablation = _collect_ablation(loki_dir)
+    if ablation is not None:
+        facts["ablation"] = ablation
 
     # ASSESSMENTS: LLM opinions. Explicitly labeled as judgment, NOT proof. A
     # green council verdict is an opinion that can be wrong or gamed; it never
@@ -1760,6 +1772,11 @@ def _compute_headline(facts, degraded):
         and tests.get("exit_code") == 0
     )
     if tests_verified and not degraded and diff_nonempty:
+        # S-113: ablation showed deleting the change leaves the suite green, so
+        # the passing tests do not prove the change. Never VERIFIED; amber.
+        ablation = facts.get("ablation")
+        if isinstance(ablation, dict) and ablation.get("status") == "not_load_bearing":
+            return "VERIFIED WITH GAPS"
         return "VERIFIED"
     # Any fact verified at all (tests/build verified, or a passed gate)?
     # A non-empty diff is a PREREQUISITE for VERIFIED (checked above), NOT a
