@@ -357,8 +357,8 @@ _quarantine_is_listed() {
 }
 
 run_test() {
-    local test_name="$1"
-    local test_file="$2"
+    local test_name="${1:-}"
+    local test_file="${2:-}"
 
     # Take this suite's index BEFORE any skip, so indices are stable regardless
     # of which shard is running -- the awk pass above walks run_test calls in
@@ -366,6 +366,17 @@ run_test() {
     # this same suite, on every shard's invocation.
     local _idx=$_shard_index
     _shard_index=$((_shard_index + 1))
+    # S-174: a registration with a missing or empty command used to die on
+    # "$2: unbound variable" (no summary, every later suite skipped) or pass as
+    # `bash -c ""`. Count it as one failure and keep going. Placed after the
+    # index increment (LPT slots stay put) and before the shard skip (every
+    # shard reports it). stderr keeps LOKI_TEST_LIST stdout clean; the word
+    # FAILED keeps the local-ci scraper matching.
+    if [ "$#" -lt 2 ] || [ -z "$test_file" ]; then
+        echo -e "${RED}✗ ${test_name:-<unnamed>} FAILED: malformed registration at run-all-tests.sh line ${BASH_LINENO[0]} (needs a name and a non-empty command)${NC}" >&2
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        return 0
+    fi
     if [ -n "$_shard_n" ] && [ "${_shard_assign[_idx]:-}" != "$_shard_i" ]; then
         return 0
     fi
@@ -405,7 +416,8 @@ run_test() {
         echo -e "${RED}  This is a stale run_test registration, not a code defect.${NC}"
         echo -e "${RED}  Either restore the script or remove the registration.${NC}"
         TOTAL_FAILED=$((TOTAL_FAILED + 1))
-        return 1
+        # return 0: under set -e a non-zero return ended the whole run (S-174).
+        return 0
     fi
 
     echo -e "${YELLOW}┌────────────────────────────────────────────────────────────────┐${NC}"
@@ -1467,6 +1479,7 @@ run_test "Welcome opener (terminal + browser)" "$SCRIPT_DIR/test-welcome-opener.
 
 run_test "Browser-open guard (tests never open a browser, S-103)" "$SCRIPT_DIR/test-browser-open-guard.sh"
 run_test "prune-worktrees treats cherry-picked branches as merged (S-154)" "$SCRIPT_DIR/test-prune-worktrees.sh"
+run_test "run_test missing or empty argument does not stop the runner (S-174)" "$SCRIPT_DIR/test-run-all-missing-arg.sh"
 run_test "ShellCheck Linting" "$SCRIPT_DIR/run-shellcheck.sh"
 
 # Summary
