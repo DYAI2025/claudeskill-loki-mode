@@ -1004,7 +1004,7 @@ greet("world");`}</pre>
             </div>
             <div className="flex items-center justify-between px-4 py-3">
               <span className="text-sm text-[#6B6960]">License</span>
-              <span className="text-sm text-[#36342E]">MIT</span>
+              <span className="text-sm text-[#36342E]">BUSL-1.1</span>
             </div>
           </div>
         </div>
