@@ -165,5 +165,214 @@ class NothingButAnExplicitSuccessCounts(unittest.TestCase):
         self.assertEqual(_evaluate([], self.required), "PENDING_EMPTY")
 
 
+# ---------------------------------------------------------------------------
+# S-84 round 3: the reuse-eligibility content compare (FIX 1) and the
+# release-SHA priority order (FIX 2), executed for real rather than
+# reimplemented, so a future edit that reintroduces either regression fails
+# THIS suite instead of only a scratchpad harness.
+#
+# DEPENDENCY-FREE, same reasoning as _required_names() above: no PyYAML, no
+# git repo needed for FIX 2 (it is one pure bash function). FIX 1 needs a
+# real git repo (git show / git diff --raw against actual commits), which is
+# always available in CI and locally.
+# ---------------------------------------------------------------------------
+import subprocess
+import tempfile
+
+
+def _eligibility_script():
+    """STEP 1's python3 heredoc, extracted from the raw YAML text without a
+    YAML parser. It reads (parent, sha) from argv and decides eligibility
+    entirely by itself (git show / git diff --raw), so it can run standalone
+    against a scratch repo."""
+    # The closing delimiter still carries the YAML block scalar's own
+    # indentation in the RAW file text (this module deliberately never runs
+    # it through a YAML parser), so it is matched with leading whitespace
+    # allowed rather than assumed absent.
+    src = _RELEASE.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"<<'PYEOF'\n(.*?)\n[ \t]*PYEOF\b", src, re.S)
+    if not m:
+        return None
+    lines = m.group(1).splitlines()
+    indents = [len(l) - len(l.lstrip(" ")) for l in lines if l.strip()]
+    strip = min(indents) if indents else 0
+    return "\n".join(l[strip:] if len(l) >= strip else l for l in lines)
+
+
+def _has_conclusion_fn():
+    """The has_conclusion() bash function (FIX 2's building block), extracted
+    verbatim so its awk field-matching is exercised for real."""
+    src = _RELEASE.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"has_conclusion\(\) \{.*?\n[ \t]*\}", src, re.S)
+    if not m:
+        return None
+    lines = m.group(0).splitlines()
+    indents = [len(l) - len(l.lstrip(" ")) for l in lines if l.strip()]
+    strip = min(indents) if indents else 0
+    return "\n".join(l[strip:] if len(l) >= strip else l for l in lines)
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", repo] + list(args), check=True,
+                    capture_output=True,
+                    env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                         "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"})
+
+
+def _write(repo, path, data):
+    full = pathlib.Path(repo) / path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, str):
+        data = data.encode()
+    full.write_bytes(data)
+
+
+def _run_eligibility(repo, parent, sha):
+    script = _eligibility_script()
+    assert script, "could not extract the eligibility script from release.yml"
+    r = subprocess.run(["python3", "-c", script, parent, sha], cwd=repo,
+                        capture_output=True, text=True)
+    return r.returncode, r.stderr
+
+
+@unittest.skipIf(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                  "git not available")
+class ContentCompareCannotBeHiddenByALineSeparatorSwap(unittest.TestCase):
+    """FIX 1 (round 3, two independent HIGH reviews of round 2 reproduced
+    this): the compare must operate on raw bytes with no line splitting, or a
+    `\\n` -> `\\r` / U+2028 / \\x0c swap can hide a real change (a dropped
+    `USER nobody`, an added `raise` guard) behind an otherwise-identical
+    normalized line list."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="s84-elig-")
+        _git(self.repo, "init", "-q", "-b", "main", ".")
+
+    def _base_commit(self):
+        _write(self.repo, "VERSION", "9.55.0\n")
+        _write(self.repo, "package.json", '{"version": "9.55.0"}\n')
+        _write(self.repo, "Dockerfile",
+               b"FROM alpine:3.20\nLABEL version=\"9.55.0\"\n# drop privileges\nUSER nobody\n")
+        _write(self.repo, "mcp/__init__.py",
+               b'# guard\nraise SystemExit("blocked")\n__version__ = "9.55.0"\n')
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        return subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+
+    def _bump_and_commit(self, mutate):
+        _write(self.repo, "VERSION", "9.56.0\n")
+        for path in ("package.json", "Dockerfile", "mcp/__init__.py"):
+            full = pathlib.Path(self.repo) / path
+            full.write_bytes(full.read_bytes().replace(b"9.55.0", b"9.56.0"))
+        mutate()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "release")
+        return subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+
+    def test_clean_version_only_bump_is_eligible(self):
+        parent = self._base_commit()
+        sha = self._bump_and_commit(lambda: None)
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertEqual(rc, 0, err)
+
+    def test_dockerfile_carriage_return_absorbs_user_nobody(self):
+        """Reproduces reviewer A's Dockerfile finding: swapping the `\\n`
+        before `USER nobody` for `\\r` must NOT compare equal to the parent
+        (round 2's splitlines()-based compare did)."""
+        parent = self._base_commit()
+        def mutate():
+            full = pathlib.Path(self.repo, "Dockerfile")
+            full.write_bytes(full.read_bytes().replace(
+                b"# drop privileges\nUSER nobody\n", b"# drop privileges\rUSER nobody\n"))
+        sha = self._bump_and_commit(mutate)
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0,
+            "a \\r-hidden `USER nobody` line compared equal to the parent; "
+            "the compare is splitting lines again instead of using raw bytes")
+
+    def test_mcp_init_form_feed_absorbs_raise_guard(self):
+        """Reproduces reviewer A's mcp/__init__.py finding with \\x0c."""
+        parent = self._base_commit()
+        def mutate():
+            full = pathlib.Path(self.repo, "mcp/__init__.py")
+            full.write_bytes(full.read_bytes().replace(b"# guard\nraise", b"# guard\x0craise"))
+        sha = self._bump_and_commit(mutate)
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0,
+            "a \\x0c-hidden `raise` guard compared equal to the parent")
+
+    def test_mcp_init_u2028_absorbs_raise_guard(self):
+        """Same finding with U+2028 LINE SEPARATOR, the other splitlines()
+        break character reviewers used."""
+        parent = self._base_commit()
+        def mutate():
+            full = pathlib.Path(self.repo, "mcp/__init__.py")
+            full.write_bytes(full.read_bytes().replace(
+                b"# guard\nraise", "# guard raise".encode()))
+        sha = self._bump_and_commit(mutate)
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0,
+            "a U+2028-hidden `raise` guard compared equal to the parent")
+
+    def test_dropped_package_json_files_entry_is_not_eligible(self):
+        """v8.38.0 incident class: the diff is filename-allowlisted but the
+        CONTENT changed beyond the version string (a files[] entry vanished).
+        Round 2 only content-checked loki-ts/dist/loki.js; this must now be
+        checked for every allowlisted file."""
+        parent = self._base_commit()
+        def mutate():
+            full = pathlib.Path(self.repo, "package.json")
+            full.write_bytes(b'{"version": "9.56.0", "files": ["autonomy/"]}\n')
+        sha = self._bump_and_commit(mutate)
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0, "package.json content drift was not caught")
+
+
+@unittest.skipIf(subprocess.run(["bash", "--version"], capture_output=True).returncode != 0,
+                  "bash not available")
+class ReleaseShaPriorityOrderIsCorrected(unittest.TestCase):
+    """FIX 2 (round 3, corrected from round 2's over-eager version): a
+    completed FAILURE at the release SHA always wins; cancelled/timed_out do
+    NOT, since main's cancel-in-progress concurrency group can cancel an
+    otherwise-healthy release SHA run for reasons unrelated to the code."""
+
+    def _has_conclusion(self, runs_tsv, want, conclusion):
+        fn = _has_conclusion_fn()
+        self.assertIsNotNone(fn, "could not extract has_conclusion() from release.yml")
+        script = fn + f'\nhas_conclusion {want!r} "$1" {conclusion!r} && echo YES || echo NO\n'
+        r = subprocess.run(["bash", "-c", script, "_", runs_tsv],
+                            capture_output=True, text=True)
+        return r.stdout.strip()
+
+    def test_a_completed_failure_at_the_release_sha_is_detected(self):
+        runs = "Tests\tcompleted\tfailure\nBun Parity\tcompleted\tsuccess"
+        self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "YES")
+
+    def test_a_completed_failure_survives_a_concurrent_in_progress_run(self):
+        """S2: a failed run plus a still-running retry must still register as
+        a failure -- this is the 'hidden failure' case reviewers named."""
+        runs = "Tests\tcompleted\tfailure\nTests\tin_progress\tnull"
+        self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "YES")
+
+    def test_cancelled_is_not_treated_as_failure(self):
+        """S1: a cancelled release-SHA run must NOT satisfy the failure
+        check, so the job can still fall through to parent reuse instead of
+        failing an otherwise-green bump."""
+        runs = "Tests\tcompleted\tcancelled"
+        self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "NO")
+
+    def test_timed_out_is_not_treated_as_failure(self):
+        runs = "Tests\tcompleted\ttimed_out"
+        self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "NO")
+
+    def test_success_is_detected_independently_of_failure(self):
+        runs = "Tests\tcompleted\tsuccess"
+        self.assertEqual(self._has_conclusion(runs, "Tests", "success"), "YES")
+        self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "NO")
+
+
 if __name__ == "__main__":
     unittest.main()

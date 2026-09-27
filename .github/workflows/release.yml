@@ -100,39 +100,74 @@ jobs:
   # typecheck/test, the two version-file probes) are independent of this
   # lookup. `release` still needs both.
   #
-  # GUARANTEED, exactly: Tests and Bun Parity must have succeeded EITHER at
-  # the release SHA, OR at its immediate parent PROVIDED every file this push
-  # changed is on the allowlist below AND -- round 2 fix, was CONTENT-BLIND
-  # for every allowlisted file except loki-ts/dist/loki.js -- each changed
-  # file's own diff from the parent normalizes to identical once the old and
-  # new VERSION literal are replaced with a placeholder (CHANGELOG.md, prose,
-  # is the only exemption from that content check). A file that fails the
-  # compare disqualifies reuse for everything, not just itself. Security
-  # Audit is NEVER reused -- see the note at its check below -- so it is
-  # always required fresh at the release SHA, which costs about 4 min on
-  # every release regardless of what the push touched. This is a fail-closed
-  # eligibility gate, not a substitute for the poll below: a red run already
-  # sitting at the release SHA still fails the job even on an eligible bump
-  # (see FIX 2 in the poll loop) -- the content check and that check are two
-  # independent guards, neither sufficient alone.
+  # GUARANTEED, exactly: for each of Tests / Bun Parity / Security Audit,
+  # (a) any success at the release SHA wins outright; (b) else any completed
+  # run at the release SHA with conclusion exactly "failure" fails the whole
+  # job, even if another run of the same workflow is still in flight (a
+  # completed failure is never hidden behind a hopeful retry); (c) else, for
+  # Tests/Bun Parity only, reuse the parent's verdict if this push is eligible
+  # (see below) and the parent shows a success; (d) else wait for the release
+  # SHA's own result. Security Audit never reaches (c) -- it is NEVER reused,
+  # so it always resolves via (a), (b), or (d) at the release SHA, which costs
+  # about 4 min on every release regardless of what the push touched.
+  # Eligibility (the "(c)" gate) requires every file this push changed to be
+  # on the allowlist below, present as the same regular-file mode on both
+  # sides (round 3: `git diff --raw`, not `--name-only` -- a rename, add,
+  # delete, or mode/type change disqualifies even an allowlisted path), AND
+  # each changed file's own RAW BYTES normalize to identical once the old and
+  # new VERSION literal (each required to match `^\d+\.\d+\.\d+$`, round 3) is
+  # substituted for a placeholder -- CHANGELOG.md instead has to be a
+  # prepend-only edit (its old bytes must be a byte-suffix of the new ones,
+  # round 3, replacing a blanket content exemption that a full-file rewrite
+  # could pass through). A file that fails its check disqualifies reuse for
+  # everything, not just itself. This is a fail-closed eligibility gate, not a
+  # substitute for (b): a completed failure at the release SHA always wins
+  # over reuse, and reuse never wins over a success or failure already
+  # decided at the release SHA itself.
   #
-  # Round 2 (HIGH, reproduced by two independent reviewers): the filename-only
-  # allowlist check let a dropped package.json files[] entry, arbitrary code
-  # appended to mcp/__init__.py, and a new Dockerfile RUN line all reuse the
-  # parent's verdict -- the v8.38.0 incident class, done to the allowlist
-  # itself. Fixed by extending the version-literal normalize-and-compare from
-  # loki-ts/dist/loki.js to every allowlisted file except CHANGELOG.md.
-  # loki-ts/dist/loki.js.map was also proposed as a second debugId-style
-  # exemption; measured against a real release instead of assumed, its
-  # embedded sourcesContent differed beyond the version and its own debugId,
-  # so it is removed from the allowlist entirely rather than exempted (see the
-  # note at ALLOWLIST below). Reviewers also required: a completed FAILURE for
-  # Tests or Bun Parity already sitting at the release SHA must fail the gate
-  # even when the parent would otherwise qualify for reuse -- a red run at the
-  # release commit itself is never masked by a green parent (FIX 2, poll loop
-  # below). That second check exists BECAUSE the content compare alone is
-  # racy against a concurrent re-run at the release SHA; it does not replace
-  # the compare as the primary reuse guard.
+  # Round 3 (two independent HIGH reviews of round 2, both reproduced):
+  #
+  # FIX 1 (byte-safe compare). Round 2's compare split each file with
+  # `str.splitlines()` (which treats \r, \x0c, U+2028 and others as line
+  # breaks) and rejoined with "\n", then substituted the version string.
+  # Reviewers reproduced hiding a Dockerfile `USER nobody` (so the built image
+  # ran as root, confirmed with `docker build`) and a Python `raise` guard in
+  # mcp/__init__.py, in both cases by swapping the `\n` before it for a `\r`
+  # or U+2028 -- the normalizer's own line reshuffle made the parent and the
+  # sabotaged release compare equal. Fixed by comparing RAW BYTES with a
+  # single substring substitution and no line splitting at all; a NUL already
+  # present on either side (which would collide with the placeholder) now
+  # disqualifies that file outright. The debugId trailer strip is scoped to
+  # loki-ts/dist/loki.js alone, matched only at the true end of the byte
+  # string (never mid-file, never on another path), so it cannot be used to
+  # smuggle a line into any other allowlisted file either.
+  #
+  # FIX 2 (release-SHA priority, corrected). Round 2 treated ANY non-success
+  # completed run at the release SHA (including cancelled/timed_out) as an
+  # immediate fail. Reviewers showed this fails an otherwise-eligible, fully
+  # green bump the moment a later push's `cancel-in-progress` concurrency
+  # group cancels the release SHA's own in-flight Tests run -- a false
+  # negative, not a safety property. The (a)-(b)-(c)-(d) order above is the
+  # fix: only an explicit completed "failure" blocks reuse; cancelled,
+  # timed_out, or skipped fall through to reuse-if-eligible or to waiting,
+  # exactly like "not resolved yet". Checking (b) before waiting on any
+  # still-in-flight retry is what closes the "hidden failure" case: a
+  # completed failure plus a still-running run no longer reports pending.
+  #
+  # loki-ts/dist/loki.js.map is back on the allowlist (round 3): round 2's
+  # diagnosis for why a real release's dist failed to reuse -- non-deterministic
+  # minifier variable naming -- was WRONG, per both reviewers' independent,
+  # measured correction. Bun's build is byte-deterministic per commit; the
+  # committed b651b98d^ dist was simply STALE relative to its own src at that
+  # commit, which a fresh rebuild in a scratch worktree confirmed (see the
+  # replay note below). The map's JSON "debugId" is derived from the bundle
+  # (which embeds VERSION), so leaving the map off the allowlist made reuse
+  # permanently dead: 39 of the last 40 release commits touch it. Fixed
+  # properly instead of exempted: parse the map as JSON, drop only the
+  # top-level "debugId" key from each side, canonically re-serialize what's
+  # left, and run the same raw version-literal compare on that. A stale or
+  # rebuilt-different parent dist still correctly makes the bump ineligible;
+  # only a genuinely fresh, matching parent dist reuses.
   #
   # That is not hypothetical for this repo: a releases test passed on a
   # developer clone and failed on 3.10-3.13 in Actions, and the operator mount
@@ -144,21 +179,17 @@ jobs:
   # DIFFERENT execution than the one the branch was judged on, and doubles CI
   # cost for a weaker guarantee.
   #
-  # FAIL-CLOSED DIRECTION IS LOAD-BEARING, on both the reuse decision and the
-  # poll. A parent that is not a clean allowlisted+content-identical diff, that
-  # has no resolvable commit, or whose own Tests/Bun Parity run is anything but
-  # success (pending, failed, cancelled, or simply not found) never blocks the
-  # release -- it just falls back to checking that workflow at the release
-  # SHA, exactly as before S-84. At whichever SHA is actually checked, a
-  # workflow that is missing, still queued, cancelled, or timed out is NOT a
-  # pass. Only an explicit success conclusion counts, and it counts even if
-  # OTHER runs of the same workflow at that SHA failed or were cancelled (a
-  # superseded retry must not block a later success). An absent measurement is
-  # never evidence of health. The reuse fast path also depends on the parent's
-  # Tests/Bun Parity having actually finished before the bump was pushed --
-  # main's `cancel-in-progress` concurrency group would otherwise cancel an
-  # in-flight parent run when the bump lands; S-80 (per-SHA concurrency,
-  # approved separately) removes that cancellation risk.
+  # FAIL-CLOSED DIRECTION IS LOAD-BEARING throughout: an absent measurement,
+  # a still-queued run, or an ineligible/unreadable diff never counts as a
+  # pass -- each either falls back to checking the release SHA directly or
+  # keeps the job waiting up to the poll deadline, and the deadline itself
+  # fails closed. The reuse fast path also depends on the parent's Tests/Bun
+  # Parity having actually finished before the bump was pushed -- main's
+  # `cancel-in-progress` concurrency group would otherwise cancel an in-flight
+  # parent run when the bump lands; S-80 (per-SHA concurrency, approved
+  # separately) removes that cancellation risk. It does not need to land for
+  # FIX 2 above: FIX 2 is about a cancelled run at the RELEASE SHA, a
+  # different commit than the one S-80 protects.
   required-ci:
     runs-on: ubuntu-latest
     permissions:
@@ -183,98 +214,145 @@ jobs:
 
           # -------------------------------------------------------------------
           # STEP 1: is this a version-bump-only diff against the immediate
-          # parent? Eligible only when EVERY changed path is on this allowlist,
-          # the diff is non-empty (an empty diff is not proof of anything), the
-          # parent commit resolves, this is a push event (workflow_dispatch
-          # republishes an already-tagged commit and always checks fresh), AND
-          # (round 2 fix) EVERY changed file's own diff from the parent is
-          # version-literal-only: replace the old/new VERSION string with a
-          # placeholder in each side and the two must then be byte-identical.
-          # CHANGELOG.md (prose) is the only file exempt from that content
-          # check -- everything else, including docs/wiki version headers,
-          # package.json, the Dockerfile and the two __init__.py files, must
-          # prove it changed NOTHING but the version string.
-          #
-          # loki-ts/dist/loki.js.map is NOT on the allowlist at all (round 2
-          # addendum): measured against a real release (b651b98d^..b651b98d),
-          # its embedded sourcesContent differed beyond the version string and
-          # its own debugId, so a per-file debugId exemption for it would have
-          # been a hole, not a fix. If it appears in the diff, this bump is not
-          # eligible and falls back to the release SHA -- same as any other
-          # dist rebuild that fails the compare.
+          # parent? The parent must resolve and this must be a push event
+          # (workflow_dispatch republishes an already-tagged commit and always
+          # checks fresh). Everything else -- the allowlist, the raw-mode
+          # check, the VERSION shape, and the per-file byte compare -- is
+          # decided in one python3 invocation below (round 3: rewritten for
+          # BLOCKING findings A and B from two independent HIGH reviews of
+          # round 2; see the job-level comment above for what each fixes).
           # -------------------------------------------------------------------
           ELIGIBLE=0
           PARENT=""
           if [ "$EVENT_NAME" = "push" ] && PARENT="$(git rev-parse "${SHA}^" 2>/dev/null)" \
              && git cat-file -e "${PARENT}^{commit}" 2>/dev/null; then
-            CHANGED="$(git diff --no-renames --name-only "$PARENT" "$SHA" 2>/dev/null || true)"
-            if [ -n "$CHANGED" ]; then
-              ALLOWLIST='VERSION
-          package.json
-          SKILL.md
-          CHANGELOG.md
-          CLAUDE.md
-          Dockerfile
-          Dockerfile.sandbox
-          dashboard/__init__.py
-          mcp/__init__.py
-          server.json
-          plugins/loki-mode/.claude-plugin/plugin.json
-          loki-ts/dist/loki.js
-          docs/INSTALLATION.md
-          wiki/Home.md
-          wiki/_Sidebar.md
-          wiki/API-Reference.md'
-              OK=1
-              CHECKFILES=""
-              while IFS= read -r f; do
-                [ -n "$f" ] || continue
-                printf '%s\n' "$ALLOWLIST" | grep -qxF "$f" || { OK=0; break; }
-                CHECKFILES="$CHECKFILES $f"
-              done <<<"$CHANGED"
-              if [ "$OK" = "1" ]; then
-                # CHECKFILES is intentionally unquoted: it is a space-joined
-                # list built one allowlisted path at a time above, and every
-                # path in ALLOWLIST is a plain relative path with no spaces,
-                # so word-splitting it into argv is safe here.
-                python3 - "$PARENT" "$SHA" $CHECKFILES <<'PYEOF' || OK=0
-          import re, subprocess, sys
-          parent, sha, files = sys.argv[1], sys.argv[2], sys.argv[3:]
-          EXEMPT = {"CHANGELOG.md"}
-          def show(rev, path):
-              r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
-              return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
-          old_ver = (show(parent, "VERSION") or "").strip()
-          new_ver = (show(sha, "VERSION") or "").strip()
-          if not old_ver or not new_ver:
+            if python3 - "$PARENT" "$SHA" <<'PYEOF'
+          import json, re, subprocess, sys
+
+          parent, sha = sys.argv[1], sys.argv[2]
+
+          # One per line, NO leading whitespace (see the job comment for what
+          # each path's own check additionally requires beyond being listed
+          # here: CHANGELOG.md is prepend-only; loki.js and loki.js.map each
+          # have their own debugId handling; everything else is a plain raw
+          # version-literal byte compare).
+          ALLOWLIST = {
+              "VERSION", "package.json", "SKILL.md", "CHANGELOG.md", "CLAUDE.md",
+              "Dockerfile", "Dockerfile.sandbox", "dashboard/__init__.py",
+              "mcp/__init__.py", "server.json",
+              "plugins/loki-mode/.claude-plugin/plugin.json",
+              "loki-ts/dist/loki.js", "loki-ts/dist/loki.js.map",
+              "docs/INSTALLATION.md", "wiki/Home.md", "wiki/_Sidebar.md",
+              "wiki/API-Reference.md",
+          }
+          REGULAR_MODES = {"100644", "100755"}
+          VERSION_RE = re.compile(rb"^\d+\.\d+\.\d+$")
+          # Anchored at the true end of the byte string ONLY (no MULTILINE):
+          # this can match at most once, at the last line, so it can never be
+          # used to splice a hidden line in anywhere else in the file.
+          DEBUG_ID_TRAILER = re.compile(rb"(?:\r\n|\r|\n)?//# debugId=[0-9A-Fa-f-]+[ \t]*(?:\r\n|\r|\n)?\Z")
+
+          def fail(msg):
+              print("normalizer: " + msg, file=sys.stderr)
               sys.exit(1)
-          # Only the exact Bun debugId comment line is dropped, not every line
-          # that merely mentions the word (a bundled dependency's own code
-          # could otherwise smuggle a real change past this normalizer). Only
-          # loki-ts/dist/loki.js carries this trailer; harmless no-op elsewhere.
-          DEBUG_ID_LINE = re.compile(r"^//# debugId=[0-9A-Fa-f-]+$")
-          def norm(s, ver):
-              s = s.replace(ver, "\x00")
-              return "\n".join(l for l in s.splitlines() if not DEBUG_ID_LINE.match(l.strip()))
-          for f in files:
-              if f in EXEMPT:
+
+          def show_bytes(rev, path):
+              r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+              return r.stdout if r.returncode == 0 else None
+
+          # git diff --raw, NOT --name-only: every changed path must be a
+          # status-M, same-mode, regular-file change present on both sides.
+          # --no-renames turns a rename into a delete+add pair, which fails
+          # the "present on both sides as M" check by construction, so a
+          # rename INTO the allowlist (e.g. CHANGELOG.md -> wiki/Home.md)
+          # cannot slip through as if it were an ordinary edit.
+          raw = subprocess.run(["git", "diff", "--no-renames", "--raw", parent, sha],
+                                capture_output=True)
+          if raw.returncode != 0:
+              fail("git diff --raw failed")
+          lines = [l for l in raw.stdout.decode("utf-8", "replace").splitlines() if l]
+          if not lines:
+              fail("empty diff")
+          line_re = re.compile(r'^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])\d*\t(.+)$')
+          changed = []
+          for line in lines:
+              m = line_re.match(line)
+              if not m:
+                  fail(f"unparseable raw diff line: {line!r}")
+              old_mode, new_mode, status, path = m.groups()
+              if path not in ALLOWLIST:
+                  fail(f"not on the allowlist: {path}")
+              if status != "M":
+                  fail(f"not a modification (status {status}): {path}")
+              if old_mode != new_mode or old_mode not in REGULAR_MODES:
+                  fail(f"not a same-mode regular file: {path} ({old_mode} -> {new_mode})")
+              changed.append(path)
+
+          old_ver = show_bytes(parent, "VERSION")
+          new_ver = show_bytes(sha, "VERSION")
+          if old_ver is None or new_ver is None:
+              fail("VERSION missing on one side")
+          old_ver, new_ver = old_ver.strip(), new_ver.strip()
+          if not VERSION_RE.match(old_ver) or not VERSION_RE.match(new_ver):
+              fail("VERSION does not match ^\\d+\\.\\d+\\.\\d+$ on one side")
+
+          def version_only(old_b, new_b):
+              # A NUL already present on either side would collide with the
+              # substitution placeholder and falsely compare equal -- refuse
+              # outright rather than risk that collision.
+              if b"\x00" in old_b or b"\x00" in new_b:
+                  return False
+              return old_b.replace(old_ver, b"\x00") == new_b.replace(new_ver, b"\x00")
+
+          for path in changed:
+              old_b, new_b = show_bytes(parent, path), show_bytes(sha, path)
+              if old_b is None or new_b is None:
+                  fail(f"could not read {path} on one side")
+
+              if path == "CHANGELOG.md":
+                  # Prepend-only: the new entry goes at the top, so the old
+                  # file's exact bytes must still be present as the tail of
+                  # the new one. A full rewrite (not just a prepend) fails.
+                  if not new_b.endswith(old_b):
+                      fail("CHANGELOG.md is not prepend-only")
                   continue
-              old_c, new_c = show(parent, f), show(sha, f)
-              if old_c is None or new_c is None:
-                  sys.exit(1)
-              if norm(old_c, old_ver) != norm(new_c, new_ver):
-                  sys.exit(1)
+
+              if path == "loki-ts/dist/loki.js":
+                  old_b = DEBUG_ID_TRAILER.sub(b"", old_b, count=1)
+                  new_b = DEBUG_ID_TRAILER.sub(b"", new_b, count=1)
+                  if not version_only(old_b, new_b):
+                      fail("loki.js changed beyond the version string and its debugId trailer")
+                  continue
+
+              if path == "loki-ts/dist/loki.js.map":
+                  try:
+                      old_j, new_j = json.loads(old_b), json.loads(new_b)
+                  except Exception as e:
+                      fail(f"loki.js.map is not valid JSON: {e}")
+                  if not isinstance(old_j, dict) or not isinstance(new_j, dict):
+                      fail("loki.js.map is not a JSON object")
+                  old_j.pop("debugId", None)
+                  new_j.pop("debugId", None)
+                  old_canon = json.dumps(old_j, sort_keys=True, separators=(",", ":")).encode()
+                  new_canon = json.dumps(new_j, sort_keys=True, separators=(",", ":")).encode()
+                  if not version_only(old_canon, new_canon):
+                      fail("loki.js.map changed beyond the version string (top-level debugId excluded)")
+                  continue
+
+              if not version_only(old_b, new_b):
+                  fail(f"{path} changed beyond the version string")
+
           sys.exit(0)
           PYEOF
-              fi
-              [ "$OK" = "1" ] && ELIGIBLE=1
+            then
+              ELIGIBLE=1
             fi
           fi
 
           if [ "$ELIGIBLE" = "1" ]; then
-            echo "Version-bump-only diff against parent $PARENT (every changed file is allowlisted AND content-identical modulo the version string). Tests and Bun Parity may reuse that commit's verdict if it already succeeded there; Security Audit is always required fresh at $SHA (it triggers only on a VERSION-path push or a PR, and this commit is itself a VERSION push, so it always runs here anyway)."
+            echo "Version-bump-only diff against parent $PARENT (every changed file is allowlisted, same-mode, and byte-identical modulo the version string). Tests and Bun Parity may reuse that commit's verdict if it already succeeded there; Security Audit is always required fresh at $SHA (it triggers only on a VERSION-path push or a PR, and this commit is itself a VERSION push, so it always runs here anyway)."
           else
-            echo "Not eligible for parent reuse (non-allowlisted diff, a changed file's content differs beyond the version string, empty diff, no resolvable parent, or a non-push event). All required workflows must succeed at $SHA."
+            echo "Not eligible for parent reuse (see 'normalizer:' diagnostic above if the eligibility check ran, or: empty diff, no resolvable parent, or a non-push event). All required workflows must succeed at $SHA unless already decided by a completed run there."
           fi
 
           # -------------------------------------------------------------------
@@ -299,22 +377,15 @@ jobs:
               --jq '.workflow_runs[] | select(.event=="push") | "\(.name)\t\(.status)\t\(.conclusion)"' 2>/dev/null || true
           }
 
-          classify() {
-            # $1 = exact workflow name, $2 = runs blob. ANY completed+success
-            # run for that name is a pass, whatever else exists for it (a
-            # failed run plus a later success still passes). All-completed
-            # none-success is a fail. Nothing matching, or anything still in
-            # flight, is pending.
-            local want="$1" runs="$2" matches
-            matches="$(printf '%s\n' "$runs" | awk -F'\t' -v w="$want" '$1==w')"
-            if [ -z "$matches" ]; then echo pending; return; fi
-            if printf '%s\n' "$matches" | awk -F'\t' '$2=="completed" && $3=="success"{f=1} END{exit !f}'; then
-              echo success; return
-            fi
-            if printf '%s\n' "$matches" | awk -F'\t' '$2!="completed"{f=1} END{exit !f}'; then
-              echo pending; return
-            fi
-            echo failed
+          has_conclusion() {
+            # $1 = exact workflow name, $2 = runs blob, $3 = exact conclusion.
+            # True iff some completed run of that exact name has that exact
+            # conclusion, whatever else exists for the same name (a failed run
+            # plus a later success still lets has_conclusion(..., success)
+            # come back true; a failed run plus a still-running one still lets
+            # has_conclusion(..., failure) come back true).
+            printf '%s\n' "$2" | awk -F'\t' -v w="$1" -v c="$3" \
+              '$1==w && $2=="completed" && $3==c{f=1} END{exit !f}'
           }
 
           deadline=$(( $(date +%s) + 2400 ))
@@ -327,24 +398,31 @@ jobs:
             failed=0
             while IFS= read -r want; do
               [ -n "$want" ] || continue
-              result=""
-              label="$SHA"
-              release_result="$(classify "$want" "$runs_release")"
-              if [ "$want" != "Security Audit" ] && [ "$release_result" = "failed" ]; then
-                # FIX 2 (round 2, reviewer-required): a completed FAILURE
-                # already sitting at the release SHA itself must never be
-                # masked by a green parent. Reuse only ever SKIPS a wait for
-                # a workflow that has not failed here; it must not ignore one
-                # that has.
-                result="failed"
-                label="$SHA"
+              # FIX 2 (round 3, reviewer-corrected priority order):
+              #   (a) any success at the release SHA wins outright;
+              #   (b) else a completed run at the release SHA with conclusion
+              #       exactly "failure" fails the job -- checked BEFORE any
+              #       wait, so a still-running retry can never hide it;
+              #   (c) else reuse the parent's success if this bump is
+              #       eligible (never for Security Audit, which is never
+              #       reused);
+              #   (d) else wait for the release SHA's own result. Cancelled,
+              #       timed_out, and skipped deliberately fall through to (c)
+              #       or (d) rather than failing here: they are not evidence
+              #       the code is broken, only that this exact run did not
+              #       finish, and treating them as a hard fail would break an
+              #       otherwise-green bump whenever a later push's
+              #       cancel-in-progress concurrency group cancels the
+              #       release SHA's own in-flight run.
+              if has_conclusion "$want" "$runs_release" success; then
+                result="success"; label="$SHA"
+              elif has_conclusion "$want" "$runs_release" failure; then
+                result="failed"; label="$SHA"
               elif [ "$want" != "Security Audit" ] && [ "$ELIGIBLE" = "1" ] \
-                   && [ "$(classify "$want" "$runs_parent")" = "success" ]; then
-                result="success"
-                label="$PARENT (reused)"
+                   && has_conclusion "$want" "$runs_parent" success; then
+                result="success"; label="$PARENT (reused)"
               else
-                result="$release_result"
-                label="$SHA"
+                result="pending"; label="$SHA"
               fi
               echo "  $want @ $label: $result"
               case "$result" in
