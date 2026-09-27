@@ -665,3 +665,29 @@ checklist item before writing ANY `review@`/`merged@` status, not an
 occasional spot-check -- this has now cost real review-agent time
 (S-14's reviewer had to reconstruct via Read across worktrees) on top
 of the tracking confusion itself.
+
+### Drift audit (turn 84, 6-hour window)
+
+**Matched CONTROL.md:** the status-tracking-lag correction from turn 72
+started being applied immediately and consistently -- S-14 and S-36's
+reworks were both committed to a real git ref in the SAME turn they
+were reported, not left pending for a later cleanup pass. Two separate
+reviewer teams (S-29, S-20) independently confirmed a session-wide
+EnterWorktree tooling bug rather than one agent assuming it was a
+local fluke, and both correctly re-dispatched with the exact workaround
+(verify Bash first, never call EnterWorktree, use `git show` across
+worktrees) rather than repeating the same failure a third time.
+
+**Drifted:** S-44 (the confirmed sole lever on the release blocker per
+turn-72's own correction) is STILL not merged after nearly an hour of
+build time -- longer than any other single build this session. This is
+the single highest-priority item and has now been the top priority
+for two consecutive audits without landing. Shard 2/4 has hung a 7th
+time. NO_RECENT_RELEASE has now stood for 5.5 hours.
+
+**Correction for the next 6 hours:** if S-44 is not merged by the next
+audit (turn 90), treat that as itself worth investigating (is the
+per-suite instrumentation task genuinely this large, or is the builder
+stuck on something) rather than continuing to wait passively -- check
+its actual diff-in-progress via Read, not just its transcript
+timestamp, to confirm real forward progress on the deliverable itself.
