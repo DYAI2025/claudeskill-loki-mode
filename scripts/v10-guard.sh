@@ -348,7 +348,7 @@ def _mask_quoted_redirect_chars(text):
                 out.append(ch)
             elif ch == "\\" and i + 1 < n:
                 out.append(ch)
-                out.append(text[i + 1])
+                out.append(_REDIRECT_MASK.get(text[i + 1], text[i + 1]))
                 i += 2
                 continue
             else:
@@ -366,8 +366,9 @@ def _mask_quoted_redirect_chars(text):
             i += 1
             continue
         if ch == "\\" and i + 1 < n:
+            # An escaped char outside quotes is literal too (`\>` is not a redirect).
             out.append(ch)
-            out.append(text[i + 1])
+            out.append(_REDIRECT_MASK.get(text[i + 1], text[i + 1]))
             i += 2
             continue
         out.append(ch)
@@ -501,7 +502,9 @@ def expand_shell_payloads(segs, seps, depth=0):
         c_pos = args.index("-c")
         if c_pos + 1 >= len(args):
             continue
-        payload = args[c_pos + 1]
+        # Undo tokenize()'s redirect-char mask: inside the payload these are
+        # live operators again (&&, >, &) once bash re-parses it.
+        payload = unmask_redirect_chars(args[c_pos + 1])
         try:
             payload_tokens = tokenize(payload)
         except ValueError:
@@ -763,11 +766,14 @@ def segment_writes_board(words, name, idx, raw_segment_text):
     if name == "truncate" and any(_covers_board(a) for a in rest if not a.startswith("-")):
         return True
     if name == "perl":
-        has_pi = any(a in ("-pi", "-ip") for a in rest) or ("-p" in rest and "-i" in rest)
+        # Combined short flags (-pi, -i -pe, -pie, -i.bak): collect every
+        # flag char; perl -i edits in place with or without -p.
+        flag_chars = "".join(a[1:] for a in rest if a.startswith("-") and not a.startswith("--"))
+        has_pi = "i" in flag_chars
         if has_pi and any(_covers_board(a) for a in rest if not a.startswith("-")):
             return True
     if name in ("python3", "python") and "open(" in raw_segment_text and \
-            re.search(r"open\([^)]*BOARD\.md[^)]*,\s*[\"'][wax]", raw_segment_text):
+            re.search(r"open\([^)]*BOARD\.md[^)]*,\s*(?:mode\s*=\s*)?[\"'][wax]", raw_segment_text):
         return True
     return False
 

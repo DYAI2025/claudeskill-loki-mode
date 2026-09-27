@@ -629,8 +629,34 @@ assert_blocked "S-99 R3: sed -i rewriting BOARD.md earlier in the command sets p
     "sed -i '' '/S-3/d' docs/v10/BOARD.md && git commit -am x" "$REPO3" "RULE3"
 board_reset
 
+# S-99 rework: review findings 1-4.
+# (F1) The redirect-char mask must be undone before a bash -c / sh -c
+# payload is re-tokenized, or a quoted &&, >, & glues the payload into one
+# segment and hides every rule after its first word.
+assert_blocked "S-99 F1a: bash -c payload with && still scans the rm after it" \
+    "bash -c 'true && rm -rf /Users/nonexistent-s99'" "$SCRIPT_DIR" "RULE4"
+assert_blocked "S-99 F1b: sh -c payload with && still scans the force push after it" \
+    'sh -c "true && git push --force"' "$SCRIPT_DIR" "RULE2"
+assert_blocked "S-99 F1c: bash -c payload with > VERSION still blocked" \
+    "bash -c 'echo 9.9.9 > VERSION'" "$SCRIPT_DIR" "RULE5"
+# (F2) perl -i -pe (separate -i, combined -pe) is the common idiom.
+board_reset
+assert_blocked "S-99 F2: perl -i -pe rewriting BOARD.md sets pending before commit" \
+    "perl -i -pe 's/S-3/X/' docs/v10/BOARD.md && git commit -am x" "$REPO3" "RULE3"
+board_reset
+# (F3) A backslash-escaped ">" outside quotes is a literal argument too.
+assert_blocked "S-99 F3: escaped \\> must not hide the real rm target after it" \
+    'rm -rf /tmp/x \> /Users/someone/important' "$SCRIPT_DIR" "RULE4"
+# (F4) python open() with a keyword mode= argument.
+board_reset
+assert_blocked "S-99 F4: python3 open(path, mode='w') on BOARD.md sets pending before commit" \
+    "python3 -c \"open('docs/v10/BOARD.md', mode='w').write('gone')\" && git commit -am x" "$REPO3" "RULE3"
+board_reset
+
 echo ""
 echo "--- S-99 follow-ups continued: everyday commands stay allowed ---"
+assert_allowed "S-99 sanity: bash -c with a quoted && of safe commands still allowed" \
+    "bash -c 'true && echo ok > /dev/null'" "$SCRIPT_DIR"
 assert_allowed "S-99 sanity: git status still allowed" "git status" "$SCRIPT_DIR"
 assert_allowed "S-99 sanity: kill of a literal PID still allowed" "kill -9 42123" "$SCRIPT_DIR"
 assert_allowed "S-99 sanity: heredoc commit message with an apostrophe still allowed" \
