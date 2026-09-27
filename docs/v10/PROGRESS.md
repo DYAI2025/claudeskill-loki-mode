@@ -434,3 +434,19 @@ review-cadence checkpoint (roughly: after every 2-3 notifications, or
 before any push), instead of committing after each individual one --
 the first two corrections described the right policy but execution
 kept reverting to one-commit-per-event under notification pressure.
+
+### Stalled-agent incident (turn ~35)
+
+Two dispatched reviewers (S-09 round 3 reviewer 2, S-27 reviewer 1)
+were listed as "running" for 2-3+ hours with zero real progress --
+`ListAgents` reported them active, but their transcripts' last
+timestamped event was over 2 hours stale in both cases (confirmed by
+reading the actual transcript timestamps, not trusting the "running"
+status label). Both were killed via `TaskStop` and replaced with fresh
+dispatches instructed to work efficiently and stop-and-report rather
+than run indefinitely if they find themselves going deep into
+tangential exploration. Correction: a background agent's listed status
+("running") is not evidence of live progress -- check its transcript's
+actual last-event timestamp against wall-clock time before assuming a
+long-running review is still doing useful work, especially once it's
+well past the review-tier's stated time budget.
