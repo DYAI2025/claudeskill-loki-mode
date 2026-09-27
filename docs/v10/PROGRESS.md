@@ -1071,3 +1071,22 @@ caught on train 1's own commit; the fast-tier dist-freshness check
 exists but the train skipped local-ci. Correction: run
 `bash scripts/local-ci.sh` (fast tier) on every train's freeze commit
 before pushing it, not only on release commits.
+
+## Drift audit, turn 180
+
+**Near-miss caught, becomes a GUARDS.md entry (S-76):** S-72's
+worktree cleanup used "directory modified in the last 90 minutes" as
+its liveness signal. Its own `git -C <wt> status` calls refresh each
+worktree's index and touch mtimes (pulse jumped to "Active builder
+worktrees: 123 of 129"), so the signal went dead, and a live agent
+that has not yet committed or written a file looks safe by every
+other rule. Caught before any removal (agent reported "0 worktrees
+removed so far"). Fix applied: an explicit exclusion list of live and
+approved-unmerged worktrees, plus `.git` file birth time (`stat -f %B`)
+as the recency signal. Guard to build: the worktree-cleanup tool must
+take the live-agent list as input and must not use mtime.
+
+**Matched:** trains stay frozen while v9.56.0 waits on Tests at
+b651b98d; all wave-2 slices build in parallel; every review that
+found a blocker went back to the same engineer with the reviewers'
+exact reproductions (S-73, S-74, S-75), not to a fresh agent.
