@@ -98,6 +98,21 @@ moat: 7 of 9 properties proven
 moat suite: FAIL (1 rule failure(s))
 EOF
 
+# write_moat_sha RESULT_FILE REPO REF -- writes RESULT_FILE.sha holding the
+# full SHA `git rev-parse REF` currently resolves to in REPO (BACKLOG 133:
+# the sidecar convention scripts/v10-pulse.sh now requires). Must be called
+# AFTER any fixture commit that moves REF, and again after each later commit
+# that moves it further, or the sidecar goes stale exactly like the real bug.
+write_moat_sha() {
+    local result_file="$1" repo="$2" ref="$3"
+    (cd "$repo" && git rev-parse "$ref") > "${result_file}.sha"
+}
+
+# A fabricated, well-formed-looking but wrong SHA: proves the comparison is a
+# real inequality check against the CURRENT resolved ref, not a vacuous
+# "sidecar exists" check.
+STALE_SHA="0000000000000000000000000000000000dead"
+
 # A worktree-list fixture builder. Writes a porcelain listing (primary
 # worktree first, always skipped by position) followed by N builder
 # worktrees, each a real .git-file + gitdir with HEAD/index/logs/HEAD, whose
@@ -306,6 +321,7 @@ done
 # reflects the age filter, not just how many were listed.
 WT_CLEAN_STALE="$WORK/wtc-stale"; mkdir -p "$WT_CLEAN_STALE"
 make_worktree "$WT_CLEAN_STALE" 120 1790474400
+write_moat_sha "$MOAT_RESULT_PASS" "$FAKE_REPO" main
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
     "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
     "PULSE_MOAT_RESULT=$MOAT_RESULT_PASS" \
@@ -338,6 +354,49 @@ else
     printf '%s\n' "$OUT"
 fi
 
+echo "T4c -- BACKLOG 133: a STALE PULSE_MOAT_RESULT (sidecar SHA does not match current main) is UNKNOWN, never a false clean"
+# Same real, parseable, clean (7 of 9, no rule failures) MOAT_RESULT_PASS
+# fixture as T4 -- proves the false-clean this fixes: without the SHA check,
+# this input alone would report exit 0 with no MOAT_REGRESSION violation.
+MOAT_RESULT_STALE="$WORK/moat-result-stale.txt"
+cp "$MOAT_RESULT_PASS" "$MOAT_RESULT_STALE"
+printf '%s\n' "$STALE_SHA" > "${MOAT_RESULT_STALE}.sha"
+MAIN_SHA_T4C="$(cd "$FAKE_REPO" && git rev-parse main)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_STALE" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}" "$WT_CLEAN_STALE")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (moat result is stale, measured against ${STALE_SHA:0:8} but main is now at ${MAIN_SHA_T4C:0:8})"; then
+    ok "stale sidecar SHA: moat_regression reports UNKNOWN with the stale reason, never a false clean"
+else
+    bad "T4c stale-sha case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T4d -- BACKLOG 133: a PULSE_MOAT_RESULT with NO sidecar SHA at all is UNKNOWN, never a confident verdict"
+# A real FAIL result (would otherwise fire MOAT_REGRESSION) with no
+# "<file>.sha" sidecar present -- the older-style capture with no provenance.
+# Must fail closed to UNKNOWN, not fire the violation and not read as clean.
+MOAT_RESULT_NO_SHA="$WORK/moat-result-no-sha.txt"
+cp "$MOAT_RESULT_FAIL" "$MOAT_RESULT_NO_SHA"
+rm -f "${MOAT_RESULT_NO_SHA}.sha"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_NO_SHA" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}" "$WT_CLEAN_STALE")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (PULSE_MOAT_RESULT has no provenance:"; then
+    ok "no sidecar SHA: moat_regression reports UNKNOWN, never a confident verdict from unprovenanced input"
+else
+    bad "T4d no-sha case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo "T5 -- CONTROL.md over the 40-line budget"
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OVERSIZE" \
     "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
@@ -367,6 +426,7 @@ CLEAN_MOAT_ARGS=(
     "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON"
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"
 )
+write_moat_sha "$MOAT_RESULT_FAIL" "$FAKE_REPO" main
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
     "${CLEAN_MOAT_ARGS[@]}"; then rc=0; else rc=$?; fi
 if [ "$rc" = 1 ] \
@@ -385,6 +445,7 @@ cat > "$MOAT_RESULT_COUNT_DROP" <<'EOF'
 moat: 6 of 9 properties proven
 moat suite: no rule failed (6 of 9 proven; the moat is NOT proven)
 EOF
+write_moat_sha "$MOAT_RESULT_COUNT_DROP" "$FAKE_REPO" main
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_COUNT_DROP"; then rc=0; else rc=$?; fi
 if [ "$rc" = 1 ] \
     && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat proven count dropped to 6 of 9 (was 7 of 9 pending-derived at last release)"; then
@@ -469,21 +530,34 @@ else
     printf '%s\n' "$OUT"
 fi
 
-echo "T9b -- moat baseline UNKNOWN but a measured PULSE_MOAT_RESULT is still usable for MOAT_REGRESSION"
-# A missing/unreadable baseline (git tag lookup failed) must not block using
-# a real measured result for the suite-FAIL check, since that check does not
-# need the baseline count at all -- only the count-drop path does.
+echo "T9b -- BACKLOG 133 supersedes the old contract here: with NO .git at all, PULSE_MAIN_REF's HEAD"
+echo "      cannot be resolved either, so SHA provenance can't be verified -- a measured FAIL must now"
+echo "      report UNKNOWN (fail closed), NOT fire MOAT_REGRESSION, even though the result itself parses"
+# Before BACKLOG 133's SHA-pinning fix, this case fired MOAT_REGRESSION
+# because the suite-FAIL check did not need the pending-derived baseline at
+# all. It now ALSO needs to resolve PULSE_MAIN_REF's current HEAD to verify
+# the result's sidecar SHA is current -- and NO_GIT_REPO has no .git, so that
+# resolution fails too. A result that cannot be proven current must not be
+# trusted to fire a violation, so this correctly downgrades to UNKNOWN.
+write_moat_sha "$MOAT_RESULT_FAIL" "$FAKE_REPO" main
 if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
     "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
     "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
     "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
-if printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL" \
-    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline"; then
-    ok "measured suite FAIL still fires MOAT_REGRESSION even when the pending-derived baseline is UNKNOWN"
+# rc=1 here, not 2: BOARD_CLEAN's 8 ready slices with zero builder worktrees
+# passed independently fire IDLE_BUILDERS -- an unrelated, correct violation
+# from this fixture's shape. The assertion below isolates the thing this test
+# actually verifies: MOAT_REGRESSION must NOT be among the fired violations,
+# and moat_regression must be UNKNOWN with the provenance-unresolvable reason.
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: MOAT_REGRESSION" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (could not verify PULSE_MOAT_RESULT's provenance: main's current HEAD could not be resolved)"; then
+    ok "with no .git anywhere, MAIN_REF's HEAD cannot be resolved either, so the measured FAIL correctly downgrades to UNKNOWN instead of firing"
 else
-    bad "T9b baseline-unknown-but-measured case: output follows"
+    bad "T9b baseline-unknown-but-measured case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
@@ -529,6 +603,7 @@ print(json.dumps({
     GIT_AUTHOR_DATE="2026-09-27T01:00:00Z" GIT_COMMITTER_DATE="2026-09-27T01:00:00Z" \
         git commit -q -m "unreleased change 2"
 )
+write_moat_sha "$MOAT_RESULT_FAIL" "$FAKE_REPO" main
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_ALL" \
     "PULSE_NPM_CMD=cat $NPM_OLD_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
     "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
@@ -648,6 +723,11 @@ cat > "$MOAT_RESULT_T14" <<'EOF'
 moat: 9 of 9 properties proven
 moat suite: all 9 properties proven
 EOF
+# BACKLOG 133: the sidecar SHA must likewise be resolved against
+# PULSE_MAIN_REF (main's tip), never the calling process's own detached HEAD
+# -- write it against main here, so this run stays a real "SHA matches"
+# clean measurement rather than tripping the new stale-SHA check.
+write_moat_sha "$MOAT_RESULT_T14" "$FAKE_REPO" main
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_T14"; then rc=0; else rc=$?; fi
 # Both the pending-derived informational count and the release-baseline read
 # via `git show`, so both must resolve against PULSE_MAIN_REF's v2.0.0 (empty
@@ -657,11 +737,28 @@ if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOA
 # v2.0.0", never "since v1.0.0".
 if printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): 9 of 9" \
     && printf '%s\n' "$OUT" | grep -qF "Moat proven at last release (pending-derived baseline): 9 of 9" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat proven (measured, PULSE_MOAT_RESULT): 9 of 9" \
     && printf '%s\n' "$OUT" | grep -q "since v2.0.0" \
     && ! printf '%s\n' "$OUT" | grep -q "since v1.0.0"; then
-    ok "moat pending-derived count, baseline, and unreleased-merge age all resolve against PULSE_MAIN_REF's v2.0.0 tag, not the detached HEAD's v1.0.0"
+    ok "moat pending-derived count, baseline, unreleased-merge age, and the SHA-pinned measured result all resolve against PULSE_MAIN_REF's v2.0.0 tag, not the detached HEAD's v1.0.0"
 else
     bad "T14 finding-1 repro case: rc=$rc output follows (HEAD detached at $DETACHED_HEAD_SHA, main at $MAIN_TIP_SHA)"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T14b -- BACKLOG 133: same fixture, but the sidecar SHA is written against the DETACHED HEAD"
+echo "        (the v1.0.0 tag), not main -- must report UNKNOWN as stale, proving the SHA compare"
+echo "        pins to PULSE_MAIN_REF and does not silently accept the calling process's own HEAD"
+write_moat_sha "$MOAT_RESULT_T14" "$FAKE_REPO" HEAD
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_T14" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (moat result is stale, measured against ${DETACHED_HEAD_SHA} but main is now at ${MAIN_TIP_SHA})"; then
+    ok "sidecar SHA pinned to the calling process's own detached HEAD (not main) correctly reports stale/UNKNOWN"
+else
+    bad "T14b HEAD-vs-main-pinning case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 (cd "$FAKE_REPO" || exit 1; git checkout -q main; git tag -d v2.0.0 >/dev/null; git reset -q --hard v1.0.0)
@@ -744,13 +841,38 @@ else
     printf '%s\n' "$OUT"
 fi
 
-echo "T17 -- finding 3 (decoupling): a failed pending-derived read does not blank the measured MOAT_REGRESSION check"
-# NO_GIT_REPO (from T9) has no .git at all, so the pending-derived
-# informational read (git show) fails -- but a measured PULSE_MOAT_RESULT
-# result must still be evaluated and still fire on a live suite FAIL. The two
-# checks are independent safe() calls specifically so one's failure cannot
-# silently blank the other.
-if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
+echo "T17 -- finding 3 (decoupling): a failed pending-derived read AND an UNKNOWN release baseline do not"
+echo "      blank the measured MOAT_REGRESSION check, once its own SHA provenance still checks out"
+# A real .git repo (so PULSE_MAIN_REF's HEAD CAN be resolved for the BACKLOG
+# 133 SHA check) tagged v1.0.0 but with no tests/moat/pending.txt blob AT
+# EITHER the tag or main -- so BOTH the pending-derived informational read
+# (`git show main:...`) and the release-baseline read (`git show v1.0.0:...`,
+# used by the count-drop path and reported as moat_baseline UNKNOWN) fail on
+# their own, while a measured, SHA-matched PULSE_MOAT_RESULT result must
+# still be evaluated and still fire on a live suite FAIL. The three checks
+# (pending-derived, baseline, measured) are independent safe() calls
+# specifically so one's failure cannot silently blank another -- this is the
+# same case T9b/T17 covered before BACKLOG 133 (an UNKNOWN baseline must not
+# gate the measured suite-FAIL check), reconstructed here with a repo whose
+# main IS resolvable so the new SHA check does not also fire. (Pre-BACKLOG-133
+# this used NO_GIT_REPO, which had no .git at all -- that now also makes
+# MAIN_REF's HEAD unresolvable, which is the different, UNKNOWN-provenance
+# case T9b covers instead.)
+NO_PENDING_REPO="$WORK/no-pending-repo"
+mkdir -p "$NO_PENDING_REPO"
+(
+    cd "$NO_PENDING_REPO" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    echo "no moat dir here" > README.md
+    git add README.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "no tests/moat/pending.txt on this repo"
+    git tag v1.0.0
+)
+write_moat_sha "$MOAT_RESULT_FAIL" "$NO_PENDING_REPO" main
+if run_pulse "PULSE_REPO_ROOT=$NO_PENDING_REPO" "PULSE_MAIN_REF=main" \
     "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
     "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
@@ -758,8 +880,9 @@ if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
 if [ "$rc" = 1 ] \
     && printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline" \
     && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL"; then
-    ok "pending-derived read UNKNOWN (no .git) does not stop the independent measured-result check from firing"
+    ok "pending-derived read AND release-baseline both UNKNOWN (no pending.txt blob anywhere) do not stop the independent, SHA-verified measured-result check from firing"
 else
     bad "T17 decoupling case: rc=$rc output follows"
     printf '%s\n' "$OUT"

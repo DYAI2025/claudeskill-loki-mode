@@ -46,15 +46,32 @@
 #                       informational context only. With no PULSE_MOAT_RESULT
 #                       (or an unreadable/unparseable one), MOAT_REGRESSION
 #                       reports UNKNOWN rather than silently falling back to
-#                       the pending-derived count. Typical use:
+#                       the pending-derived count.
+#                       SHA pinning (BACKLOG 133): a result file alone is not
+#                       enough -- it must also prove which commit it was
+#                       measured against. The writer MUST also write a
+#                       sidecar file at "<PULSE_MOAT_RESULT>.sha" holding
+#                       exactly the full 40-char SHA the tree was at when
+#                       `tests/moat/run.sh` was run (no trailing content, no
+#                       short SHA, no ref name -- compared byte-for-byte,
+#                       never re-resolved through git). Capture the SHA and
+#                       require a clean tree BEFORE running the suite, not
+#                       after: `tests/moat/run.sh` takes minutes, in which
+#                       time HEAD can move (another process, a background
+#                       swarm run) and a dirty tree means HEAD's SHA does not
+#                       actually describe what was measured. Typical use:
+#                         git diff --quiet HEAD || exit 1
+#                         moat_sha="$(git rev-parse HEAD)"
 #                         bash tests/moat/run.sh > moat-result.txt
+#                         printf '%s\n' "$moat_sha" > moat-result.txt.sha
 #                         PULSE_MOAT_RESULT=moat-result.txt bash scripts/v10-pulse.sh
-#                       Known limitation: this file carries no SHA or
-#                       timestamp of its own, so a STALE captured result
-#                       (from an earlier commit) fed in repeatedly reads as
-#                       current -- this script cannot detect that; the
-#                       caller is responsible for regenerating it per commit
-#                       it cares about pinning to.
+#                       This script compares that sidecar's contents against
+#                       PULSE_MAIN_REF's current resolved HEAD. A missing/
+#                       empty sidecar (an older-style capture with no
+#                       provenance) or a mismatched SHA (a stale capture from
+#                       an earlier commit) both report UNKNOWN with a clear
+#                       reason -- never a confident clean/regression verdict
+#                       from input that cannot be proven current.
 #   PULSE_SWARM_START   swarm start time override, epoch seconds or ISO8601
 #   PULSE_NOW           "now" override, epoch seconds or ISO8601
 #   PULSE_PYTHON        python3 interpreter to use (default: python3)
@@ -704,8 +721,12 @@ def moat_pending_count_at(ref):
 # of truth -- only PULSE_MOAT_RESULT, which must point to a file holding the
 # real captured stdout of a `tests/moat/run.sh` run (its own summary lines are
 # parsed verbatim: "moat: N of 9 properties proven" and, when the suite
-# failed, "moat suite: FAIL (K rule failure(s))"). Typical use:
+# failed, "moat suite: FAIL (K rule failure(s))"). Typical use (SHA captured
+# BEFORE the run, see the header comment's BACKLOG 133 note on why):
+#   git diff --quiet HEAD || exit 1
+#   moat_sha="$(git rev-parse HEAD)"
 #   bash tests/moat/run.sh > /path/to/moat-result.txt   # takes minutes
+#   printf '%s\n' "$moat_sha" > /path/to/moat-result.txt.sha
 #   PULSE_MOAT_RESULT=/path/to/moat-result.txt bash scripts/v10-pulse.sh
 # Re-running the suite inside this script's own ~9s budget is not an option
 # (the suite alone takes minutes), so when no result file is supplied, or it
@@ -715,6 +736,18 @@ def moat_pending_count_at(ref):
 # original bug. The pending-derived count is still shown, but only as
 # informational context, explicitly labelled as not suite-verified, and it
 # never feeds a violation.
+#
+# BACKLOG 133 (SHA pinning): a real, parseable PULSE_MOAT_RESULT is still not
+# enough on its own -- nothing ties it to the commit it was measured against,
+# so a stale capture from an earlier commit would read as clean today. The
+# required sidecar "<PULSE_MOAT_RESULT>.sha" (see the header comment) must
+# hold exactly the full SHA `tests/moat/run.sh` was measured at; this script
+# compares it byte-for-byte against `git rev-parse MAIN_REF`'s current
+# resolved HEAD (never re-resolved through git -- a ref name or short SHA in
+# the sidecar simply fails the equality check rather than being trusted). A
+# missing/empty sidecar or a mismatch both demote an otherwise-parseable
+# result to UNKNOWN, deliberately fail-closed: a capture with no provenance,
+# or provably stale provenance, must never register as a confident verdict.
 _MOAT_COUNT_RE = re.compile(r"moat:\s*(\d+)\s*of\s*9\s*properties\s*proven", re.IGNORECASE)
 _MOAT_FAIL_RE = re.compile(r"moat suite:\s*FAIL\s*\((\d+)\s*rule failure", re.IGNORECASE)
 # tests/moat/run.sh's own terminal verdict lines (see its final echo calls):
@@ -781,6 +814,36 @@ def check_moat_regression():
                     "PULSE_MOAT_RESULT file did not contain a parseable 'moat: N of 9' "
                     "count line plus one of run.sh's terminal verdict lines"
                 )
+            else:
+                # BACKLOG 133: a parseable result is not yet a TRUSTABLE one --
+                # it must also prove it was measured against the commit this
+                # pulse is reporting on. Sidecar path convention, see header.
+                sha_path = result_path + ".sha"
+                try:
+                    with open(sha_path, "r", encoding="utf-8") as f:
+                        measured_sha = f.read().strip()
+                except OSError:
+                    measured_sha = ""
+                if not measured_sha:
+                    measured = None
+                    measured_error = (
+                        "PULSE_MOAT_RESULT has no provenance: expected a sidecar file at "
+                        "%s holding the SHA it was measured against (run "
+                        "`git rev-parse HEAD > %s` BEFORE running the suite); a result with "
+                        "no recorded SHA cannot be trusted to be current" % (sha_path, sha_path)
+                    )
+                elif main_sha is None:
+                    measured = None
+                    measured_error = (
+                        "could not verify PULSE_MOAT_RESULT's provenance: %s's current HEAD "
+                        "could not be resolved" % MAIN_REF
+                    )
+                elif measured_sha != main_sha:
+                    measured = None
+                    measured_error = (
+                        "moat result is stale, measured against %s but %s is now at %s"
+                        % (measured_sha[:8], MAIN_REF, main_sha[:8])
+                    )
 
     return {
         "at_last_release": at_release,
@@ -839,8 +902,9 @@ else:
             emit("Moat regression check: UNKNOWN (%s)" % regression["measured_error"])
         else:
             emit(
-                "Moat regression check: UNKNOWN (no PULSE_MOAT_RESULT supplied; run "
-                "`bash tests/moat/run.sh > FILE` and pass PULSE_MOAT_RESULT=FILE for a real measurement)"
+                "Moat regression check: UNKNOWN (no PULSE_MOAT_RESULT supplied; capture "
+                "`git rev-parse HEAD` BEFORE running `bash tests/moat/run.sh > FILE`, write it to "
+                "FILE.sha, and pass PULSE_MOAT_RESULT=FILE for a real measurement)"
             )
 
 
