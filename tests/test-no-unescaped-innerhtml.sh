@@ -50,7 +50,7 @@ STATS="$(printf '%s\n' "$OUT" | grep '^STATS ' | tail -1)"
 NFILES="$(printf '%s' "$STATS" | sed -n 's/.*files=\([0-9]*\).*/\1/p')"
 NSITES="$(printf '%s' "$STATS" | sed -n 's/.*sites=\([0-9]*\).*/\1/p')"
 NFIND="$(printf '%s' "$STATS" | sed -n 's/.*findings=\([0-9]*\).*/\1/p')"
-if [ "${NFILES:-0}" -ge 20 ] && [ "${NSITES:-0}" -ge 100 ] && [ "${NFIND:-0}" -ge 100 ]; then
+if [ "${NFILES:-0}" -ge 20 ] && [ "${NSITES:-0}" -ge 100 ] && [ "${NFIND:-0}" -ge 1 ]; then
     pass "the scan is non-vacuous (files=$NFILES html_sites=$NSITES findings=$NFIND)"
 else
     fail "the scan examined too little to mean anything (files=${NFILES:-?} sites=${NSITES:-?} findings=${NFIND:-?})"

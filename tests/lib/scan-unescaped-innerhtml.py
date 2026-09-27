@@ -7,7 +7,7 @@ field) and is spliced into that markup unescaped is an XSS sink. Cycle 4 fixed
 two such panels in build-standalone.js (f6050ef1); this guard stops the class
 coming back.
 
-WHAT IS SCANNED: dashboard-ui/components/*.js and
+WHAT IS SCANNED: every .js under dashboard-ui/components (vendor/ too) and
 dashboard-ui/scripts/build-standalone.js. build-standalone.js emits the browser
 code inside one big Node template literal, so the <script> bodies inside any
 template literal are re-tokenized as JavaScript; otherwise every browser-side
@@ -50,7 +50,8 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Findings that were looked at and judged not exploitable, keyed by
-# "<repo-relative file>::<expression with whitespace removed>". Every reason
+# "<repo-relative file>::<expression with whitespace removed>" (also inside
+# string literals, so join(' ') is keyed as join('')). Every reason
 # must say WHY the value cannot carry markup (at least 40 characters). Adding an
 # entry is a deliberate act that shows up in review as one; it is not a way to
 # silence the check.
@@ -309,6 +310,8 @@ ALLOWLIST = {
         'loop variable over COLUMNS, a constant array literal in this file, so the value is a literal written here',
     'dashboard-ui/components/loki-wiki-browser.js::t.id':
         'loop variable over TABS, a constant array literal in this file, so the value is a literal written here',
+    'dashboard-ui/components/vendor/loki-mascot/loki-mascot.js::cfg.label':
+        'cfg is getEmotion(): a copy of EMOTIONS[key] or the default, a constant table of literal labels',
     'dashboard-ui/scripts/build-standalone.js::t.id':
         'loop variable over TYPES in the memory-files panel, a constant array literal in this file, so the value is a literal written here',
     "dashboard-ui/scripts/build-standalone.js::plural(total,'receipt')":
@@ -401,6 +404,12 @@ SAFE_HELPERS = {
         "input passed through this._esc",
     "dashboard-ui/components/loki-spec-panel.js::_typeBadge":
         "builds a badge whose class and label both go through this._esc",
+    "dashboard-ui/components/vendor/loki-mascot/loki-mascot.js::legs":
+        "takes no argument and returns one constant SVG <g> fragment built "
+        "from string literals",
+    "dashboard-ui/components/vendor/loki-mascot/loki-mascot.js::frag":
+        "returns map[key] only when key is an own property of the constant "
+        "BROWS/EYES/MOUTHS/PROPS tables, else the literal fallback",
     "dashboard-ui/components/loki-task-board.js::_columnIcon":
         "a switch over the status that returns one of five constant SVG "
         "fragments; the input is never echoed",
@@ -830,7 +839,8 @@ def scan_file(path):
 
 def default_targets():
     comp = os.path.join(REPO_ROOT, "dashboard-ui", "components")
-    files = sorted(os.path.join(comp, f) for f in os.listdir(comp) if f.endswith(".js"))
+    files = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(comp)
+                   for f in fs if f.endswith(".js"))
     files.append(os.path.join(REPO_ROOT, "dashboard-ui", "scripts", "build-standalone.js"))
     return files
 
