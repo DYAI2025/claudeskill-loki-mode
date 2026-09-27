@@ -1251,6 +1251,8 @@ run_test "Export overwrite guard (non-interactive never hangs)" "$SCRIPT_DIR/tes
 run_test "Time-to-first-preview metric (write-once, never invented)" "$SCRIPT_DIR/test-first-preview-metric.sh"
 run_test "Session knobs stay default-OFF (gates the v8 SDK-flip audit)" "$SCRIPT_DIR/test-session-knobs-default-off.sh"
 run_test "shards partition the suite list (no silently dropped suite)" "$SCRIPT_DIR/test-shard-coverage.sh"
+run_test "shard-durations.tsv drift detector (S-134)" "$SCRIPT_DIR/test-shard-durations-drift.sh"
+run_test "version-bump-only push skips heavy Tests jobs (S-132)" "$SCRIPT_DIR/test-version-bump-only.sh"
 run_test "Tier A test selector (S-91 rules R0-R7)" "$SCRIPT_DIR/test-select-tests.sh"
 run_test "quarantine (non-blocking listed failure, rejects expired/moat/review/>7d)" "$SCRIPT_DIR/test-quarantine.sh"
 run_test "quickstart scorer works on macOS bash 3.2 (first-run path)" "$SCRIPT_DIR/test-quickstart-bash32.sh"

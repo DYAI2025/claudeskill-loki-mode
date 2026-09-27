@@ -588,3 +588,5 @@ State versioning (SYN-015)	0
 Welcome opener (terminal + browser)	7
 Browser-open guard (tests never open a browser, S-103)	1
 ShellCheck Linting	140
+shard-durations.tsv drift detector (S-134)	2
+version-bump-only push skips heavy Tests jobs (S-132)	3
