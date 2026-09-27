@@ -134,6 +134,7 @@ banners you might expect. These variables control the remaining `[INFO]` and
 |---|---|---|
 | `LOKI_DURABLE_STATE` | `0` | `1` enables durable state **and** the richer process-exit contract that lets Kubernetes distinguish a deterministic failure from a crash. See [exit codes](./exit-codes.md). |
 | `LOKI_SDK_LOOP` | unset | Routes the run through the Bun/TypeScript runner instead of bash. Both implement the same exit contract. |
+| `LOKI_ALLOW_AGENT_GITHUB_TOKEN` | unset | By default `GH_TOKEN`/`GITHUB_TOKEN` are withheld from agent sessions and used only by Loki's own push and PR steps. Exactly `1` lets the agent inherit them as before; that is a Rule of Two exposure, and `loki start` prints a one-line stderr warning. |
 
 `LOKI_DURABLE_STATE=1` is the one to set in a Job or task definition. Without
 it every failure collapses to exit 1 and the platform cannot tell "re-running

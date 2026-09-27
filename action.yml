@@ -242,6 +242,9 @@ runs:
         LOKI_COUNCIL_ENABLED: 'false'
         LOKI_SKIP_PREREQS: 'true'
         LOKI_AUTO_CONFIRM: ${{ inputs.auto_confirm }}
+        # Rule of Two: the PRD carries PR text, so the agent never pushes or
+        # opens a PR from this step. Post or push from a later step.
+        LOKI_DELEGATE_PR: '0'
       run: |
         PRD_FILE="${{ steps.review-prd.outputs.prd_file }}"
         OUTPUT_FILE="${RUNNER_TEMP}/loki-review-output.txt"
@@ -276,6 +279,9 @@ runs:
         LOKI_COUNCIL_ENABLED: 'false'
         LOKI_SKIP_PREREQS: 'true'
         LOKI_AUTO_CONFIRM: ${{ inputs.auto_confirm }}
+        # Rule of Two: the PRD carries PR text, so the agent never pushes or
+        # opens a PR from this step. Post or push from a later step.
+        LOKI_DELEGATE_PR: '0'
       run: |
         OUTPUT_FILE="${RUNNER_TEMP}/loki-fix-output.txt"
         PRD_FILE="${{ inputs.prd_file }}"
@@ -309,6 +315,9 @@ runs:
         LOKI_COUNCIL_ENABLED: 'false'
         LOKI_SKIP_PREREQS: 'true'
         LOKI_AUTO_CONFIRM: ${{ inputs.auto_confirm }}
+        # Rule of Two: the PRD carries PR text, so the agent never pushes or
+        # opens a PR from this step. Post or push from a later step.
+        LOKI_DELEGATE_PR: '0'
       run: |
         OUTPUT_FILE="${RUNNER_TEMP}/loki-test-output.txt"
         PRD_FILE="${{ inputs.prd_file }}"
