@@ -237,3 +237,32 @@ actually root-causing the live CI failure log rather than trusting a
 local reproduction that happened to share the same surface symptom for
 a different reason. Fix dispatched: isolate `test-iteration-grace.sh`'s
 two `run.sh`-sourcing call sites into their own scratch CWD.
+
+### Anti-drift control system (founder directive, 2026-09-26/27)
+
+Founder directive: build `docs/v10/CONTROL.md` plus `scripts/v10-pulse.sh`
+as the top priority above all slices, so every turn starts from a
+deterministic, fact-derived violation report instead of memory. Work this
+turn:
+
+- `docs/v10/CONTROL.md` written (36 lines, under the 40-line budget) and
+  pushed (a37c3fa9): mission, priority order, D12-D19 one-liners, velocity
+  targets, and the rule that every turn addresses the top pulse violation
+  first. Added to the hot-files list.
+- `docs/v10/BOARD.md` normalized: every slice row's Status cell is now
+  exactly `token@YYYY-MM-DDTHH:MMZ`, with prose moved to a new Notes
+  column, so the pulse script's parser has a fixed contract instead of
+  free text (7beffa20, pushed). Merged-but-unreleased age is documented as
+  git-derived, not BOARD-trusted, per the same section.
+- Pulse-script builder dispatched (worktree, MEDIUM tier) with the full
+  constraint set: 10s budget via portable timeouts (no macOS `timeout`),
+  UNKNOWN-never-reads-as-clean on any failed sub-check, a cheap `stat`-based
+  builder-activity check (never `find` across ~40 worktrees), full env-var
+  injectability, exact-match VIOLATION line assertions per fixture, and a
+  self-check that CONTROL.md itself stays under 40 lines. Result pending.
+- S-23's follow-up review batch closed clean (2/2 APPROVE, no blocking
+  findings) while this work was in flight; BOARD.md updated accordingly.
+- Still open: hooks in `.claude/settings.local.json` (after the pulse
+  script merges), pulse test fixtures (bundled into the builder's own
+  scope), the every-6th-turn drift-audit mechanism, and the founder reply
+  once the pulse is live.
