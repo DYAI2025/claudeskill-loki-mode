@@ -5428,6 +5428,7 @@ except Exception:
 # the agent runs (see .github/workflows/loki-issue-to-pr.yml).
 #===============================================================================
 _LOKI_WITHHELD_TOKENS=""
+_LOKI_GIT_CONFIG_COUNT_UNSUPPORTED=""
 _LOKI_GH_TOKEN_REAL_HAD=""
 _LOKI_GH_TOKEN_REAL_VAL=""
 _LOKI_GITHUB_TOKEN_REAL_HAD=""
@@ -5467,28 +5468,107 @@ _loki_restore_one_token() {
 _loki_gh_capture() {
     [ -z "$_LOKI_WITHHELD_TOKENS" ] || return 0
     local _v
-    if [ -n "${GH_TOKEN+x}" ]; then _LOKI_GH_TOKEN_REAL_HAD=1; _LOKI_GH_TOKEN_REAL_VAL="$GH_TOKEN"; fi
-    if [ -n "${GITHUB_TOKEN+x}" ]; then _LOKI_GITHUB_TOKEN_REAL_HAD=1; _LOKI_GITHUB_TOKEN_REAL_VAL="$GITHUB_TOKEN"; fi
-    if [ -n "${GH_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GH_ENT_TOKEN_REAL_HAD=1; _LOKI_GH_ENT_TOKEN_REAL_VAL="$GH_ENTERPRISE_TOKEN"; fi
-    if [ -n "${GITHUB_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GITHUB_ENT_TOKEN_REAL_HAD=1; _LOKI_GITHUB_ENT_TOKEN_REAL_VAL="$GITHUB_ENTERPRISE_TOKEN"; fi
+    # GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n were introduced in
+    # git 2.31.0 (2021-03-15); an older git silently ignores them, leaving the
+    # credential.helper reset a no-op with no error -- the exact
+    # fail-open-with-no-signal this fix must not have. Detected once per
+    # process (not on every apply) from `git --version`; a `git version
+    # X.Y.Z` line below 2.31 sets the flag so _loki_withhold_github_tokens can
+    # warn once. Ubuntu 24.04 (2.43) and Debian bookworm (2.39), the two base
+    # images this project ships (Dockerfile, Dockerfile.sandbox), are both
+    # well above this floor; the warning matters for an operator's own older
+    # git (e.g. RHEL 8 ships 2.18).
+    if command -v git >/dev/null 2>&1; then
+        local _gv _gv_major _gv_minor
+        _gv="$(git --version 2>/dev/null)"
+        case "$_gv" in
+            git\ version\ [0-9]*.[0-9]*.*)
+                _gv="${_gv#git version }"
+                _gv_major="${_gv%%.*}"
+                _gv="${_gv#*.}"
+                _gv_minor="${_gv%%.*}"
+                case "$_gv_major" in *[!0-9]*) _gv_major="" ;; esac
+                case "$_gv_minor" in *[!0-9]*) _gv_minor="" ;; esac
+                if [ -n "$_gv_major" ] && [ -n "$_gv_minor" ]; then
+                    if [ "$_gv_major" -lt 2 ] || { [ "$_gv_major" -eq 2 ] && [ "$_gv_minor" -lt 31 ]; }; then
+                        _LOKI_GIT_CONFIG_COUNT_UNSUPPORTED=1
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    # Cross-runtime/nested-`loki start` guard: a bash child spawned by an
+    # ALREADY-withheld process (Bun's delegateToBash forwarding
+    # {...process.env}, or an agent literally invoking `loki start` inside its
+    # own withheld session) inherits the PARENT's sentinel/scoped state as
+    # ordinary env vars. Without this guard this process would capture that
+    # inherited state as if it were the operator's real original and restore
+    # to it for its own trusted calls -- i.e. Loki's own push/PR would use the
+    # inherited garbage sentinel instead of a real credential. Detect the
+    # sentinel shape (see _LOKI_GH_SENTINEL below) and treat it, and the
+    # scoped GH_CONFIG_DIR/credential.helper reset that came with it, as
+    # ABSENT rather than as the real original.
+    local _inherited_sentinel=""
+    case "${GH_TOKEN:-}" in ghp_LOKIWITHHELDsentinel*INVALID) _inherited_sentinel=1 ;; esac
+    if [ -n "$_inherited_sentinel" ]; then
+        : # GH_TOKEN/GITHUB_TOKEN/GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN
+          # all get the SAME sentinel per _loki_gh_apply, so one check covers
+          # all 4 -- _LOKI_*_REAL_HAD stays unset for each, meaning "restore to
+          # absent", not "restore to this garbage value".
+    else
+        if [ -n "${GH_TOKEN+x}" ]; then _LOKI_GH_TOKEN_REAL_HAD=1; _LOKI_GH_TOKEN_REAL_VAL="$GH_TOKEN"; fi
+        if [ -n "${GITHUB_TOKEN+x}" ]; then _LOKI_GITHUB_TOKEN_REAL_HAD=1; _LOKI_GITHUB_TOKEN_REAL_VAL="$GITHUB_TOKEN"; fi
+        if [ -n "${GH_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GH_ENT_TOKEN_REAL_HAD=1; _LOKI_GH_ENT_TOKEN_REAL_VAL="$GH_ENTERPRISE_TOKEN"; fi
+        if [ -n "${GITHUB_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GITHUB_ENT_TOKEN_REAL_HAD=1; _LOKI_GITHUB_ENT_TOKEN_REAL_VAL="$GITHUB_ENTERPRISE_TOKEN"; fi
+    fi
     for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
         _LOKI_WITHHELD_TOKENS="${_LOKI_WITHHELD_TOKENS:+$_LOKI_WITHHELD_TOKENS }$_v"
     done
-    if [ -n "${GH_CONFIG_DIR+x}" ]; then
-        _LOKI_GH_CONFIG_DIR_HAD=1
-        _LOKI_GH_CONFIG_DIR_OLD="$GH_CONFIG_DIR"
-    fi
+    # An inherited scoped GH_CONFIG_DIR (bash's loki-gh-config.* or the Bun
+    # route's loki-gh-config-*) is likewise not the operator's real original.
+    case "${GH_CONFIG_DIR:-}" in
+        "${TMPDIR:-/tmp}"/loki-gh-config.* | "${TMPDIR:-/tmp}"/loki-gh-config-*) ;;
+        *)
+            if [ -n "${GH_CONFIG_DIR+x}" ]; then
+                _LOKI_GH_CONFIG_DIR_HAD=1
+                _LOKI_GH_CONFIG_DIR_OLD="$GH_CONFIG_DIR"
+            fi
+            ;;
+    esac
+    # An inherited credential.helper reset: if the sentinel was inherited AND
+    # the LAST GIT_CONFIG_KEY/VALUE pair is exactly this fix's reset
+    # (credential.helper=""), treat the count as if that pair were never
+    # added -- i.e. capture the state BENEATH it as the real original, so
+    # restore correctly removes only the inherited pair rather than an
+    # operator-configured one at the same index.
     if [ -n "${GIT_CONFIG_COUNT:-}" ] && [ "${GIT_CONFIG_COUNT}" -eq "${GIT_CONFIG_COUNT}" ] 2>/dev/null; then
-        _LOKI_GIT_CONFIG_COUNT_HAD=1
-        _LOKI_GIT_CONFIG_COUNT_OLD="$GIT_CONFIG_COUNT"
-        _LOKI_GIT_CRED_INDEX="$GIT_CONFIG_COUNT"
+        local _n=$((GIT_CONFIG_COUNT - 1)) _last_key_var _last_val_var
+        _last_key_var="GIT_CONFIG_KEY_${_n}"
+        _last_val_var="GIT_CONFIG_VALUE_${_n}"
+        if [ -n "$_inherited_sentinel" ] && [ "$_n" -ge 0 ] \
+            && [ "${!_last_key_var:-}" = "credential.helper" ] && [ -z "${!_last_val_var:-}" ]; then
+            if [ "$_n" -gt 0 ]; then
+                _LOKI_GIT_CONFIG_COUNT_HAD=1
+                _LOKI_GIT_CONFIG_COUNT_OLD="$_n"
+            fi
+            _LOKI_GIT_CRED_INDEX="$_n"
+        else
+            _LOKI_GIT_CONFIG_COUNT_HAD=1
+            _LOKI_GIT_CONFIG_COUNT_OLD="$GIT_CONFIG_COUNT"
+            _LOKI_GIT_CRED_INDEX="$GIT_CONFIG_COUNT"
+        fi
     else
         _LOKI_GIT_CRED_INDEX=0
     fi
     # Fixed for the process lifetime once captured, so restore-then-reapply
     # (the trusted-call cycle) always re-exports the SAME sentinel rather than
     # minting a new one that a caller mid-command could not have seen.
-    _LOKI_GH_SENTINEL="ghp_LOKI_WITHHELD_$$_${RANDOM}${RANDOM}_INVALID"
+    # Alphanumeric-only after the ghp_ prefix (no underscores): matches the
+    # real gh token shape and the existing token-redaction regex in
+    # autonomy/lib/proof_redact.py (gh[pousr]_[A-Za-z0-9]{20,}), so if this
+    # sentinel ever leaked into a proof/receipt artifact it would still be
+    # caught by the existing redaction filter rather than passing it by shape.
+    _LOKI_GH_SENTINEL="ghp_LOKIWITHHELDsentinel$$${RANDOM}${RANDOM}INVALID"
 }
 
 # Unconditionally (re-)export the withheld/scoped state. Never captures --
@@ -5531,13 +5611,32 @@ _loki_gh_restore() {
     unset "GIT_CONFIG_KEY_${_LOKI_GIT_CRED_INDEX}" "GIT_CONFIG_VALUE_${_LOKI_GIT_CRED_INDEX}"
 }
 
+_LOKI_GH_TRUSTED_DEPTH=0
+
+# Reentrancy: a trusted function (create_session_pr) calls `gh` directly one
+# or more times; since the gh() wrapper (_loki_gh_apply) IS
+# _loki_with_github_tokens, each of those calls re-enters this function while
+# the OUTER call is still in progress. Without depth tracking, the FIRST
+# nested `gh` call's own apply-on-exit would re-scope the environment before
+# the outer caller's second `gh` call (or any bare `git` call) runs, breaking
+# it silently -- caught in this session before landing: create_session_pr
+# calls `gh pr list` then `gh pr create`, and the nested apply between them
+# would have handed the second call sentineled/scoped state instead of real
+# credentials. Only the OUTERMOST call restores on entry and re-applies on
+# exit; a nested call finds the depth already > 0 and is a pure passthrough
+# (real credentials are already in place from the outer restore).
 _loki_with_github_tokens() {
-    local _rc=0
-    if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
-        _loki_gh_restore
+    local _rc=0 _outermost=0
+    if [ "$_LOKI_GH_TRUSTED_DEPTH" -eq 0 ]; then
+        _outermost=1
+        if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
+            _loki_gh_restore
+        fi
     fi
+    _LOKI_GH_TRUSTED_DEPTH=$((_LOKI_GH_TRUSTED_DEPTH + 1))
     "$@" || _rc=$?
-    if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
+    _LOKI_GH_TRUSTED_DEPTH=$((_LOKI_GH_TRUSTED_DEPTH - 1))
+    if [ "$_outermost" -eq 1 ] && [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
         _loki_gh_apply
     fi
     return "$_rc"
@@ -5573,6 +5672,9 @@ _loki_withhold_github_tokens() {
     _loki_gh_apply
     if [ -n "$_first_time" ]; then
         log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper. Loki's own push and PR steps still use the real credentials."
+        if [ -n "$_LOKI_GIT_CONFIG_COUNT_UNSUPPORTED" ]; then
+            printf '%s\n' "WARNING: git < 2.31 detected -- GIT_CONFIG_COUNT/GIT_CONFIG_KEY/GIT_CONFIG_VALUE (used to reset credential.helper) are silently ignored on this git version. The git-invoked credential-helper bypass (BACKLOG 149 round 2) is NOT closed on this host; upgrade git to 2.31+ to close it. The GH_TOKEN-family sentinel and GH_CONFIG_DIR scoping above are unaffected and still apply." >&2
+        fi
     fi
 }
 

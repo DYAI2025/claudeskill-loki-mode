@@ -246,7 +246,7 @@ describe("runAutonomous withholds GitHub tokens from the provider", () => {
     expect(dump).not.toContain(GHA);
     // BACKLOG 149 round 2: the provider must see a sentinel, not an absent
     // var -- proves the fix sentinels rather than merely deletes.
-    expect(dump).toMatch(/GH_TOKEN=ghp_LOKI_WITHHELD_/);
+    expect(dump).toMatch(/GH_TOKEN=ghp_LOKIWITHHELDsentinel/);
     expect(dump).toMatch(/GH_CONFIG_DIR=/);
     expect(dump).toMatch(/GIT_CONFIG_KEY_0=credential\.helper/);
     expect(warnings()).toBe(0);

@@ -111,7 +111,12 @@ export function withholdGithubTokens(
     }
     return [];
   }
-  const sentinel = `ghp_LOKI_WITHHELD_${process.pid}_${randomBytes(8).toString("hex")}_INVALID`;
+  // Alphanumeric-only after the ghp_ prefix (no underscores): matches the
+  // real gh token shape and the existing token-redaction regex in
+  // autonomy/lib/proof_redact.py (gh[pousr]_[A-Za-z0-9]{20,}), so if this
+  // sentinel ever leaked into a proof/receipt artifact it would still be
+  // caught by the existing redaction filter rather than passing it by shape.
+  const sentinel = `ghp_LOKIWITHHELDsentinel${process.pid}${randomBytes(8).toString("hex")}INVALID`;
   for (const v of GITHUB_TOKEN_VARS) env[v] = sentinel;
   try {
     env["GH_CONFIG_DIR"] = mkdtempSync(join(tmpdir(), "loki-gh-config-"));

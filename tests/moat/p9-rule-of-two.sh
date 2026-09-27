@@ -1364,7 +1364,17 @@ PY
         # osxkeychain-style helper? A fix that only touches GH_CONFIG_DIR/
         # GH_TOKEN does nothing here; only an explicit credential.helper reset
         # closes it.
-        printf 'credout="$(printf "protocol=https\\nhost=github.com\\n\\n" | git credential fill 2>/dev/null)"\n'
+        # A reserved, never-real host (RFC 2606 .invalid), not github.com:
+        # the fake moatkeychain helper is configured UNSCOPED so it answers
+        # for any host, but a real per-host-scoped system/global credential
+        # helper entry for the REAL github.com could otherwise answer first
+        # on a dev machine with a live cached credential (confirmed live: this
+        # machine's system gitconfig sets credential.helper=osxkeychain
+        # unconditionally, independent of the sandboxed HOME). Using a host
+        # nothing could ever have a real credential for makes this probe
+        # correct by construction rather than by this machine's keychain
+        # state happening to come up empty.
+        printf 'credout="$(printf "protocol=https\\nhost=moat-p9.invalid\\n\\n" | git credential fill 2>/dev/null)"\n'
         printf 'if printf "%%s" "$credout" | grep -q "^password="; then\n'
         printf '    printf "%%s\\n" "$credout" > "$MOAT_LOG_DIR/provider-credential.$$"\n'
         printf '    echo credential_helper_read=yes >> "$MOAT_LOG_DIR/provider-actions.log"\n'
@@ -1501,6 +1511,12 @@ PY
             && nok "[default] the provider's own 'gh auth token' resolved via hosts.yml"
         grep -qxF "gh_auth_token=$GH_CANARY" "$T/default/provider-actions.log" \
             && nok "[default] the provider's own 'gh auth token' returned the real GH_TOKEN canary"
+        # Positive check, not just absence-of-bad-value: the provider's own
+        # `gh auth token` must actually print the sentinel shape, so a probe
+        # that emitted NOTHING (e.g. the provider crashed before running it)
+        # cannot pass by vacuity.
+        grep -qE '^gh_auth_token=ghp_LOKIWITHHELDsentinel.*INVALID$' "$T/default/provider-actions.log" \
+            || nok "[default] the provider's own 'gh auth token' did not print the expected sentinel shape at all (probe vacuous or gh_auth_token= line missing: $(grep '^gh_auth_token=' "$T/default/provider-actions.log" 2>/dev/null || echo 'no gh_auth_token= line found'))"
         # BACKLOG 149 round 2: a plain `git credential fill` -- git's own
         # credential-helper chain, never gh-mediated -- must not reach the
         # fake osxkeychain-style helper. GH_CONFIG_DIR/GH_TOKEN scoping alone
@@ -1511,6 +1527,10 @@ PY
             && nok "[default] the provider session's git credential.helper resolved a credential (helper chain not reset): $(cat "$T"/default/provider-credential.* 2>/dev/null | grep -v '^password=' )"
         grep -qF -- "$HELPER_CANARY" "$T"/default/provider-credential.* 2>/dev/null \
             && nok "[default] the provider session exfiltrated the git-credential-helper canary"
+        # Positive check for the same reason: the probe must have actually run
+        # and reported "no", not merely never printed anything.
+        grep -qxF 'credential_helper_read=no' "$T/default/provider-actions.log" \
+            || nok "[default] the git-credential-helper probe never ran or never reported (vacuous probe: $(grep 'credential_helper_read=' "$T/default/provider-actions.log" 2>/dev/null || echo 'no credential_helper_read= line found'))"
     fi
 
     # 2. auto-pr: LOKI_AUTO_PR=1, so the session PR comes from create_session_pr.
@@ -1575,10 +1595,14 @@ PY
         # and credential-helper checks matter MOST here.
         grep -qxF "gh_auth_token=$KEYRING_CANARY" "$T/hosts-only/provider-actions.log" \
             && nok "[hosts-only] the provider's own 'gh auth token' resolved via the OS-keyring fallback with no env token present"
+        grep -qE '^gh_auth_token=ghp_LOKIWITHHELDsentinel.*INVALID$' "$T/hosts-only/provider-actions.log" \
+            || nok "[hosts-only] the provider's own 'gh auth token' did not print the expected sentinel shape at all (probe vacuous: $(grep '^gh_auth_token=' "$T/hosts-only/provider-actions.log" 2>/dev/null || echo 'no gh_auth_token= line found'))"
         grep -qxF 'credential_helper_read=yes' "$T/hosts-only/provider-actions.log" \
             && nok "[hosts-only] the provider session's git credential.helper resolved a credential with no env token present"
         grep -qF -- "$HELPER_CANARY" "$T"/hosts-only/provider-credential.* 2>/dev/null \
             && nok "[hosts-only] the provider session exfiltrated the git-credential-helper canary with no env token present"
+        grep -qxF 'credential_helper_read=no' "$T/hosts-only/provider-actions.log" \
+            || nok "[hosts-only] the git-credential-helper probe never ran or never reported (vacuous probe: $(grep 'credential_helper_read=' "$T/hosts-only/provider-actions.log" 2>/dev/null || echo 'no credential_helper_read= line found'))"
     fi
 
     # --- Bun route: the same scenarios, through the real dist CLI -----------
