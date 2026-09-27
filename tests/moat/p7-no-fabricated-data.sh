@@ -727,10 +727,22 @@ def literal_rows(arr):
 # unconditional "delete the duplicate on merge": whichever helper S-30 ships
 # wins if S-30 merges second, and whoever resolves that merge should diff the
 # two definitions rather than assume byte-identity.
-ABSENT = re.compile(r"^(?:null|undefined|''|\"\")$")
+#
+# S-30/BACKLOG 125 B-6 second half: null/undefined/'' closed only half the
+# bypass class. is_literal() is ALSO true for false/0/{}/true (LIT_WORDS and
+# the empty-array/empty-object literal arms both accept them), so each one
+# could still stand in for the "real" branch of a ternary and exempt a
+# fabricated-rows table on the other side (`loading ? false : BACKUP_ROWS`).
+# None of the four carries actual row data, so none may exempt -- ABSENT
+# rejects them as exact tokens only (the regex is fully anchored), never as a
+# substring: `10` (contains "0") and `{ ready: true }` (contains "true", not
+# empty) are genuine literals and must keep exempting, pinned by
+# NearAbsentLiteralSiblingHonest.tsx.
+ABSENT = re.compile(r"^(?:null|undefined|''|\"\"|true|false|0|\{\})$")
 def is_exempting_sibling(v):
     """True when v is a genuine data-shaped literal for the both-branches-
-    literal ternary exemption: is_literal() minus the bare absence markers."""
+    literal ternary exemption: is_literal() minus the bare absence/sentinel
+    markers (null/undefined/''/""/true/false/0/{})."""
     v = re.sub(r'\s+as\s+const\s*$', '', v.strip())
     return is_literal(v) and not ABSENT.match(v)
 line_of = lambda s, i: s.count('\n', 0, i) + 1
@@ -3573,6 +3585,45 @@ export function BC2({ live, other }) {
   return <b>{data}</b>;
 }
 TSX
+    # S-30/BACKLOG 125 B-6, second half: is_exempting_sibling()'s ABSENT set
+    # excluded null/undefined/'' from the both-branches-literal exemption but
+    # left false/0/{}/true in it, so is_literal() (true for every one of
+    # them) still let each sentinel exempt a module-level fabricated-rows
+    # table on the OTHER ternary branch -- the identical bypass class as the
+    # null case, four more ways in. All four in one fixture, against the SAME
+    # table, since flag_table_fallback dedupes by span (position), not by
+    # table name, so each of the four independent ternaries is expected to
+    # flag on its own line.
+    cat > "$d/src/components/AbsentSiblingBypassFallback.tsx" <<'TSX'
+const BACKUP_ROWS17 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function AB({ loading }) {
+  const a = loading ? false : BACKUP_ROWS17;
+  const b = loading ? 0 : BACKUP_ROWS17;
+  const c = loading ? {} : BACKUP_ROWS17;
+  const d = loading ? true : BACKUP_ROWS17;
+  return <b>{(a || b || c || d) ? 1 : 0}</b>;
+}
+TSX
+    # Paired honest fixture: the ABSENT expansion above is four exact tokens,
+    # never a substring match. A non-zero number literal (`10`, contains "0"
+    # but is not the exact token) and a non-empty object literal (`{ ready:
+    # true }`, contains "true" but is not the bare `{}` sentinel) are genuine
+    # data-shaped literals and must keep exempting, or the fix would have
+    # overreached into flagging ordinary literal-vs-table choices.
+    cat > "$d/src/components/NearAbsentLiteralSiblingHonest.tsx" <<'TSX'
+const BACKUP_ROWS18 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function NA({ mode }) {
+  const a = mode ? 10 : BACKUP_ROWS18;
+  const b = mode ? BACKUP_ROWS18 : { ready: true };
+  return <b>{a === b ? 1 : 0}</b>;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -3634,6 +3685,10 @@ BareCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS13' (fabricated row
 BareOrChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS14' (fabricated rows) used as a fallback
 BareNullishChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS15' (fabricated rows) used as a fallback
 BareOrChainCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS16' (fabricated rows) used as a fallback
+AbsentSiblingBypassFallback.tsx:6|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
+AbsentSiblingBypassFallback.tsx:7|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
+AbsentSiblingBypassFallback.tsx:8|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
+AbsentSiblingBypassFallback.tsx:9|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
 HelperReturnTaskVerbatim.tsx:1|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnFnDecl.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnArrow.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
@@ -3676,6 +3731,7 @@ EOF
         BareCastTernaryFallback.tsx:1 \
         BareOrChainTernaryFallback.tsx:1 BareNullishChainTernaryFallback.tsx:1 \
         BareOrChainCastTernaryFallback.tsx:1 \
+        AbsentSiblingBypassFallback.tsx:4 NearAbsentLiteralSiblingHonest.tsx:0 \
         DefaultProvidersSpreadHonest.tsx:0 \
         ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
         BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
