@@ -50,6 +50,16 @@ else
   bad "STEP 1 extraction is empty or malformed; parity below would be vacuous"
 fi
 
+# Verdict parity below cannot reach every branch (loki.js.map, the NUL guard),
+# so also require the normalizer bodies to be byte-identical.
+awk '/<<.PYEOF.$/{f=1;next} /^          PYEOF$/{f=0} f' "$RELEASE_YML" | sed 's/^          //' > "$WORK/py-release"
+awk '/<<.PYEOF.$/{f=1;next} /^PYEOF$/{f=0} f' "$GATE_SH" > "$WORK/py-script"
+if [ -s "$WORK/py-release" ] && [ -s "$WORK/py-script" ] && cmp -s "$WORK/py-release" "$WORK/py-script"; then
+  ok "script's python normalizer is byte-identical to release.yml STEP 1's ($(wc -l < "$WORK/py-script" | tr -d ' ') lines)"
+else
+  bad "script's python normalizer differs from release.yml STEP 1's (or one side is empty)"
+fi
+
 # ---------------------------------------------------------------- fixtures
 BASE="$WORK/base"
 mkdir -p "$BASE/loki-ts/dist" "$BASE/autonomy" "$BASE/wiki"
@@ -211,8 +221,9 @@ steps = g.get("steps") or []
 runs = [(s.get("run") or "", s.get("if")) for s in steps]
 if not any("test_version_bump_safety.py" in r and c is None for r, c in runs):
     fails.append("gate does not run tests/test_version_bump_safety.py unconditionally")
-if not any("test-server-json-current.sh" in r and c is None for r, c in runs):
-    fails.append("gate does not run tests/test-server-json-current.sh unconditionally")
+for t in ("test-server-json-current.sh", "test-plugin-json-current.sh"):
+    if not any(t in r and c is None for r, c in runs):
+        fails.append(f"gate does not run tests/{t} unconditionally")
 if not any("scripts/ci/version-bump-only.sh gate" in r for r, _ in runs):
     fails.append("gate does not run scripts/ci/version-bump-only.sh gate")
 for name in names[1:]:
