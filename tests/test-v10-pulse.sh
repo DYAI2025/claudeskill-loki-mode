@@ -1405,7 +1405,7 @@ else
     printf '%s\n' "$OUT"
 fi
 
-echo "T29c -- D26 guard 4: a bare 'exit' with no number, and no other citation, is not evidence"
+echo "T31 -- D26 guard 4: a bare 'exit' with no number, and no other citation, is not evidence"
 CLAIM_REPO_EXIT="$WORK/claim-repo-exit"
 mkdir -p "$CLAIM_REPO_EXIT/docs/v10"
 (
@@ -1434,11 +1434,11 @@ if [ "$rc" = 1 ] \
     && printf '%s\n' "$OUT" | grep -qF "S-101 fixed the login exit flow, no test run."; then
     ok "a bare 'exit' with no number is not treated as a citation, claim is flagged"
 else
-    bad "T29c bare-exit case: rc=$rc output follows"
+    bad "T31 bare-exit case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
-echo "T29d -- D26 guard 4: an N/N shape that is a date, not a test count, is not evidence"
+echo "T32 -- D26 guard 4: an N/N shape that is a date, not a test count, is not evidence"
 CLAIM_REPO_DATE="$WORK/claim-repo-date"
 mkdir -p "$CLAIM_REPO_DATE/docs/v10"
 (
@@ -1467,7 +1467,7 @@ if [ "$rc" = 1 ] \
     && printf '%s\n' "$OUT" | grep -qF "S-102 verified 9/27 with the team."; then
     ok "a date-shaped N/N with no test word next to it is not treated as a citation, claim is flagged"
 else
-    bad "T29d date-shaped-N/N case: rc=$rc output follows"
+    bad "T32 date-shaped-N/N case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 

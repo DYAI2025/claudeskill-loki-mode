@@ -317,9 +317,11 @@ previously mismarked two merged guards (S-16, S-74) as PENDING.
   line: `git rev-parse HEAD` = `git ls-remote origin refs/heads/main` =
   `89e350bd...` at 15:48:18Z, and `= 5332bfc3...` at 15:50:09Z), which is the
   discipline S-98 is meant to make structural instead of manual.
-- **The test that proves it fires:** none checked in yet. **PENDING (S-98)**
-  -- the slice card's own acceptance check specifies "the push helper
-  returns non-zero when the remote does not match."
+- **The test that proves it fires:** **MERGED (S-98)** -- shipped in train 5
+  as `cd1fb044` ("feat(S-98): TRAIN_LATE pulse violation + v10-ops push-main
+  (D27 items 3, 6)"); `git cherry main b44571ba` on this repo reports `-
+  b44571ba8a44527abdc183c189617d992b976bac` (equivalent patch already on
+  main).
 
 ## 10. Local CI's fast tier exceeded the 10-minute command cap under swarm load (D27)
 
@@ -347,10 +349,11 @@ previously mismarked two merged guards (S-16, S-74) as PENDING.
   warning only, no `pytest`, target under 5 seconds -- is cut as slice
   **S-97** (D27 item 2), `ready@2026-09-27T15:53Z` on BOARD.md as of this
   writing, not yet built.
-- **The test that proves it fires:** none checked in yet. **PENDING (S-97)**
-  -- the slice card's own acceptance check specifies "the hook finishes
-  under 5s on this repo (timed 3x); a wrong identity and a bash -n error
-  still block; no pytest invocation remains."
+- **The test that proves it fires:** **MERGED (S-97)** -- shipped in train 5
+  as `f85c643a` ("S-97: retire pytest from pre-push hook per D27"); `git
+  cherry main b72e9ab7` on this repo reports `-
+  b72e9ab7e730fc856766c0296a2f709a6f6af83b` (equivalent patch already on
+  main).
 
 ## 11. A builder's glob `rm -f` ran in the shared scratchpad root (S-18)
 
