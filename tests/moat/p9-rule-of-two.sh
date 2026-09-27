@@ -1591,6 +1591,7 @@ PY
     }
     local OPT_WARN='LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the agent session holds the GitHub token'
 
+    scn_default() {
     # 1. default: the product defaults, LOKI_DELEGATE_PR=1 (on_run_complete).
     inj_run default ":"
     if inj_live default; then
@@ -1691,7 +1692,9 @@ PY
                 && nok "[default] the fake ssh binary was invoked at all (GIT_SSH_COMMAND=false did not take effect): $(tr '\n' ',' < "$T/default/ssh.log" 2>/dev/null)"
         fi
     fi
+    }
 
+    scn_auto_pr() {
     # 2. auto-pr: LOKI_AUTO_PR=1, so the session PR comes from create_session_pr.
     inj_run auto-pr "export LOKI_DELEGATE_PR=0 LOKI_AUTO_PR=1"
     if inj_live auto-pr; then
@@ -1704,7 +1707,9 @@ PY
         grep -q '^loki token=yes via=[a-z]* pr create' "$T/auto-pr/gh.log" \
             || nok "[auto-pr] the session PR gh pr create did not carry the token"
     fi
+    }
 
+    scn_auto_pr_ssh() {
     # 2b. auto-pr over an SSH origin (BACKLOG 149 round 4): guards the SSH
     #     RE-GRANT, which nothing above does -- removing the SSH restore lines
     #     from _loki_gh_restore left every other assertion green. Same run as
@@ -1729,6 +1734,7 @@ PY
                 || nok "[auto-pr-ssh] Loki's own session push over the SSH origin was not accepted (push log: $(tr '\n' ',' < "$T/auto-pr-ssh/push.log"))"
         fi
     fi
+    }
 
     # 2c. planted (BACKLOG 149 round 5): the agent plants code in its own repo
     #     config and waits for Loki's trusted push, which used to run `git push`
@@ -1772,6 +1778,8 @@ PY
             || nok "[planted] control: the $_pt plant did not record the credential on the old in-repo push (plant not live; log: $(tr '\n' ',' < "$PLOG"))"
     done
     : > "$PLOG"
+
+    scn_planted() {
     inj_run planted "bash '$PL/plant-repo.sh' '$PL/work' || exit 43"
     if inj_live planted; then
         grep -q "token=$GH_CANARY" "$PLOG" \
@@ -1783,7 +1791,9 @@ PY
         grep -q '^loki token=yes via=[a-z]* pr create' "$T/planted/gh.log" \
             || nok "[planted] Loki's own gh pr create did not carry the token"
     fi
+    }
 
+    scn_opt_out() {
     # 3. opt-out: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 restores the old exposure and
     #    says so. Also proves the leak probe sees a leak when there is one.
     inj_run opt-out "export LOKI_DELEGATE_PR=0 LOKI_ALLOW_AGENT_GITHUB_TOKEN=1"
@@ -1825,7 +1835,9 @@ PY
                 || nok "[opt-out] the SSH probe is blind under the opt-out (expected the fake ssh to observe the real agent fingerprint)"
         fi
     fi
+    }
 
+    scn_hosts_only() {
     # 4. hosts-only: a user authenticated ONLY via `gh auth login` (hosts.yml),
     #    no GH_TOKEN/GITHUB_TOKEN at all. This is the exact case the original
     #    4-var withhold could not see (both _loki_withhold_github_tokens and
@@ -1857,6 +1869,45 @@ PY
         grep -qxF 'credential_helper_read=no' "$T/hosts-only/provider-actions.log" \
             || nok "[hosts-only] the git-credential-helper probe never ran or never reported (vacuous probe: $(grep 'credential_helper_read=' "$T/hosts-only/provider-actions.log" 2>/dev/null || echo 'no credential_helper_read= line found'))"
     fi
+    }
+    # --- run the six scenarios above with bounded parallelism (<=3) --------
+    # Each is already an independent "fresh copy" (own $T/<label> work dir,
+    # HOME and logs; see inj_run), so the only cross-scenario coupling is the
+    # `nok` accumulator. A backgrounded subshell must clear the inherited
+    # `trap moat_cleanup EXIT` FIRST: bash 3.2 has no BASHPID, so
+    # moat_cleanup's "${BASHPID:-$$}" guard cannot tell a subshell from the
+    # main shell ($$ does not change in a bash subshell without BASHPID), and
+    # letting that trap fire here would print spurious "case never ran" FAILs
+    # and rm -rf $MOAT_TMP out from under a sibling still running. Each
+    # subshell gets its own `nok` that appends to a per-scenario file instead
+    # of the shared $CASE_FAILS (which a subshell cannot write back to its
+    # parent); the real nok() replays those files afterward, in the ORIGINAL
+    # fixed scenario order, so a FAIL's text is byte-identical to a serial run
+    # regardless of which scenario actually finishes first.
+    p9_inj_bg() {  # <label> <fn-name> -> sets P9_LAST_PID
+        local ff="$T/nok.$1"
+        : > "$ff"
+        ( trap - EXIT; nok() { printf '%s\n' "$1" >> "$ff"; }; "$2" ) &
+        P9_LAST_PID=$!
+    }
+    local pids1="" pids2="" pid label
+
+    p9_inj_bg default scn_default; pids1="$pids1 $P9_LAST_PID"
+    p9_inj_bg auto-pr scn_auto_pr; pids1="$pids1 $P9_LAST_PID"
+    if [ -n "$SSH_FP" ]; then
+        p9_inj_bg auto-pr-ssh scn_auto_pr_ssh; pids1="$pids1 $P9_LAST_PID"
+    fi
+    for pid in $pids1; do wait "$pid"; done
+
+    p9_inj_bg planted scn_planted; pids2="$pids2 $P9_LAST_PID"
+    p9_inj_bg opt-out scn_opt_out; pids2="$pids2 $P9_LAST_PID"
+    p9_inj_bg hosts-only scn_hosts_only; pids2="$pids2 $P9_LAST_PID"
+    for pid in $pids2; do wait "$pid"; done
+
+    for label in default auto-pr auto-pr-ssh planted opt-out hosts-only; do
+        [ -s "$T/nok.$label" ] || continue
+        while IFS= read -r line; do nok "$line"; done < "$T/nok.$label"
+    done
 
     # --- Bun route: the same scenarios, through the real dist CLI -----------
     # `loki start owner/repo#N` always diverts issue refs to bash
