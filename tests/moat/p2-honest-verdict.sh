@@ -850,7 +850,7 @@ case_council_readers_no_user_site_pth() {
     need python3 git || return
     local fail='{"runner":"jest","pass":false,"summary":"1 failed"}'
     local green='{"runner":"jest","pass":true,"summary":"green"}'
-    local home="$RUN/pth-home" mark="$RUN/pth.mark" py site planted="" bad="" leg d b out want
+    local home="$RUN/pth-home" mark="$RUN/pth.mark" ctl="$RUN/pth.ctl" py site planted="" bad="" leg d b out want
     mkdir -p "$home"
     # Plant in the user site of every interpreter the council could run: the
     # PATH python3 (the pre-fix reader) and the fixed root-owned candidates the
@@ -865,33 +865,59 @@ case_council_readers_no_user_site_pth() {
 import json, os
 _real = json.load
 def load(fp, *a, **k):
-    if str(getattr(fp, "name", "")).endswith("test-results.json"):
+    name = str(getattr(fp, "name", ""))
+    if name.endswith("test-results.json"):
         open(os.environ.get("MOAT_MARK", os.devnull), "a").write("pth\n")
         return {"runner": "jest", "pass": True, "status": "passed"}
+    if os.path.basename(name) in ("pending.json", "in-progress.json", "blocked.json", "failed.json"):
+        open(os.environ.get("MOAT_MARK", os.devnull), "a").write("pth-queue\n")
+        return []
     return _real(fp, *a, **k)
 json.load = load
 EOF
         planted="$planted $py"
     done
     [ -n "$planted" ] || { _why="control broken: no runnable python3 to plant a user-site .pth for"; return; }
-    for leg in pth-fail plain-green; do
+    for leg in pth-fail pth-queue plain-green; do
         d="$RUN/pth-$leg"
         case "$leg" in *-fail) b="$(council_repo "$d" "$fail")" ;; *) b="$(council_repo "$d" "$green")" ;; esac \
             || { _why="fixture $leg failed"; return; }
+        if [ "$leg" = pth-queue ]; then
+            # Green tests, but 2 pending and 1 failed task: the queue readers
+            # alone must keep the member and the devil's advocate at CONTINUE.
+            mkdir -p "$d/.loki/queue"
+            printf '%s\n' '[{"id":"t1"},{"id":"t2"}]' > "$d/.loki/queue/pending.json"
+            printf '%s\n' '[{"id":"t3"}]' > "$d/.loki/queue/failed.json"
+            for py in $planted; do
+                rm -f "$ctl"
+                out="$(cd "$d" && HOME="$home" MOAT_MARK="$ctl" "$py" -E -c 'import json; print(len(json.load(open(".loki/queue/pending.json"))))' 2>/dev/null)"
+                if [ "$out" != "0" ] || ! grep -q '^pth-queue$' "$ctl" 2>/dev/null; then
+                    _why="control broken: $py -E did not forge the queue read via the planted .pth (got '$out')"
+                    return
+                fi
+            done
+            for want in "council_evaluate_member requirements_verifier|CONTINUE" \
+                        "council_devils_advocate_review|OVERRIDE_CONTINUE"; do
+                local qcall="${want%%|*}"
+                # shellcheck disable=SC2086
+                out="$(export HOME="$home" MOAT_MARK="$mark"; council_call_args "$d" "$b" $qcall)"
+                [ "$out" = "${want#*|}" ] || bad="$bad [$leg ${qcall%% *}: got '$out' want ${want#*|}]"
+            done
+            continue
+        fi
         : > "$d/neutral-evidence.txt"
         # Control: under -E, every planted interpreter really does run the .pth
         # and forge this fixture's test-results.json, so "no effect" below is
         # a measurement, not an absence.
         if [ "$leg" = pth-fail ]; then
             for py in $planted; do
-                rm -f "$mark"
-                out="$(cd "$d" && HOME="$home" MOAT_MARK="$mark" "$py" -E -c 'import json; print(json.load(open(".loki/quality/test-results.json"))["pass"])' 2>/dev/null)"
-                if [ "$out" != "True" ] || ! grep -q '^pth$' "$mark" 2>/dev/null; then
+                rm -f "$ctl"
+                out="$(cd "$d" && HOME="$home" MOAT_MARK="$ctl" "$py" -E -c 'import json; print(json.load(open(".loki/quality/test-results.json"))["pass"])' 2>/dev/null)"
+                if [ "$out" != "True" ] || ! grep -q '^pth$' "$ctl" 2>/dev/null; then
                     _why="control broken: $py -E did not run the planted .pth (got '$out')"
                     return
                 fi
             done
-            rm -f "$mark"
         fi
         # The plain-green leg runs without the planted HOME: it proves the
         # harness can reach the approving words at all.
@@ -908,6 +934,14 @@ EOF
             fi
             [ "$out" = "$w" ] || bad="$bad [$leg ${call%% *}: got '$out' want $w]"
         done
+        # Convergence fast-path reader: rc 1 (not green) on red, 0 on green.
+        case "$leg" in *-fail) w=1 ;; *) w=0 ;; esac
+        if [ "$leg" = pth-fail ]; then
+            out="$(export HOME="$home" MOAT_MARK="$mark"; council_call "$d" "$b" _council_convergence_evidence_green)"
+        else
+            out="$(council_call "$d" "$b" _council_convergence_evidence_green)"
+        fi
+        [ "$out" = "$w" ] || bad="$bad [$leg _council_convergence_evidence_green: got rc '$out' want $w]"
     done
     [ ! -s "$mark" ] || bad="$bad [the planted .pth forged a council read: $(sort -u "$mark" | tr '\n' ' ')]"
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
@@ -1333,7 +1367,7 @@ run_case P2.verify-exit-contract "loki verify maps nothing-to-check to 3, could-
 run_case P2.fast-verify-inconclusive-not-zero "loki verify --fast with nothing scanned, a nonexistent root or an unknown flag does not exit 0 (bash-only command, both entry points)" case_fast_verify
 run_case P2.council-inconclusive-cannot-exit-zero "inconclusive evidence plus a council vote alone cannot approve completion" case_council_inconclusive
 run_case P2.council-readers-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing test results green in the council's readers" case_council_readers_not_shadowed
-run_case P2.council-readers-no-user-site-pth "a .pth planted in user site-packages cannot turn failing test results green in the council's three test-result readers (heuristic, member, devil's advocate)" case_council_readers_no_user_site_pth
+run_case P2.council-readers-no-user-site-pth "a .pth planted in user site-packages cannot turn failing test results green in the council's test-result readers (heuristic, member, devil's advocate, convergence fast path) nor empty its queue counts (member pending/in-progress/blocked, devil's advocate failed)" case_council_readers_no_user_site_pth
 run_case P2.checklist-verify-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing PRD checklist checks green (checklist-verify.py, summary, council evidence, hard gate)" case_checklist_not_shadowed
 run_case P2.exit-zero-with-failures-not-pass "a runner that exits 0 while its own summary reports failures (jest 'Tests: 1 failed') is recorded pass:false with no unit-tests.pass, and the council blocks it (bash); a recorded failed_count > 0 (or legacy failed > 0) with pass:true fails the council evidence gate and the Bun test gate alike, while 0, null and a missing count still pass on both" case_exit_zero_with_failures
 run_case P2.console-verdict-needs-computed-result "a console verdict word needs a computed result: the receipt route carries the verifier's integrity_check (tampered, not_verified, verified on a real generator receipt), the audit verify route says nothing_checked for zero files, the audit viewer never reads VALID for nothing checked or TAMPERED for a failed request, and the receipt panel never affirms without a server-verified result; both client probes flag the verbatim pre-fix lines" case_console_verdict

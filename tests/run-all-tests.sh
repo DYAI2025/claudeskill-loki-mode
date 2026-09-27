@@ -664,6 +664,7 @@ run_test "Council Live-Vote Quorum (WAVE13 fail-closed)" "$SCRIPT_DIR/test-counc
 # (.loki/quality/test-results.json), not a log path nothing writes, so a real
 # unanimous COMPLETE is not always vetoed. Includes a mutation guard.
 run_test "Council Devil's Advocate (structured test-evidence)" "$SCRIPT_DIR/test-council-devils-advocate.sh"
+run_test "Council py-tool copy byte-identical to run.sh" "$SCRIPT_DIR/test-council-py-tool-identity.sh"
 
 # Anti-sycophancy DA veto: on a UNANIMOUS approve, a non-confirming devil's-advocate
 # verdict MUST drive approve_count below the effective completion threshold so

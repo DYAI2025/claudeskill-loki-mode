@@ -3763,14 +3763,25 @@ else:
             # Cases 6 and 7, with Case 8 as the positive control proving this
             # can still reach COMPLETE when every queue really is empty.
             local unfinished=0
-            local _q _qcount
+            local _q _qcount _q_py=""
             for _q in pending in-progress blocked; do
                 [ -f "$loki_dir/queue/${_q}.json" ] || continue
-                _qcount=$(_QUEUE_FILE="$loki_dir/queue/${_q}.json" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os
+                # Same -I -S interpreter as the test-result readers: a user-site
+                # .pth must not be able to make this count read 0.
+                [ -n "$_q_py" ] || _q_py="$(_loki_snapshot_py_tool)" || _q_py=""
+                _qcount=""
+                [ -n "$_q_py" ] && _qcount=$(_QUEUE_FILE="$loki_dir/queue/${_q}.json" "$_q_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os
 d = json.load(open(os.environ['_QUEUE_FILE']))
-print(len(d.get('tasks', d) if isinstance(d, dict) else d))" 2>/dev/null || echo "0")
-                # Guard against a non-numeric read (malformed file, python absent).
-                case "$_qcount" in ''|*[!0-9]*) _qcount=0 ;; esac
+print(len(d.get('tasks', d) if isinstance(d, dict) else d))" 2>/dev/null)
+                # Fail closed: a present queue file whose count cannot be read
+                # (malformed file, no interpreter) is not evidence it is empty.
+                case "$_qcount" in
+                    ''|*[!0-9]*)
+                        blocked="true"
+                        reasons="${reasons}${_q} queue count unreadable; "
+                        continue
+                        ;;
+                esac
                 if [ "$_qcount" -gt 0 ]; then
                     unfinished=$((unfinished + _qcount))
                     blocked="true"
@@ -4032,6 +4043,8 @@ else:
             ((issues_found++))
             issue_details="${issue_details}structured test results red (pass==false); "
         fi
+    elif [ -f "$tr_file" ]; then
+        ((issues_found++)); issue_details="${issue_details}test results unreadable (no isolated python3); "
     fi
     # Additional source: any legacy test log that shows no pass indicator is a red
     # signal. Missing logs are NOT counted (this path is not written by the runner).
@@ -4047,8 +4060,18 @@ else:
     # Skeptical check 2: Are there still failing tasks in the queue?
     if [ -f "$loki_dir/queue/failed.json" ]; then
         local failed_count
-        failed_count=$(_QUEUE_FILE="$loki_dir/queue/failed.json" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os; print(len(json.load(open(os.environ['_QUEUE_FILE']))))" 2>/dev/null || echo "0")
-        if [ "$failed_count" -gt 0 ]; then
+        local failed_count="" _fq_py=""
+        _fq_py="$(_loki_snapshot_py_tool)" || _fq_py=""
+        [ -n "$_fq_py" ] && failed_count=$(_QUEUE_FILE="$loki_dir/queue/failed.json" "$_fq_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os; print(len(json.load(open(os.environ['_QUEUE_FILE']))))" 2>/dev/null)
+        # Fail closed: an unreadable failed-queue count (malformed, no
+        # interpreter) vetoes instead of reading as zero.
+        case "$failed_count" in
+            ''|*[!0-9]*)
+                ((issues_found++))
+                issue_details="${issue_details}failed queue count unreadable; "
+                ;;
+        esac
+        if [ "${failed_count:-0}" -gt 0 ] 2>/dev/null; then
             ((issues_found++))
             issue_details="${issue_details}$failed_count tasks in failed queue; "
         fi
@@ -4530,8 +4553,11 @@ _council_convergence_evidence_green() {
     # Affirmative test-green is REQUIRED: a real runner that passed. A missing
     # file or runner=="none" (no suite) is NOT affirmative evidence -> not green.
     [ -f "$tr_file" ] || return 1
+    # -I -S interpreter (see _loki_snapshot_py_tool); none resolvable -> not green.
+    local _cv_py
+    _cv_py="$(_loki_snapshot_py_tool)" || return 1
     local tr_state
-    tr_state=$(_TR_FILE="$tr_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+    tr_state=$(_TR_FILE="$tr_file" "$_cv_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_TR_FILE']) as f:
@@ -4554,7 +4580,7 @@ print('yes' if (runner != 'none' and passed is True
     local results_file="${TARGET_DIR:-.}/.loki/checklist/verification-results.json"
     if [ -f "$results_file" ]; then
         local cl_state
-        cl_state=$(_RESULTS_FILE="$results_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+        cl_state=$(_RESULTS_FILE="$results_file" "$_cv_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_RESULTS_FILE']) as f:
