@@ -682,15 +682,23 @@ outog="$(
     source "$PREAMBLE"
     base="$(command git rev-parse --abbrev-ref HEAD)"
     printf 'my private notes\n' > usernotes.txt
-    # Model git 2.17 for the whole session (leading open paren on case
-    # patterns for bash 3.2 inside $( ... )).
-    git() {
-        case " $* " in
-            (*" status "*"--no-renames"*|*" status "*"--ignored=matching"*) return 129 ;;
-            (*" --pathspec-from-file="*) return 129 ;;
-        esac
-        command git "$@"
-    }
+    # BACKLOG 129: _loki_untracked_status now resolves git via
+    # _loki_snapshot_git_tool to an ABSOLUTE path, so a shell function named
+    # git no longer shadows it there (that unscoped-shadow closure is the
+    # whole point of the fix). Model git 2.17 with a standalone fake git
+    # SCRIPT instead, and shadow the resolver function (an ordinary bash
+    # function call, not an absolute-path exec) to hand it out. Leading open
+    # paren on case patterns for bash 3.2 inside dollar-paren.
+    cat > fakegit.sh <<FAKEGIT
+#!/bin/sh
+case " \$* " in
+    (*" status "*"--no-renames"*|*" status "*"--ignored=matching"*) exit 129 ;;
+    (*" --pathspec-from-file="*) exit 129 ;;
+esac
+exec $(command -v git) "\$@"
+FAKEGIT
+    chmod +x fakegit.sh
+    _loki_snapshot_git_tool() { printf "%s\n" "$PWD/fakegit.sh"; }
     setup_agent_branch >/dev/null 2>&1
     marker="$( [ -f .loki/state/preexisting-untracked.failed ] && echo yes || echo no )"
     before="$(command git rev-list --count HEAD)"
@@ -698,7 +706,7 @@ outog="$(
     ITERATION_COUNT=1
     result=0
     msg="$(commit_session_changes 2>&1)"
-    unset -f git
+    unset -f _loki_snapshot_git_tool
     after="$(git rev-list --count HEAD)"
     git checkout -q "$base" 2>/dev/null
     intact="$( [ "$(cat usernotes.txt 2>/dev/null)" = "my private notes" ] && echo yes || echo no )"
