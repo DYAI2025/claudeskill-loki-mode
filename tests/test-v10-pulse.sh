@@ -1405,6 +1405,72 @@ else
     printf '%s\n' "$OUT"
 fi
 
+echo "T18c -- D26 guard 4: a bare 'exit' with no number, and no other citation, is not evidence"
+CLAIM_REPO_EXIT="$WORK/claim-repo-exit"
+mkdir -p "$CLAIM_REPO_EXIT/docs/v10"
+(
+    cd "$CLAIM_REPO_EXIT" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '# Board\n' > docs/v10/BOARD.md
+    printf '# Progress\n' > docs/v10/PROGRESS.md
+    git add docs/v10/BOARD.md docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "seed docs"
+    printf 'S-101 fixed the login exit flow, no test run.\n' >> docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:05:00Z" GIT_COMMITTER_DATE="2026-09-27T00:05:00Z" \
+        git commit -q -m "docs(v10): S-101 status (bare-exit fixture)"
+)
+if run_pulse "PULSE_REPO_ROOT=$CLAIM_REPO_EXIT" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$CLAIM_REPO_EXIT")" \
+    "PULSE_MOAT_RESULT=" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNEVIDENCED_CLAIM:" \
+    && printf '%s\n' "$OUT" | grep -qF "S-101 fixed the login exit flow, no test run."; then
+    ok "a bare 'exit' with no number is not treated as a citation, claim is flagged"
+else
+    bad "T18c bare-exit case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T18d -- D26 guard 4: an N/N shape that is a date, not a test count, is not evidence"
+CLAIM_REPO_DATE="$WORK/claim-repo-date"
+mkdir -p "$CLAIM_REPO_DATE/docs/v10"
+(
+    cd "$CLAIM_REPO_DATE" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '# Board\n' > docs/v10/BOARD.md
+    printf '# Progress\n' > docs/v10/PROGRESS.md
+    git add docs/v10/BOARD.md docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "seed docs"
+    printf 'S-102 verified 9/27 with the team.\n' >> docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:05:00Z" GIT_COMMITTER_DATE="2026-09-27T00:05:00Z" \
+        git commit -q -m "docs(v10): S-102 status (date-shaped-N/N fixture)"
+)
+if run_pulse "PULSE_REPO_ROOT=$CLAIM_REPO_DATE" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$CLAIM_REPO_DATE")" \
+    "PULSE_MOAT_RESULT=" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNEVIDENCED_CLAIM:" \
+    && printf '%s\n' "$OUT" | grep -qF "S-102 verified 9/27 with the team."; then
+    ok "a date-shaped N/N with no test word next to it is not treated as a citation, claim is flagged"
+else
+    bad "T18d date-shaped-N/N case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
 if command -v /bin/sh >/dev/null 2>&1 && /bin/sh -c 'case "$BASH_VERSION" in 3.2*) exit 0;; *) exit 1;; esac' 2>/dev/null; then

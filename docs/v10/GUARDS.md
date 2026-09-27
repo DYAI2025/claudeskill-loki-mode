@@ -206,24 +206,32 @@ that owns building it -- never claimed as done. Newest last.
   bits, so the commit itself looks unchanged while the working tree's real
   permissions quietly regress (S-16 fix commit `254c3c85`; S-74 fix commit
   `e5dc3d28`, same underlying mechanism).
-- **The guard:** S-16 (merged, commit `254c3c85`): `cp -p "$file" "$tmp"`
+- **The guard:** S-16, commit `254c3c85`, **PENDING** -- re-verified against
+  main with `git merge-base --is-ancestor 254c3c85 main` (non-zero, not an
+  ancestor): that commit lives only on branch `s16-rework-permission-fix`.
+  Main's `scripts/release.sh` has no `apply_sed`/`bump_all_version_files`
+  function at all today, so the described fix (`cp -p "$file" "$tmp"`
   immediately after `mktemp`, before the `sed -E ... > "$tmp"` redirect --
   `cp -p` copies the original's mode onto the temp file, and the subsequent
   `>` redirect truncates that inode's content in place rather than
-  recreating it, so the copied mode survives. S-74 (commit `e5dc3d28`,
-  **PENDING**, not yet merged): `shutil.copymode(board, tmp_path)` before
-  EACH `os.replace` call (the main write and the corruption-restore path),
-  shared through one `_atomic_write()` helper so both preserve the real
-  board file's mode.
+  recreating it, so the copied mode survives) is not present on main. This
+  entry previously read "merged"; that was false. S-74 (commit `e5dc3d28`,
+  **PENDING**, not yet merged either -- same `git merge-base` check):
+  `shutil.copymode(board, tmp_path)` before EACH `os.replace` call (the main
+  write and the corruption-restore path), shared through one
+  `_atomic_write()` helper so both preserve the real board file's mode.
 - **The test that proves it fires:** S-16 -- none checked in; the fix was
   verified manually only (an isolated 644-in/600-out-without-the-fix repro,
   plus a full `bump_all_version_files` run against a scratch git-archive
   copy showing all 14 files retained distinctive non-default modes 640/664
-  across two consecutive runs), per commit `254c3c85`'s own message. This
-  gap is exactly why the S-74 recurrence was not caught sooner by a
-  regression suite. S-74 -- `tests/test-v10-ops.sh`'s "a 644 board stays 644
-  after a flip" and "...after a corruption-triggered restore" cases
-  (commit `e5dc3d28`); **PENDING (S-74)** until that slice merges.
+  across two consecutive runs), per commit `254c3c85`'s own message. That
+  manual verification ran against the `s16-rework-permission-fix` branch,
+  not main. This gap is exactly why the S-74 recurrence was not caught
+  sooner by a regression suite. **PENDING (S-16)** until `254c3c85` (or an
+  equivalent fix) actually merges to main. S-74 -- `tests/test-v10-ops.sh`'s
+  "a 644 board stays 644 after a flip" and "...after a corruption-triggered
+  restore" cases (commit `e5dc3d28`); **PENDING (S-74)** until that slice
+  merges.
 
 ## 8. BOARD cell located by header index broke on short/long rows (S-74)
 

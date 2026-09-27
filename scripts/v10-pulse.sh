@@ -1403,11 +1403,22 @@ _CLAIM_RE = re.compile(
     r"\b(verified|green|fixed|confirmed|passes|no[- ]fix[- ]needed)\b",
     re.IGNORECASE,
 )
+_EVIDENCE_TEST_WORD = r"(?:tests?|passing|passed|failing|failed|suite)"
 _EVIDENCE_RE = re.compile(
     r"`[^`]+`"                                    # a backticked command
     r"|\brc\s*=\s*-?\d+\b"                        # rc=<n>
-    r"|\bexit(?:\s*code)?\s*-?\d+\b|\bexit(?:ed)?\b"  # exit / exit 0 / exited
-    r"|\b\d+\s*/\s*\d+\b"                         # N/N (e.g. 42/42)
+    r"|\bexit(?:\s*code)?\s*-?\d+\b"               # exit 0 / exit code 1
+                                                    # (a bare "exit"/"exited"
+                                                    # with no number is NOT
+                                                    # evidence -- neither is
+                                                    # a bare N/N: it matches a
+                                                    # date like "9/27" just as
+                                                    # well as a test count, so
+                                                    # N/N only counts next to
+                                                    # a test word below)
+    r"|\b\d+\s+passed\b"                           # "N passed"
+    r"|\b\d+\s*/\s*\d+\s+" + _EVIDENCE_TEST_WORD + r"\b"  # N/N tests|passing|...
+    r"|\b" + _EVIDENCE_TEST_WORD + r"\s*:?\s*\d+\s*/\s*\d+\b"  # tests: N/N
     r"|\b[0-9a-f]{7,40}\b",                        # a SHA
     re.IGNORECASE,
 )
