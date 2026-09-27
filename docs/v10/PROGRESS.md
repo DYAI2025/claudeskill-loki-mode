@@ -539,3 +539,39 @@ the SAME tool-call turn as the action it describes -- write `review@`
 only in the turn that dispatches the reviewer, write `merged@` only in
 the turn that performs the cherry-pick/merge. Never pre-write an
 intended status for an action queued later in a longer turn.
+
+### Drift audit (turn 54, 6-hour window)
+
+**Matched CONTROL.md:** review rigor held under real volume this
+window -- 4 P7 scanner sibling slices (S-29/S-30/S-31/S-32) all in
+flight concurrently on the same file, and reviewers found genuine,
+adversarially-discovered gaps in 3 of the 4 (S-29's `.concat()`/
+spread bypasses, S-30's incomplete `false`/`0`/`{}` exemption class,
+S-31's `useCallback` gap) rather than rubber-stamping honest-looking
+disclosures. S-32, the one that got a clean APPROVE, earned it: its
+own reviewer independently re-implemented the substitution logic to
+verify it, not just read the diff.
+
+**Drifted:** the self-caught status-tracking-lag pattern (S-30, S-32,
+GF-4 all marked `review@` after the fact was already `merged@` or
+"never actually dispatched") is now the dominant drift signal, not the
+docs-ratio the last two audits tracked. Shard 2/4 CI hangs are now at
+4 occurrences (BACKLOG 143), all on the identical shard index -- past
+the point where "watch for a third" (turn 42's language) is the right
+framing; this is confirmed structural. NO_RECENT_RELEASE has now stood
+for over 4.5 hours despite three separate turns stating intent to
+release the moment CI goes green -- the intent keeps forming and not
+converting to action because CI itself keeps hanging before it can go
+green, which is a genuinely different root cause than the earlier
+"kept getting preempted by other merges" diagnosis.
+
+**Correction for the next 6 hours:** the standing status-write rule
+from this session (write the status in the SAME turn as the action)
+needs a companion check -- before ending a turn with a `review@`/
+`merged@` write, re-read the exact row just written and confirm the
+verb matches what ListAgents or git log actually shows RIGHT NOW, not
+what was true a few tool calls earlier in the same turn. On CI: if
+shard 2/4 hangs a 5th time, stop treating cancel-and-repush as
+sufficient and escalate to actually implementing BACKLOG 143's fix
+(per-suite timeout instrumentation) as the next ready slice, ahead of
+anything else in the queue.
