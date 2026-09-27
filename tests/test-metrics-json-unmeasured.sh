@@ -140,6 +140,37 @@ else
     log_fail "real data: time_saved.hours is 0.5 (unchanged formula)" "got: $val"
 fi
 
+# -------------------------------------------
+# Case 7: context/tracking.json present but empty / all-zero (its seeded
+# initial state) -- tokens.total must still be null, not a fabricated 0
+# -------------------------------------------
+for ctx_body in '{}' '{"totals": {"total_input": 0, "total_output": 0, "total_cost_usd": 0.0, "compaction_count": 0, "iterations_tracked": 0}}'; do
+    CTX_DIR="$TMPDIR_BASE/ctx-$TOTAL/.loki"
+    mkdir -p "$CTX_DIR/context"
+    printf '%s\n' "$ctx_body" > "$CTX_DIR/context/tracking.json"
+    ((TOTAL++))
+    val=$(json_get "['tokens']['total']" <<<"$(run_metrics_json "$CTX_DIR")")
+    if [ "$val" = "None" ]; then
+        log_pass "empty context tracking ($ctx_body): tokens.total is null"
+    else
+        log_fail "empty context tracking ($ctx_body): tokens.total is null" "got: $val"
+    fi
+done
+
+# -------------------------------------------
+# Case 8: context/tracking.json with real totals -- tokens come through
+# -------------------------------------------
+CTX_REAL="$TMPDIR_BASE/ctx-real/.loki"
+mkdir -p "$CTX_REAL/context"
+printf '%s\n' '{"totals": {"total_input": 700, "total_output": 300, "total_cost_usd": 0.25, "iterations_tracked": 1}}' > "$CTX_REAL/context/tracking.json"
+((TOTAL++))
+val=$(json_get "['tokens']['total']" <<<"$(run_metrics_json "$CTX_REAL")")
+if [ "$val" = "1000" ]; then
+    log_pass "real context tracking: tokens.total is 1000"
+else
+    log_fail "real context tracking: tokens.total is 1000" "got: $val"
+fi
+
 echo ""
 echo "========================================"
 echo "Results: $PASS passed, $FAIL failed, $TOTAL total"

@@ -28849,13 +28849,16 @@ tokens_known = bool(iterations)
 # Also check context tracking for cost data
 ctx_file = os.path.join(loki_dir, "context", "tracking.json")
 ctx = load_json(ctx_file)
-if ctx is not None:
-    if total_cost == 0 and not tokens_known:
-        totals = ctx.get("totals", {})
-        total_cost = totals.get("total_cost_usd", 0)
-        total_input_tokens = totals.get("total_input", 0)
-        total_output_tokens = totals.get("total_output", 0)
-    tokens_known = True
+# context-tracker.py seeds tracking.json with all-zero totals, so the file
+# existing is not a measurement: only real (nonzero) totals count (S-147).
+if isinstance(ctx, dict) and not tokens_known:
+    totals = ctx.get("totals")
+    if isinstance(totals, dict) and (totals.get("total_input") or totals.get("total_output")
+                                     or totals.get("total_cost_usd") or totals.get("iterations_tracked")):
+        total_cost = totals.get("total_cost_usd") or 0
+        total_input_tokens = totals.get("total_input") or 0
+        total_output_tokens = totals.get("total_output") or 0
+        tokens_known = True
 
 # --- Time saved estimate ---
 # Each Loki iteration replaces ~15min of manual work. Null (not a computed

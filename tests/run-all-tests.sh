@@ -1187,6 +1187,7 @@ run_test "Memory Replay" "$SCRIPT_DIR/test-memory-replay.sh"
 run_test "Memory Speed Privacy" "$SCRIPT_DIR/test-memory-speed-privacy.sh"
 run_test "Memory Wake Dead Code" "$SCRIPT_DIR/test-memory-wake-dead-code.sh"
 run_test "Metrics Command" "$SCRIPT_DIR/test-metrics-command.sh"
+run_test "Metrics JSON Unmeasured" "$SCRIPT_DIR/test-metrics-json-unmeasured.sh"
 
 # Batch 5 of the orphaned-suite registration (2026-07-27).
 run_test "Migration Post Edit Revert" "$SCRIPT_DIR/test-migration-post-edit-revert.sh"
