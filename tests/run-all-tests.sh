@@ -265,6 +265,95 @@ if [ -n "${LOKI_TEST_SHARD:-}" ]; then
     fi
 fi
 
+# Quarantine (CEO Part C item 14). tests/quarantine.txt lists suites whose
+# failure is reported but does not block the run -- each entry names an owner
+# and an issue so a quarantine cannot silently become permanent, and an
+# expiry so a stale entry ages out loud instead of quietly staying forever.
+# Keyed by the suite's script basename, the same key _suite_timeout_for above
+# already uses for its own override table, so one lookup convention covers
+# both files.
+#
+# Validated once, up front, before any suite runs: an invalid entry (bad
+# format, expired, more than 7 days out, or a moat/review suite) fails the
+# whole run immediately rather than being silently ignored or silently
+# accepted. No retry -- fix the entry or remove it.
+_quarantine_file="$SCRIPT_DIR/quarantine.txt"
+_quarantine_suites=$'\n'
+TOTAL_QUARANTINED=0
+QUARANTINED_SUITES=""
+
+_quarantine_reject() {
+    echo "run-all-tests: quarantine.txt: $1" >&2
+    exit 2
+}
+
+# Read one date (YYYY-MM-DD) as epoch seconds, GNU first then BSD, validating
+# the captured value rather than trusting exit status -- same shape as
+# loki_run_tmp_stat_field's GNU/BSD stat handling elsewhere in this repo's
+# tooling, because each date implementation rejects the other's flags
+# differently and only the captured value is trustworthy. Forced to UTC on
+# both branches: a local-time parse near a DST transition can shift the
+# 86400-second day math by an hour, and "today" below is already formatted in
+# UTC (`date -u`), so both sides of the subtraction must agree on zone.
+_quarantine_date_epoch() {
+    local d="$1" v
+    v="$(TZ=UTC date -d "$d" +%s 2>/dev/null)" || v=''
+    case "$v" in '' | *[!0-9]*) v="$(TZ=UTC date -j -f '%Y-%m-%d' "$d" +%s 2>/dev/null)" || v='' ;; esac
+    case "$v" in '' | *[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$v"
+}
+
+if [ -f "$_quarantine_file" ]; then
+    _q_today_epoch="$(_quarantine_date_epoch "$(date -u +%Y-%m-%d)")" || {
+        echo "run-all-tests: quarantine.txt: could not resolve today's date" >&2
+        exit 2
+    }
+    _q_lineno=0
+    while IFS= read -r _q_line || [ -n "$_q_line" ]; do
+        _q_lineno=$((_q_lineno + 1))
+        case "$_q_line" in
+            '' | '#'*) continue ;;
+        esac
+        _q_suite="" _q_owner="" _q_expiry="" _q_issue=""
+        IFS=$'\t' read -r _q_suite _q_owner _q_expiry _q_issue <<<"$_q_line"
+        if [ -z "$_q_suite" ] || [ -z "$_q_owner" ] || [ -z "$_q_expiry" ] || [ -z "$_q_issue" ]; then
+            _quarantine_reject "line $_q_lineno: need suite<TAB>owner<TAB>expiry<TAB>issue, got '$_q_line'"
+        fi
+        case "$_q_expiry" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *) _quarantine_reject "line $_q_lineno: expiry '$_q_expiry' is not YYYY-MM-DD" ;;
+        esac
+        case "$_q_suite" in
+            moat/* | */moat/*) _quarantine_reject "line $_q_lineno: '$_q_suite' is under tests/moat/ and can never be quarantined" ;;
+            *review*) _quarantine_reject "line $_q_lineno: '$_q_suite' matches *review* and can never be quarantined" ;;
+        esac
+        # The suite field is documented as a bare script basename, so a moat
+        # script named without its "moat/" prefix (e.g. just
+        # "p1-portable-proof.sh") would slip past the case pattern above while
+        # still naming a real file under tests/moat/. Check the actual path,
+        # not only the spelling.
+        if [ -e "$SCRIPT_DIR/moat/${_q_suite##*/}" ]; then
+            _quarantine_reject "line $_q_lineno: '$_q_suite' names a script under tests/moat/ and can never be quarantined"
+        fi
+        _q_expiry_epoch="$(_quarantine_date_epoch "$_q_expiry")" \
+            || _quarantine_reject "line $_q_lineno: expiry '$_q_expiry' could not be parsed"
+        if [ "$_q_expiry_epoch" -lt "$_q_today_epoch" ]; then
+            _quarantine_reject "line $_q_lineno: '$_q_suite' expired on $_q_expiry"
+        fi
+        if [ $(( (_q_expiry_epoch - _q_today_epoch) / 86400 )) -gt 7 ]; then
+            _quarantine_reject "line $_q_lineno: '$_q_suite' expiry $_q_expiry is more than 7 days out"
+        fi
+        _quarantine_suites="${_quarantine_suites}${_q_suite}"$'\n'
+    done < "$_quarantine_file"
+fi
+
+_quarantine_is_listed() {
+    case "$_quarantine_suites" in
+        *$'\n'"$1"$'\n'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 run_test() {
     local test_name="$1"
     local test_file="$2"
@@ -407,11 +496,31 @@ run_test() {
         case "$_rc" in 124 | 137) _timed_out=1 ;; esac
     fi
 
+    # Quarantine check happens before the pass/fail branches below so a
+    # quarantined suite's failure (or timeout) is reported but never touches
+    # TOTAL_FAILED -- the one counter the exit-code gate at the bottom of this
+    # file reads. Only intercepts a NON-zero rc; a quarantined suite that
+    # passes is just a pass, counted normally.
+    local _quarantined=0
+    if [ "$_rc" -ne 0 ] && _quarantine_is_listed "$(basename -- "$_script_path")"; then
+        _quarantined=1
+    fi
+
     if [ "$_rc" -eq 0 ]; then
         echo ""
         echo -e "${GREEN}✓ ${test_name} PASSED${NC}"
         echo "[$(date -u +%FT%TZ)] END: ${test_name} (${_elapsed}s)"
         TOTAL_PASSED=$((TOTAL_PASSED + 1))
+    elif [ "$_quarantined" -eq 1 ]; then
+        echo ""
+        if [ "$_timed_out" -eq 1 ]; then
+            echo -e "${YELLOW}~ ${test_name} QUARANTINED: timed out after ${_suite_timeout}s (non-blocking, see tests/quarantine.txt)${NC}"
+        else
+            echo -e "${YELLOW}~ ${test_name} QUARANTINED: rc=${_rc} (non-blocking, see tests/quarantine.txt)${NC}"
+        fi
+        echo "[$(date -u +%FT%TZ)] END: ${test_name} QUARANTINED (${_elapsed}s)"
+        QUARANTINED_SUITES="${QUARANTINED_SUITES}${test_name} (${_script_path##*/}, rc=${_rc})"$'\n'
+        TOTAL_QUARANTINED=$((TOTAL_QUARANTINED + 1))
     elif [ "$_timed_out" -eq 1 ]; then
         echo ""
         # Must contain the literal substring "FAILED" (not just the ✗ glyph):
@@ -1135,6 +1244,7 @@ run_test "Time-to-first-preview metric (write-once, never invented)" "$SCRIPT_DI
 run_test "Session knobs stay default-OFF (gates the v8 SDK-flip audit)" "$SCRIPT_DIR/test-session-knobs-default-off.sh"
 run_test "shards partition the suite list (no silently dropped suite)" "$SCRIPT_DIR/test-shard-coverage.sh"
 run_test "Tier A test selector (S-91 rules R0-R7)" "$SCRIPT_DIR/test-select-tests.sh"
+run_test "quarantine (non-blocking listed failure, rejects expired/moat/review/>7d)" "$SCRIPT_DIR/test-quarantine.sh"
 run_test "quickstart scorer works on macOS bash 3.2 (first-run path)" "$SCRIPT_DIR/test-quickstart-bash32.sh"
 run_test "first-run path works on macOS bash 3.2 (welcome, tour, quickstart)" "$SCRIPT_DIR/test-first-run-bash32.sh"
 run_test "competitor verify surface (head-to-head, locally reproducible)" "$SCRIPT_DIR/test-competitor-verify-surface.sh"
@@ -1277,7 +1387,13 @@ echo ""
 echo -e "Tests Run:    ${TESTS_RUN}"
 echo -e "${GREEN}Passed:       ${TOTAL_PASSED}${NC}"
 echo -e "${RED}Failed:       ${TOTAL_FAILED}${NC}"
+echo -e "${YELLOW}Quarantined:  ${TOTAL_QUARANTINED}${NC}"
 echo ""
+
+if [ -n "$QUARANTINED_SUITES" ]; then
+    echo -e "${YELLOW}Quarantined (ran, failed, reported but did not block -- see tests/quarantine.txt):${NC}"
+    echo -e "${YELLOW}${QUARANTINED_SUITES}${NC}"
+fi
 
 if [ -n "$TIMED_OUT_SUITES" ]; then
     echo -e "${RED}Timed out (killed by the per-suite watchdog, not a normal failure):${NC}"
