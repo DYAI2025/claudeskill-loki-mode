@@ -1656,6 +1656,14 @@ def check_unevidenced_claims():
     if rc != 0:
         return None
     shas = [s for s in out.splitlines() if s.strip()]
+    # A line that was later edited (a citation added) or deleted (retracted)
+    # no longer exists verbatim on MAIN_REF, so it is resolved and not flagged;
+    # otherwise a fixed line would stay flagged until it aged out of the window.
+    current = set()
+    for path in _CLAIM_DOC_PATHS:
+        crc, cout, _ = git(["show", "%s:%s" % (MAIN_REF, path)])
+        if crc == 0:
+            current.update(l.strip() for l in cout.splitlines())
     flagged = []
     for sha in shas:
         drc, dout, _ = git(["show", sha, "--"] + list(_CLAIM_DOC_PATHS))
@@ -1666,6 +1674,8 @@ def check_unevidenced_claims():
                 continue
             added = line[1:]
             if _CLAIM_RE.search(added) and not _EVIDENCE_RE.search(added):
+                if current and added.strip() not in current:
+                    continue
                 flagged.append((sha[:8], added.strip()[:160]))
     return {"checked": len(shas), "flagged": flagged}
 

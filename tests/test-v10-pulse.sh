@@ -1415,6 +1415,42 @@ else
     printf '%s\n' "$OUT"
 fi
 
+echo "T30e -- D26 guard 4: an uncited claim later edited to carry a citation (or retracted) is no longer flagged"
+# The same uncited line as T30, then a later commit rewrites it with a SHA
+# citation, and another uncited line is added then deleted. Neither survives
+# verbatim on main, so neither is flagged; a still-present uncited line would be.
+CLAIM_REPO_FIXED="$WORK/claim-repo-fixed"
+mkdir -p "$CLAIM_REPO_FIXED/docs/v10"
+(
+    cd "$CLAIM_REPO_FIXED" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '# Board\n' > docs/v10/BOARD.md
+    printf '# Progress\n' > docs/v10/PROGRESS.md
+    git add docs/v10/BOARD.md docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" git commit -q -m "seed docs"
+    printf 'S-99 verified and merged, no fix needed.\nS-98 fixed.\n' >> docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:05:00Z" GIT_COMMITTER_DATE="2026-09-27T00:05:00Z" git commit -q -m "uncited claims"
+    printf '# Progress\nS-99 verified and merged in abc1234def (rc=0).\n' > docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:10:00Z" GIT_COMMITTER_DATE="2026-09-27T00:10:00Z" git commit -q -m "cite S-99, retract S-98"
+)
+if run_pulse "PULSE_REPO_ROOT=$CLAIM_REPO_FIXED" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$CLAIM_REPO_FIXED")" \
+    "PULSE_MOAT_RESULT=" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNEVIDENCED_CLAIM:" \
+    && printf '%s\n' "$OUT" | grep -qF "Unevidenced-claim check: 3 commit(s) scanned touching BOARD.md/PROGRESS.md, 0 flagged line(s)"; then
+    ok "an uncited claim that was later cited or retracted is not flagged"
+else
+    bad "T30e cited-or-retracted case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo "T31 -- D26 guard 4: a bare 'exit' with no number, and no other citation, is not evidence"
 CLAIM_REPO_EXIT="$WORK/claim-repo-exit"
 mkdir -p "$CLAIM_REPO_EXIT/docs/v10"
