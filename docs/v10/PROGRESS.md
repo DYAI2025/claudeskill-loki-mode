@@ -605,3 +605,32 @@ shard-2/4 hangs and unblock the release path). If NO_RECENT_RELEASE is
 still the top violation at the NEXT audit (turn 66) with S-44 already
 merged, that would mean the hang has a second, undiagnosed cause
 worth a fresh investigation rather than continued cancel-and-repush.
+
+### Drift audit (turn 66, 6-hour window)
+
+**Matched CONTROL.md:** review rigor held at genuinely high volume --
+S-14, S-29, S-31, S-36 all got real, precisely-diagnosed CONCERNs this
+window (TAMPERED/FAILED mislabeling, a seal-failure sentinel bug, a
+useMemo bypass, plus S-29's own 4-round self-review before ever
+reaching a human reviewer), and every one was sent to rework rather
+than merged on "close enough." The moat P7-scanner sibling group has
+now had real adversarial findings on essentially every single review
+pass across 4+ rounds -- the review discipline is the thing actually
+catching a genuinely hard, high-surface-area bug class.
+
+**Drifted, condition not yet met:** the turn-60 correction's trigger
+("if NO_RECENT_RELEASE still stands at turn 66 WITH S-44 ALREADY
+MERGED") has NOT fired as written -- S-44 is still in review, not yet
+merged, so the stated condition for "fresh investigation" isn't
+actually true yet. The shard has now hung a 5th time (past the 4
+counted at turn 60), still before S-44's fix has landed to test
+against. NO_RECENT_RELEASE has now stood for nearly 5 hours.
+
+**Correction for the next 6 hours:** keep the turn-60 diagnosis as
+correctly not-yet-falsified (S-44 hasn't shipped, so its fix hasn't
+had a chance to prove or disprove the hypothesis) -- prioritize
+getting S-44 reviewed and merged specifically because it's the one
+lever that can end this diagnostic loop, over other ready-queue work.
+If the shard hangs a 6th time AFTER S-44 is confirmed merged and its
+fix is live in the workflow, that is the actual trigger for a fresh
+investigation, not the count alone.
