@@ -9218,10 +9218,27 @@ setup_agent_branch() {
 
     # Record the user's own untracked and gitignored files so
     # commit_session_changes and the receipt leave them alone.
-    local snap_ok=1 leftover=""
+    local snap_ok=1 leftover="" gittool=""
     if ! _loki_snapshot_or_fail_closed; then
         snap_ok=0
-        rm -f .loki/state/preexisting-untracked.z .loki/state/preexisting-untracked.sha.z 2>/dev/null
+        rm -f .loki/state/preexisting-untracked.sha.z 2>/dev/null
+        # BACKLOG 88: the receipt (workspace_diff._preexisting_untracked) reads
+        # preexisting-untracked.z on its own, independent of
+        # _LOKI_SNAPSHOT_THIS_RUN below. Leaving it absent after a failed
+        # snapshot (old code: `rm -f` here too) makes the receipt treat EVERY
+        # currently-untracked file as this run's own work, even though nothing
+        # is actually committed -- a pre-existing file the user never touched
+        # gets named as the run's. `ls-files --others --exclude-standard` needs
+        # no --no-renames or --ignored=matching, so it still works on the git
+        # that just failed the richer `status` call above, giving the receipt a
+        # names-only fallback list. Ignored files are not covered by this
+        # fallback (old-git territory), so it is partial, not a full snapshot;
+        # the commit path is untouched (snap_ok stays 0, _LOKI_SNAPSHOT_THIS_RUN
+        # is never set below), so this still fails closed.
+        gittool="$(_loki_snapshot_git_tool)" && \
+            "$gittool" ls-files --others --exclude-standard -z > .loki/state/preexisting-untracked.z.tmp 2>/dev/null && \
+            mv .loki/state/preexisting-untracked.z.tmp .loki/state/preexisting-untracked.z \
+            || rm -f .loki/state/preexisting-untracked.z .loki/state/preexisting-untracked.z.tmp 2>/dev/null
         log_warn "Could not record pre-existing untracked files; this session will commit nothing (review and commit manually)"
     fi
 

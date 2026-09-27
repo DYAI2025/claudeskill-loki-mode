@@ -721,6 +721,57 @@ else
 fi
 
 # =============================================================================
+# Test T-old-git-receipt-fallback (BACKLOG 88): same old-git snapshot failure
+# as T-old-git-fails-closed above, but checking the RECEIPT (workspace_diff),
+# not just the commit. workspace_diff._preexisting_untracked reads
+# preexisting-untracked.z independently of _LOKI_SNAPSHOT_THIS_RUN; deleting
+# that file on a failed mint (old code) left it empty, so the receipt has no
+# exclusion list and reports the user's pre-existing usernotes.txt as this
+# run's own "untracked" work, even though the commit path correctly commits
+# nothing. `git ls-files --others --exclude-standard` needs no --no-renames or
+# --ignored=matching, so it still works on the git that just failed the
+# richer status call, and gives the receipt a names-only fallback list.
+# =============================================================================
+echo "Test T-old-git-receipt-fallback: snapshot unsupported by git -> receipt still excludes the user's pre-existing file"
+ROGR="$(make_repo toldgitreceipt)"
+outogr="$(
+    cd "$ROGR" || exit 1
+    source "$PREAMBLE"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    base="$(command git rev-parse HEAD)"
+    printf 'my private notes\n' > usernotes.txt
+    cat > fakegit.sh <<FAKEGIT
+#!/bin/sh
+case " \$* " in
+    (*" status "*"--no-renames"*|*" status "*"--ignored=matching"*) exit 129 ;;
+    (*" --pathspec-from-file="*) exit 129 ;;
+esac
+exec $(command -v git) "\$@"
+FAKEGIT
+    chmod +x fakegit.sh
+    _loki_snapshot_git_tool() { printf "%s\n" "$PWD/fakegit.sh"; }
+    setup_agent_branch >/dev/null 2>&1
+    unset -f _loki_snapshot_git_tool
+    marker="$( [ -f .loki/state/preexisting-untracked.failed ] && echo yes || echo no )"
+    printf 'agent\n' > work.js
+    ITERATION_COUNT=1
+    result=0
+    commit_session_changes >/dev/null 2>&1
+    in_head="$(git cat-file -e HEAD:usernotes.txt 2>/dev/null && echo yes || echo no)"
+    listed="$(python3 -E -c 'import sys
+sys.path.insert(0, sys.argv[1])
+from workspace_diff import collect_workspace_diff
+stat, _ = collect_workspace_diff(".", sys.argv[2])
+print(",".join("%s:%s" % (f["status"], f["path"]) for f in stat["files"]))' "$PROJECT_DIR/autonomy/lib" "$base" 2>&1)"
+    printf 'MARKER=%s INHEAD=%s LISTED=[%s]' "$marker" "$in_head" "$listed"
+)"
+if [ "$outogr" = "MARKER=yes INHEAD=no LISTED=[untracked:work.js]" ]; then
+    pass "old git: snapshot failure still fails closed, but the receipt keeps a names-only fallback and does not blame usernotes.txt on this run"
+else
+    fail "old-git snapshot failure let the receipt attribute a pre-existing untracked file to this run" "got: $outogr"
+fi
+
+# =============================================================================
 # Test T-resume-resnapshot (BACKLOG 57): the user returns to the base branch,
 # makes a file, and resumes. setup_agent_branch checks out the recorded branch;
 # the new file must not be swept into the resumed session's commit (and then
