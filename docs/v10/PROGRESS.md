@@ -400,3 +400,37 @@ events. Treat NO_RECENT_RELEASE as the standing top-tier violation it
 now is: once S-16 rework, S-39, S-14, S-20, S-36, and GF-3/GF-4's
 CI checks are confirmed green, cut a release immediately rather than
 folding one more slice in first -- the queue will refill after.
+
+### Drift audit (turn 30, 6-hour window)
+
+**Matched CONTROL.md:** the moat's shrink-only ratchet held under a
+genuine live incident: S-39 fixed a real regression S-02 introduced
+(BACKLOG 137) rather than quietly reclassifying the case as pending.
+S-40 found a second real, more severe Rule-of-Two gap mid-build
+(BACKLOG 142, a bare `Bun.spawn` bypassing the GH-token withholding)
+and stopped to ask before widening scope rather than silently
+expanding or silently shipping a known-red case as pending -- correct
+per D21 and per the founder-unavailable-clause discipline.
+
+**Drifted, and this is new:** a genuine CI health incident. The Tests
+run triggered by the last push hung on "Shell tests (shard 2/4)" for
+23+ minutes against a configured `timeout-minutes: 20`, well past
+GitHub's own enforcement point, while every other shard/job on the
+same run finished in under a minute. Cancelled manually and a fresh
+push retriggered a clean run. Docs-only commits are still 44 of 72
+(61%) this window, WORSE than both prior audits (42/68, 41/68) despite
+two consecutive corrections asking for batching -- the correction is
+not taking, likely because status updates keep getting written
+reactively per-notification rather than being queued and batched
+deliberately.
+
+**Correction for the next 6 hours:** (1) if a shard/job exceeds 1.5x
+its configured `timeout-minutes` without GitHub's own enforcement
+firing, cancel and re-push immediately rather than waiting out a full
+timeout cycle -- don't treat "still in_progress" as automatically safe
+to keep waiting on. (2) Actually hold BOARD.md edits in memory across
+multiple background-task notifications and write ONE commit per
+review-cadence checkpoint (roughly: after every 2-3 notifications, or
+before any push), instead of committing after each individual one --
+the first two corrections described the right policy but execution
+kept reverting to one-commit-per-event under notification pressure.
