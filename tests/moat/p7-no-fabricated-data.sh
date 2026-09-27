@@ -944,10 +944,16 @@ def ternary_colon_of(s, q):
 #     FLOWS_TO_STATE_TMPL) only recognizes a plain or `await`ed direct call as
 #     the local's initializer, not a chained/wrapped call
 #     (`const rows = getRows(d).slice(); setRows(rows);`);
-#   - a class-method helper is BACKLOG 144, not this arm. (useMemo is covered
-#     by the separate DECL_USEMEMO arm below, not by this arm: a useMemo-bound
+#   - a class-method helper is BACKLOG 144, not this arm. (A useMemo-bound
 #     name is a VALUE, never itself called later as name(args), so it cannot
-#     use this arm's call-site-registration machinery; see DECL_USEMEMO.)
+#     use this arm's call-site-registration machinery. The separate
+#     DECL_USEMEMO arm below covers ONLY the case where useMemo's own factory
+#     returns a literal directly, e.g. `useMemo(() => [...], deps)`. It does
+#     NOT cover `useMemo(() => helperCall(), deps)` -- a factory that calls
+#     ANOTHER already-registered fabricator rather than returning a literal
+#     itself -- since DECL_USEMEMO only inspects the factory body for a direct
+#     literal return, not a call expression. That composed form is a real,
+#     currently-undetected gap; see BACKLOG 147.)
 #   Can in principle over-flag (not false-negative only):
 #   - both the sink-span search and the two-hop local-variable hop
 #     (`const rows = getRows(d); setRows(rows)`) search the WHOLE FILE by
