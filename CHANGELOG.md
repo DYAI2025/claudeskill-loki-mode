@@ -5,6 +5,14 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.61.0
+
+**Release train 6: no shipped GitHub Action step runs the agent while holding a token.**
+
+**Security (S-54, BACKLOG 139):**
+- Three shipped action steps that inherited the caller's GitHub token now blank `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN`: "Install loki-mode" and "Cleanup" in `action.yml`, and "Run Quality Review" in `.github/actions/review/action.yml`. None of them used a token (verified: `loki version`, `loki stop` and `loki review` without `--pr` make no GitHub call). The root action's "Post review as PR comment" step keeps its token.
+- `tests/test-action-agent-step-no-token.sh` discovers every composite action by glob and treats any step that invokes loki (bare, via npx with a version, by path, through a variable, after if/while/!/timeout/env wrappers, in a pipe or subshell, or through a repo script) as an agent step that must blank all four token variables.
+
 ## v9.60.0
 
 **Release train 5: Rule of Two credential withholding closes its remaining bypasses, a release reuses its parent's CI verdict, and the pre-push hook drops to under a second.** Released on the founder's call without further review cycles on work already completed (D27).
