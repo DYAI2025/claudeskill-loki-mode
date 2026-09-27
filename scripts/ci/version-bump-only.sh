@@ -45,7 +45,7 @@ ALLOWLIST = {
     "plugins/loki-mode/.claude-plugin/plugin.json",
     "loki-ts/dist/loki.js", "loki-ts/dist/loki.js.map",
     "docs/INSTALLATION.md", "wiki/Home.md", "wiki/_Sidebar.md",
-    "wiki/API-Reference.md",
+    "wiki/API-Reference.md", "web-app/src/components/Footer.tsx",
 }
 REGULAR_MODES = {"100644", "100755"}
 VERSION_RE = re.compile(rb"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")

@@ -62,7 +62,7 @@ fi
 
 # ---------------------------------------------------------------- fixtures
 BASE="$WORK/base"
-mkdir -p "$BASE/loki-ts/dist" "$BASE/autonomy" "$BASE/wiki"
+mkdir -p "$BASE/loki-ts/dist" "$BASE/autonomy" "$BASE/wiki" "$BASE/web-app/src/components"
 (
   cd "$BASE" || exit 1
   git init -q .
@@ -74,6 +74,7 @@ mkdir -p "$BASE/loki-ts/dist" "$BASE/autonomy" "$BASE/wiki"
   printf 'var V="1.2.3";\nconsole.log(V);\n//# debugId=aaaa-1111\n' > loki-ts/dist/loki.js
   printf 'Loki 1.2.3\n' > README.md
   printf 'echo hi\n' > autonomy/run.sh
+  printf '<span>\n  v1.2.3\n</span>\n' > web-app/src/components/Footer.tsx
   git add -A && gitc commit -q -m base
 ) || { echo "fixture base setup failed"; exit 1; }
 
@@ -115,6 +116,8 @@ rename-into-allowlist|0|push|bump_core 1.2.4; mkdir -p wiki; git mv CLAUDE.md wi
 malformed-version|0|push|printf '1.2.4-rc1\n' > VERSION
 readme-version-only|0|push|printf '1.2.4\n' > VERSION; printf 'Loki 1.2.4\n' > README.md
 not-a-push|0|pull_request|bump_core 1.2.4
+footer-version-only|1|push|bump_core 1.2.4; printf '<span>\n  v1.2.4\n</span>\n' > web-app/src/components/Footer.tsx
+footer-beyond-version|0|push|bump_core 1.2.4; printf '<span>\n  v1.2.4 beta\n</span>\n' > web-app/src/components/Footer.tsx
 dep-spec-collateral|1|push|printf '1.2.4\n' > VERSION; printf 'guide 1.2.4, pins lib ^21.2.4\n' > CLAUDE.md
 EOF
 
@@ -199,6 +202,9 @@ else
   check_gate "eligible + another workflow's success" "$ELIG" "$(run_json push 'Bun Parity' completed success)" 0 false
   check_gate "eligible + gh error" "$ELIG" "$(run_json push Tests completed success)" 1 false
   check_gate "not eligible + parent Tests success" "$NOTELIG" "$(run_json push Tests completed success)" 0 false
+  # S-153: release.sh --bump-only now rewrites Footer.tsx; a version-only edit reuses, anything more runs in full.
+  check_gate "Footer version-only bump + parent Tests success" "$WORK/fx-footer-version-only" "$(run_json push Tests completed success)" 0 true
+  check_gate "Footer beyond-version bump + parent Tests success" "$WORK/fx-footer-beyond-version" "$(run_json push Tests completed success)" 0 false
 fi
 
 echo "== wiring: test.yml =="
