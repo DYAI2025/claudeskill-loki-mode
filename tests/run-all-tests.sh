@@ -1385,6 +1385,7 @@ run_test "air-gapped read-only path (egress severed)" "$SCRIPT_DIR/test-airgap-c
 run_test "doctor --airgap judges OLLAMA_HOST locality from the host, not a substring match" "$SCRIPT_DIR/test-airgap-ollama-host.sh"
 run_test "proof phases CLI/API parity (one reader, two surfaces)" "$SCRIPT_DIR/test_cli_phases_parity.sh"
 run_test "web-app has no orphaned modules (reachable from main.tsx)" "$SCRIPT_DIR/test-web-app-no-orphan-components.sh"
+run_test "web-app CommandPalette file-search failure is not no-results (node --test)" "command -v node >/dev/null 2>&1 || { echo 'node not installed: the suite did not run (unmeasured, not clean)'; exit 1; }; node --test $SCRIPT_DIR/../web-app/src/components/CommandPalette.state.test.mjs"
 # The moat runner's self-test builds and tags its own throwaway repos, so it is
 # safe in a depth-1 shard. The runner itself (tests/moat/run.sh) is NOT
 # registered here: it ratchets against the last release tag, which a depth-1

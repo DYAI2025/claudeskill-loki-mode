@@ -844,6 +844,7 @@ air-gapped read-only path (egress severed)	0
 doctor --airgap judges OLLAMA_HOST locality from the host, not a substring match	0
 proof phases CLI/API parity (one reader, two surfaces)	4
 web-app has no orphaned modules (reachable from main.tsx)	0
+web-app CommandPalette file-search failure is not no-results (node --test)	1
 the moat runner enforces every ratchet rule	13
 v10-pulse anti-drift status/violation reporter	14
 v10 drift-audit turn counter (every-6th-turn signal)	0
