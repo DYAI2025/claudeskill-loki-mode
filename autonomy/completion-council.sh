@@ -2708,7 +2708,10 @@ PYEOF
         # silently. The durable detail is in evidence-gate-details.json; this is
         # the human-visible honesty at the pass site.
         if [ "$test_inconclusive" = "true" ]; then
-            if [ "$_require_tests" = "true" ]; then
+            # Tautological provenance is excluded: tests DID run green (e.g.
+            # characterization tests pass on the base by design), and the
+            # provenance block above promises that downgrade never blocks.
+            if [ "$_require_tests" = "true" ] && [ "$test_inconclusive_reason" != "test_provenance_unconfirmed" ]; then
                 # Council route: a vote over inconclusive tests is the vote alone.
                 log_warn "[Council] Evidence gate: completion not backed by test evidence (${test_inconclusive_reason}); the council vote alone cannot approve. Record a real test run, or set LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1 to treat no-tests as affirmative."
                 _write_evidence_details "block"

@@ -89,5 +89,14 @@ d="$RUN/leak"; b="$(repo "$d" "")" || { echo "fixture failed"; exit 1; }
 rc="$(call "$d" "$b" eval_then_gate)"
 [ "$rc" = "0" ] && ok "strict mode does not leak past council_evaluate" || bad "strict mode leak" "rc=$rc want 0"
 
+# 7. Tautological provenance (green tests that also pass on the base) is not
+#    "no test evidence": the council route still approves it.
+taut_eval() { _loki_test_provenance() { echo tautological; }; council_evaluate; }
+d="$RUN/taut"; b="$(repo "$d" "$GREEN")" || { echo "fixture failed"; exit 1; }
+rc="$(call "$d" "$b" taut_eval)"
+v="$(jf "$d/.loki/council/evidence-gate-details.json" "d['tests'].get('inconclusive_reason')")"
+[ "$v" = "test_provenance_unconfirmed" ] && ok "control: stub reached (reason=test_provenance_unconfirmed)" || bad "tautological stub control" "reason=[$v]"
+[ "$rc" = "0" ] && ok "tautological green tests + vote -> rc 0" || bad "tautological provenance" "rc=$rc want 0"
+
 echo "council-inconclusive-no-approve: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
