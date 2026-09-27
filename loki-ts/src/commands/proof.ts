@@ -420,7 +420,7 @@ function mdProof(id: string | undefined): number {
   const r = spawnSync(
     "bash",
     ["-c", `source ${JSON.stringify(lib)} && render_evidence_receipt_md ${JSON.stringify(proofPath)}`],
-    { encoding: "utf8" },
+    { env: { ...process.env }, encoding: "utf8" },
   );
   if (r.stdout) process.stdout.write(r.stdout);
   if (r.status !== 0 && r.stderr) process.stderr.write(r.stderr);

@@ -496,6 +496,7 @@ export async function zeroTestsExecuted(runner: string, output: string): Promise
     '_loki_zero_tests_executed "$2" "$(cat)"';
   try {
     const proc = Bun.spawn({
+      env: { ...process.env },
       cmd: ["bash", "-c", script, "bash", runSh, runner],
       stdin: new TextEncoder().encode(output),
       stdout: "ignore",

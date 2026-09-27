@@ -1689,6 +1689,28 @@ PY
             || nok "[auto-pr] the session PR gh pr create did not carry the token"
     fi
 
+    # 2b. auto-pr over an SSH origin (BACKLOG 149 round 4): guards the SSH
+    #     RE-GRANT, which nothing above does -- removing the SSH restore lines
+    #     from _loki_gh_restore left every other assertion green. Same run as
+    #     auto-pr, but the work copy's origin is the SSH-transport fixture
+    #     remote, so create_session_pr's trusted `git push -u origin` can only
+    #     succeed if the re-grant hands back the real SSH_AUTH_SOCK and
+    #     GIT_SSH_COMMAND (the fake ssh checks the agent fingerprint before it
+    #     ever reaches the bare repo's hook).
+    if [ -n "$SSH_FP" ]; then
+        inj_run auto-pr-ssh "export LOKI_DELEGATE_PR=0 LOKI_AUTO_PR=1; git -C '$T/auto-pr-ssh/work' remote set-url origin ssh://moat-p9.invalid/repo.git || exit 42"
+        if inj_live auto-pr-ssh; then
+            [ -z "$(inj_leaked auto-pr-ssh)" ] \
+                || nok "[auto-pr-ssh] canary token(s) reached the provider environment: $(inj_leaked auto-pr-ssh)"
+            grep -qx 'provider accepted' "$T/auto-pr-ssh/push.log" \
+                && nok "[auto-pr-ssh] a git push from the provider session was accepted by the remote"
+            grep -q "fp=$SSH_FP cmd=git-receive-pack" "$T/auto-pr-ssh/ssh.log" 2>/dev/null \
+                || nok "[auto-pr-ssh] Loki's own session push never reached ssh with the real agent (SSH re-grant missing; ssh log: $(tr '\n' ',' < "$T/auto-pr-ssh/ssh.log" 2>/dev/null))"
+            grep -qx 'loki accepted' "$T/auto-pr-ssh/push.log" \
+                || nok "[auto-pr-ssh] Loki's own session push over the SSH origin was not accepted (push log: $(tr '\n' ',' < "$T/auto-pr-ssh/push.log"))"
+        fi
+    fi
+
     # 3. opt-out: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 restores the old exposure and
     #    says so. Also proves the leak probe sees a leak when there is one.
     inj_run opt-out "export LOKI_DELEGATE_PR=0 LOKI_ALLOW_AGENT_GITHUB_TOKEN=1"
@@ -1913,7 +1935,7 @@ moat_run "P9.comment-trigger-author-gate" \
     "agent jobs reachable by outsider-authored events check that author visibly in YAML, on the event's own field" \
     case_gate
 moat_run "P9.injection-cannot-reach-token" \
-    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push (HTTPS or SSH) from a provider session via the IMPLICIT resolution paths this fix closes (env vars, gh config store, git credential.helper, SSH agent/ssh command); Loki's own post-session push/PR still can. Does not hold against an explicit named-account keyring read (gh auth token -u <username>, env -u GH_TOKEN -u GITHUB_TOKEN gh auth token, security find-generic-password) or a direct ssh/hosts.yml/keychain read outside git -- the actual boundary is a CI job holding no write token and no SSH agent while the agent runs" \
+    "issue injection through the real issue path cannot reach GH_TOKEN/GITHUB_TOKEN or push (HTTPS or SSH) from a provider session via the IMPLICIT resolution paths this fix closes (env vars, gh config store, git credential.helper, SSH agent/ssh command); Loki's own post-session push/PR still can. Does not hold against an explicit named-account keyring read (gh auth token -u <username>, env -u GH_TOKEN -u GITHUB_TOKEN gh auth token, security find-generic-password), an explicit env -u GIT_SSH_COMMAND (ssh then uses ~/.ssh/id_* keys and any IdentityAgent), git's ext:: transport, or a direct ssh/hosts.yml/keychain read outside git -- the actual boundary is a CI job holding no write token and no SSH agent while the agent runs" \
     case_injection
 moat_run "P9.checkout-no-persisted-credentials" \
     "actions/checkout sets persist-credentials: false in issue/comment/review-triggered and agent-running jobs" \

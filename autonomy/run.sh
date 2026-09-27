@@ -5432,13 +5432,17 @@ except Exception:
 # ssh-transport git operation would authenticate with it.
 #
 # Fix: SSH_AUTH_SOCK is unset (not sentineled) for the withheld session.
-# Unlike the GH_TOKEN-family vars, there is no documented gh/ssh "falls
-# through to a keyring when absent, stops when present-but-wrong" behavior for
-# SSH_AUTH_SOCK to defeat -- ssh(1) simply has no agent to consult when the
-# var is unset, with no OS-level fallback socket path. A sentinel (nonexistent
-# path) would behave identically to unset here (both mean "no agent
-# reachable"), so unset is the simpler, equally-correct choice for THIS var
-# specifically -- it does not contradict round 2's reasoning for sentineling
+# Unlike the GH_TOKEN-family vars, a present-but-wrong SSH_AUTH_SOCK does NOT
+# stop ssh from falling back: with no usable agent, ssh(1) still tries the
+# default key files (~/.ssh/id_*) and any `IdentityAgent` socket named in
+# ~/.ssh/config (and on macOS a launchd agent socket is rediscoverable). A
+# sentinel therefore buys nothing over unset, so unset is the simpler choice
+# for THIS var. Those fallbacks are why GIT_SSH_COMMAND=false (below) is the
+# part that actually closes git's ssh transport: git never runs ssh at all.
+# An agent that explicitly removes it (`env -u GIT_SSH_COMMAND git push
+# git@...`) gets ssh back with those fallbacks -- same class as `env -u
+# GH_TOKEN`, disclosed in the residual list at the end of this header. That
+# does not contradict round 2's reasoning for sentineling
 # the token vars, it applies that same reasoning to a var with different
 # fallback semantics. GIT_SSH_COMMAND is set to `false` (a POSIX builtin that
 # ignores all arguments and always exits 1): git invokes it in place of ssh
@@ -5471,9 +5475,15 @@ except Exception:
 # directly off disk (F49 keeps $HOME live), or invoke `git -c
 # credential.helper=...` / `security find-generic-password` /
 # `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token` / `gh auth token -u
-# <username>` / the real `ssh` binary directly with an explicit `-i` key path
-# or a re-discovered agent socket (e.g. `launchctl getenv SSH_AUTH_SOCK` on
-# macOS) explicitly to route around this. The boundary is a CI job that holds
+# <username>` / `env -u GIT_SSH_COMMAND git push git@...` (ssh then falls back
+# to ~/.ssh/id_* default keys and any ~/.ssh/config IdentityAgent) / the real
+# `ssh` binary directly with an explicit `-i` key path or a re-discovered agent
+# socket (e.g. `launchctl getenv SSH_AUTH_SOCK` on macOS) / git's `ext::`
+# transport (`git -c protocol.ext.allow=always` with an `ext::<command>` URL,
+# which runs an arbitrary command as the transport) / GIT_ASKPASS (VS Code's
+# integrated terminal sets it to a helper that can answer git's credential
+# prompt over IPC; it is left untouched here) explicitly to route around
+# this. The boundary is a CI job that holds
 # no write token and no SSH agent while the agent runs (see
 # .github/workflows/loki-issue-to-pr.yml).
 #===============================================================================
@@ -5500,6 +5510,7 @@ _LOKI_SSH_AUTH_SOCK_OLD=""
 _LOKI_GIT_SSH_COMMAND_HAD=""
 _LOKI_GIT_SSH_COMMAND_OLD=""
 _LOKI_SSH_WITHHELD=""
+_LOKI_GH_INHERITED=""
 
 # Restore the real value (or absence) of one of the 4 token vars, using the
 # per-var _HAD/_VAL pair captured by _loki_gh_capture. Bash has no portable
@@ -5565,6 +5576,18 @@ _loki_gh_capture() {
     # ABSENT rather than as the real original.
     local _inherited_sentinel=""
     case "${GH_TOKEN:-}" in ghp_LOKIWITHHELDsentinel*INVALID) _inherited_sentinel=1 ;; esac
+    # Nested-run rule (BACKLOG 149 round 4): an inherited sentinel means this
+    # run was started from INSIDE an already-withheld session -- an agent
+    # running `loki start` in its own session, or a build started from the
+    # dashboard that start_dashboard spawned after the withhold. Such a run has
+    # no real credentials to restore on ANY channel, and reopening any of them
+    # for its "trusted" push would hand an agent-chosen repo/branch the
+    # operator's credential helper or default SSH keys. So it fails CLOSED on
+    # every channel: _loki_gh_restore becomes a no-op and Loki's own push/PR
+    # from a nested run runs with the withheld state (and fails). Before this
+    # rule the channels disagreed (HTTPS helper chain and default SSH keys
+    # reopened, agent socket closed).
+    [ -z "$_inherited_sentinel" ] || _LOKI_GH_INHERITED=1
     if [ -n "$_inherited_sentinel" ]; then
         : # GH_TOKEN/GITHUB_TOKEN/GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN
           # all get the SAME sentinel per _loki_gh_apply, so one check covers
@@ -5598,8 +5621,14 @@ _loki_gh_capture() {
     done
     # An inherited scoped GH_CONFIG_DIR (bash's loki-gh-config.* or the Bun
     # route's loki-gh-config-*) is likewise not the operator's real original.
+    # TMPDIR is normalized first: on macOS it ends in "/", so bash's own
+    # mktemp path has "//" while Node's tmpdir() (Bun route) strips the slash.
+    # Without accepting both, Bun's scoped dir was mistaken for the operator's.
+    local _tmp_root="${TMPDIR:-/tmp}"
+    _tmp_root="${_tmp_root%/}"
     case "${GH_CONFIG_DIR:-}" in
-        "${TMPDIR:-/tmp}"/loki-gh-config.* | "${TMPDIR:-/tmp}"/loki-gh-config-*) ;;
+        "$_tmp_root"/loki-gh-config.* | "$_tmp_root"//loki-gh-config.* \
+        | "$_tmp_root"/loki-gh-config-* | "$_tmp_root"//loki-gh-config-*) ;;
         *)
             if [ -n "${GH_CONFIG_DIR+x}" ]; then
                 _LOKI_GH_CONFIG_DIR_HAD=1
@@ -5671,8 +5700,11 @@ _loki_gh_apply() {
     fi
 }
 
-# Put back the REAL pre-withhold state around one trusted command.
+# Put back the REAL pre-withhold state around one trusted command. A no-op in
+# a run that inherited the sentinel: there is no real state to put back, and
+# the nested-run rule in _loki_gh_capture is to fail closed on every channel.
 _loki_gh_restore() {
+    [ -z "$_LOKI_GH_INHERITED" ] || return 0
     _loki_restore_one_token GH_TOKEN "$_LOKI_GH_TOKEN_REAL_HAD" "$_LOKI_GH_TOKEN_REAL_VAL"
     _loki_restore_one_token GITHUB_TOKEN "$_LOKI_GITHUB_TOKEN_REAL_HAD" "$_LOKI_GITHUB_TOKEN_REAL_VAL"
     _loki_restore_one_token GH_ENTERPRISE_TOKEN "$_LOKI_GH_ENT_TOKEN_REAL_HAD" "$_LOKI_GH_ENT_TOKEN_REAL_VAL"
@@ -5754,7 +5786,11 @@ _loki_withhold_github_tokens() {
     _loki_gh_capture
     _loki_gh_apply
     if [ -n "$_first_time" ]; then
-        log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper, SSH agent (SSH_AUTH_SOCK unset, GIT_SSH_COMMAND=false). Loki's own push and PR steps still use the real credentials."
+        if [ -n "$_LOKI_GH_INHERITED" ]; then
+            printf '%s\n' "WARNING: this run was started from inside an already-withheld Loki session (inherited Rule of Two sentinel). It has no real GitHub or SSH credentials to restore, so its own push and PR steps will fail closed. Start builds that need to push from a normal shell." >&2
+        else
+            log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper, SSH agent (SSH_AUTH_SOCK unset, GIT_SSH_COMMAND=false). Loki's own push and PR steps still use the real credentials."
+        fi
         if [ -n "$_LOKI_GIT_CONFIG_COUNT_UNSUPPORTED" ]; then
             printf '%s\n' "WARNING: git < 2.31 detected -- GIT_CONFIG_COUNT/GIT_CONFIG_KEY/GIT_CONFIG_VALUE (used to reset credential.helper) are silently ignored on this git version. The git-invoked credential-helper bypass (BACKLOG 149 round 2) is NOT closed on this host; upgrade git to 2.31+ to close it. The GH_TOKEN-family sentinel, GH_CONFIG_DIR scoping, and the SSH_AUTH_SOCK/GIT_SSH_COMMAND withhold above are unaffected and still apply (GIT_SSH_COMMAND is a plain env var, not a GIT_CONFIG_* mechanism, so it needs no version floor)." >&2
         fi

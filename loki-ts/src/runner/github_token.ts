@@ -78,28 +78,36 @@
 // an unrestricted session. Mirrors autonomy/run.sh's
 // _loki_withhold_github_tokens fix (see its header comment for the git-docs
 // citation and the full residual-gap list): SSH_AUTH_SOCK is deleted (not
-// sentineled -- unlike the token vars, there is no documented ssh/gh
-// "falls through when absent" behavior for this var to defeat, so unset is
-// equally correct and simpler), and GIT_SSH_COMMAND is set to `false` (a
-// POSIX builtin, ignores all arguments, always exits 1), which env-overrides
-// any core.sshCommand per git's own docs. The Bun runner has no trusted
-// post-session git call to re-grant this to, same as the token vars above.
-// Residual, not closed by this fix: an agent invoking the real `ssh` binary
-// directly (outside of git) with an explicit `-i <key>` path, or
-// re-discovering an agent socket (e.g. `launchctl getenv SSH_AUTH_SOCK` on
-// macOS) -- the same disclosed class as `gh auth token -u <username>`,
-// `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token`, and a direct hosts.yml/
-// keychain read.
+// sentineled -- a present-but-wrong socket does not stop ssh's fallbacks
+// either: ssh still tries ~/.ssh/id_* default keys and any ~/.ssh/config
+// IdentityAgent, so a sentinel buys nothing over unset), and GIT_SSH_COMMAND
+// is set to `false` (a POSIX builtin, ignores all arguments, always exits 1),
+// which env-overrides any core.sshCommand per git's own docs. That override is
+// what actually closes git's ssh transport, since git then never runs ssh.
+// The Bun runner has no trusted post-session git call to re-grant this to,
+// same as the token vars above.
+//
+// Every subprocess this module's callers spawn must pass an explicit `env`:
+// in Bun (measured on 1.3.13) a spawn with no `env` option inherits the
+// environment from process START and silently undoes everything above
+// (round 4; guarded by tests/runner/spawn_env_guard.test.ts, repro in
+// tests/runner/spawn_env_fsmonitor.test.ts).
 //
 // Hygiene against a naive injection, not an isolation boundary: code running
 // as the same user can still read another process's environment, the
 // hosts.yml file directly off disk (HOME stays live by design), or invoke
 // `git -c credential.helper=...` / `gh auth token -u <username>` /
-// `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token` / the real `ssh` binary
-// directly explicitly to route around this. The boundary is a CI job that
-// holds no write token and no SSH agent while the agent runs.
+// `env -u GH_TOKEN -u GITHUB_TOKEN gh auth token` / `env -u GIT_SSH_COMMAND
+// git push git@...` (ssh falls back to ~/.ssh/id_* and any IdentityAgent) /
+// the real `ssh` binary directly with `-i <key>` or a rediscovered agent
+// socket (`launchctl getenv SSH_AUTH_SOCK` on macOS) / git's `ext::`
+// transport (`git -c protocol.ext.allow=always`, which runs an arbitrary
+// command as the transport) / GIT_ASKPASS (VS Code's terminal points it at a
+// helper that can answer git's credential prompt; left untouched here)
+// explicitly to route around this. The boundary is
+// a CI job that holds no write token and no SSH agent while the agent runs.
 
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -128,7 +136,7 @@ export const GIT_VERSION_FLOOR_WARNING =
 // (matching the bash route's fail-silent-on-unparseable behavior).
 function isGitVersionBelowFloor(): boolean {
   try {
-    const out = execFileSync("git", ["--version"], { encoding: "utf8" });
+    const out = execFileSync("git", ["--version"], { env: { ...process.env }, encoding: "utf8" });
     const m = /git version (\d+)\.(\d+)/.exec(out);
     if (!m) return false;
     const major = Number(m[1]);
@@ -137,6 +145,25 @@ function isGitVersionBelowFloor(): boolean {
   } catch {
     return false;
   }
+}
+
+// The empty GH_CONFIG_DIR scopes are removed when the process exits (round 4:
+// they were never deleted, and over a thousand piled up in TMPDIR, mostly from
+// unit tests). One exit handler for the whole module, not one per call.
+const scopedDirs = new Set<string>();
+function trackScopedDir(dir: string): void {
+  if (scopedDirs.size === 0) {
+    process.once("exit", () => {
+      for (const d of scopedDirs) {
+        try {
+          rmSync(d, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
+      }
+    });
+  }
+  scopedDirs.add(dir);
 }
 
 /**
@@ -176,7 +203,9 @@ export function withholdGithubTokens(
   const sentinel = `ghp_LOKIWITHHELDsentinel${process.pid}${randomBytes(8).toString("hex")}INVALID`;
   for (const v of GITHUB_TOKEN_VARS) env[v] = sentinel;
   try {
-    env["GH_CONFIG_DIR"] = mkdtempSync(join(tmpdir(), "loki-gh-config-"));
+    const dir = mkdtempSync(join(tmpdir(), "loki-gh-config-"));
+    env["GH_CONFIG_DIR"] = dir;
+    trackScopedDir(dir);
   } catch {
     // Best-effort, matching the bash route: if the scoped dir cannot be
     // created, fall through rather than failing the run. The sentinel
