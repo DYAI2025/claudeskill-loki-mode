@@ -177,6 +177,36 @@ council_call() { # <repo> <base-sha> <function>
     )
     echo "$?"
 }
+# Like council_call, but for a function called with extra args (role,
+# evidence-file, ...) whose fail/green split shows up in its stdout VOTE TEXT,
+# not its return code: council_heuristic_review, council_evaluate_member and
+# council_devils_advocate_review each print one of VOTE:REJECT/VOTE:APPROVE,
+# CONTINUE/COMPLETE, OVERRIDE_CONTINUE/CONFIRMED_COMPLETE. Echoes the first
+# stdout word. A call to a nonexistent function still exits the subshell
+# nonzero but prints nothing, so the caller gets an empty string here -- which
+# cannot equal any real vote word, unlike a marker-file-only check that a
+# missing function also never touches.
+council_call_args() { # <repo> <base-sha> <function> <function-args...>
+    local out
+    out="$(
+        cd "$1" || exit 99
+        log_info() { :; }; log_warn() { :; }; log_error() { :; }; log_success() { :; }
+        log_debug() { :; }; log_header() { :; }; log_step() { :; }
+        source "$COUNCIL_SH" >/dev/null 2>&1 || exit 98
+        export COUNCIL_STATE_DIR="$1/.loki/council" TARGET_DIR="$1" ITERATION_COUNT=7
+        export _LOKI_RUN_START_SHA="$2" LOKI_TEST_PROVENANCE=0 __LOKI_CLAUDE_HELP_CACHE=__no_claude__
+        COUNCIL_ENABLED=true; COUNCIL_SIZE=3
+        mkdir -p "$COUNCIL_STATE_DIR/votes"
+        council_aggregate_votes() {
+            printf '%s\n' '{"verdict":"COMPLETE","complete_votes":2,"total_members":3}' \
+                > "$COUNCIL_STATE_DIR/votes/round-${ITERATION_COUNT}.json"
+            echo "COMPLETE"
+        }
+        local fn="$3"; shift 3
+        "$fn" "$@" 2>/dev/null
+    )" 2>/dev/null
+    printf '%s\n' "${out%%[[:space:]]*}"
+}
 council_repo() { # <dir> <test-results-json|""> -> echoes base sha; commits a real diff
     new_repo "$1" >/dev/null 2>&1 || return 1
     printf '.loki/\n' > "$1/.gitignore"; g "$1" add .gitignore; g "$1" commit -qm ignore
@@ -743,13 +773,17 @@ case_council_readers_not_shadowed() {
     need python3 git || return
     local fail='{"runner":"jest","pass":false,"summary":"1 failed"}'
     local green='{"runner":"jest","pass":true,"summary":"green"}'
-    local leg d b fn rc want bad=""
+    local leg d b fn rc want out want_out bad=""
     for leg in shadow-fail shadow-green plain-fail plain-green; do
         d="$RUN/shadow-$leg"
         case "$leg" in *-fail) b="$(council_repo "$d" "$fail")" ;; *) b="$(council_repo "$d" "$green")" ;; esac \
             || { _why="fixture $leg failed"; return; }
         case "$leg" in shadow-*) shadow_modules "$d" >/dev/null 2>&1 || { _why="fixture $leg commit failed"; return; } ;; esac
         case "$leg" in *-fail) want=1 ;; *) want=0 ;; esac
+        # A neutral evidence file with no "fail"/"error" text of its own, so the
+        # heuristic_review vote below is driven only by its D7-guarded
+        # test-results.json reader, never by grep-ing this file's content.
+        : > "$d/neutral-evidence.txt"
         # Control: this environment really does load both shadows into an
         # unguarded interpreter run from the repo, so "the marker stayed
         # empty" below is a measurement, not an absence.
@@ -765,6 +799,42 @@ case_council_readers_not_shadowed() {
             rc="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call "$d" "$b" "$fn")"
             [ "$rc" = "$want" ] || bad="$bad [$leg $fn: got $rc want $want]"
         done
+        # BACKLOG 43 follow-up: council_heuristic_review (test_auditor role),
+        # council_evaluate_member and council_devils_advocate_review each read
+        # the same tr_file with their own inline python3 -c and are on the same
+        # verdict path (a heuristic vote, a member vote, a devil's-advocate
+        # veto) but were not driven by the loop above. Both role args below are
+        # required under this script's set -u: council_call invokes the
+        # function with zero args, and council_evaluate_member's
+        # "local role=\"\$1\"" has no default (unlike the other two), so a
+        # bare council_call would abort on unbound $1 before ever reaching the
+        # test-results read -- silently skipping the coverage this exists to add.
+        #
+        # Each call's own vote text is asserted against the fail/green leg it
+        # is on (the same rc-vs-want shape as the loop above, adapted to stdout
+        # since these three functions signal via vote text, not rc): this
+        # proves the function was actually reached and its real read-then-vote
+        # logic ran, not merely that the shared $d.mark marker stayed empty --
+        # a call to a nonexistent function also never touches that marker, so
+        # the marker alone cannot tell "blocked" from "never invoked".
+        case "$leg" in
+            *-fail) want_out="VOTE:REJECT" ;;
+            *)      want_out="VOTE:APPROVE" ;;
+        esac
+        out="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_heuristic_review test_auditor "$d/neutral-evidence.txt")"
+        [ "$out" = "$want_out" ] || bad="$bad [$leg council_heuristic_review: got '$out' want $want_out]"
+        case "$leg" in
+            *-fail) want_out="CONTINUE" ;;
+            *)      want_out="COMPLETE" ;;
+        esac
+        out="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_evaluate_member requirements_verifier)"
+        [ "$out" = "$want_out" ] || bad="$bad [$leg council_evaluate_member: got '$out' want $want_out]"
+        case "$leg" in
+            *-fail) want_out="OVERRIDE_CONTINUE" ;;
+            *)      want_out="CONFIRMED_COMPLETE" ;;
+        esac
+        out="$(export PYTHONPATH=":/nonexistent" MOAT_MARK="$d.mark"; council_call_args "$d" "$b" council_devils_advocate_review)"
+        [ "$out" = "$want_out" ] || bad="$bad [$leg council_devils_advocate_review: got '$out' want $want_out]"
         [ ! -s "$d.mark" ] || bad="$bad [$leg: a repo module ran in the council: $(sort -u "$d.mark" | tr '\n' ' ')]"
     done
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
