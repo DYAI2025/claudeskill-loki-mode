@@ -5,6 +5,38 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.56.0
+
+**Release train 1 under the new release-train model: 157 commits since v9.55.0, verified together on one frozen commit.** Rule of Two now covers every agent workflow, the tamper seal on the session-created record closes a FIFO and symlink bypass, several dashboard panels stop showing a guess or a zero as if it were measured, and the macOS 27 sandbox profile actually blocks the ports it claims to.
+
+**Security:**
+- Rule of Two across every agent workflow: GitHub tokens are withheld from the provider environment on both the bash and Bun routes, the issue-to-PR action fetches issue text in a token-free step, jobs holding a write token or publish secret no longer restore caches, and the `claude --help` capability probe receives the live (token-withheld) environment.
+- The session-created record's tamper seal re-arms after a seal failure, and a FIFO or symlink substituted for the record is now caught instead of being read as absent.
+- The snapshot digest's python3 fallback goes through the hardened interpreter resolver, and a tamper event logs both digests.
+- macOS 27: the host sandbox profile's port deny used a filter keyword (`tcp`) that silently never matched a bind; it now uses `tcp4`, so confined builds really cannot bind Docker or dashboard ports.
+
+**Honest verdicts and receipts:**
+- `loki proof verify` distinguishes TAMPERED from FAILED using the attestation result, not only the hash.
+- `first_result_verified_patch` no longer claims a verification that never ran.
+- Receipt paths use one repo-relative base when `TARGET_DIR` is a subdirectory.
+- The evidence-gate summary prints `tests_ok=inconclusive` instead of `True` for an inconclusive test axis.
+- The pytest summary parser counts `error` outcomes as failures.
+- A pre-existing untracked file that is replaced by a directory now covers the files inside it.
+
+**Dashboard and web app:**
+- Session status reads `unknown` instead of guessing `completed` for stale or unrecorded runs; a historical session no longer shows the live project's checklist.
+- A failed git-status or checkpoint fetch says "Could not load" instead of "The working tree is clean" or "No checkpoints were recorded".
+- Council-state and notification reads no longer answer a corrupt file with a zero.
+- Fixed field misreads in the GitHub PRs panel (status checks, review state, PR state case), the evidence receipt (cost, files changed), the memory browser (snake_case keys) and the overview council gate; the PR detail endpoint now requests the status-check fields.
+- Expired rotating API keys are purged; stale version, license and gate-count copy corrected.
+
+**Moat and tests:**
+- P7 fabricated-data scanner catches reassignment fallbacks, `Array.from` generator rows and module-level fallback tables.
+- P2 shadow-import coverage extended to three more council readers; P3 prompt case gains a behavioral check; P4 catalog top model is `claude-opus-5-5`.
+- The test runner times out and names a hung suite instead of consuming the whole shard; dashboard-ui tests now exercise the shipped code.
+
+**Build:** `loki-ts/dist` rebuilt from source (the committed bundle had been built in a different environment; the only semantic difference is the version string).
+
 ## v9.55.0
 
 **A repo-wide sweep for the process-isolation bug class fixed in v9.54.1 found and closed several more real gaps: two agent-repo-code-execution paths, and two rounds of a tamper-detection seal being itself forgeable.** Plus a default-security tightening, the v9.54.1 kill-scoping fix extended to more surfaces, and several trust-core correctness fixes.
