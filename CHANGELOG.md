@@ -5,6 +5,12 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.69.0
+
+**Trust page says when there is not enough history.** Released from green tree 7ef5ca28 (Tests run  and Bun Parity run  both success before the bump).
+
+- trust.html shows "Not enough history yet" as its headline when every trust axis is insufficient, instead of a score built from nothing (S-148).
+
 ## v9.68.0
 
 **A faster release gate, honest dashboard states, and a current Footer version.** Released from green tree b7a8dd50 (Tests run 36341812369 and Bun Parity run 36341812334 both success before the bump).
