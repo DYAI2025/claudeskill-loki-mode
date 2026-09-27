@@ -5,6 +5,22 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.59.0
+
+**Release train 4: council readers hardened, a Tier A fast test gate, and a release script that bumps every file.**
+
+**Security:**
+- The completion council's test-result, queue and convergence readers run the resolved interpreter with `-I -S`, so a planted user-site `.pth` can no longer forge a verdict. An unreadable count fails closed, and devil's advocate vetoes when no isolated interpreter exists. A byte-identity test keeps the council's copy of the interpreter resolver equal to run.sh's (S-49, BACKLOG 134).
+
+**CI:**
+- Tier A fast gate: `scripts/select-tests.sh` picks the tests for a diff (syntax always, the changed tests, tests that reference or import the changed source, bun/typecheck for loki-ts, dashboard and dashboard-ui suites, moat properties in both directions) and falls back to the full suite on anything it cannot classify (S-91, Part C item 13).
+- pip and bun install caches on the read-only test jobs, checked by a YAML-parsing test that no job holding a write permission or publish secret gets a cache (S-89, item 11).
+
+**Release:**
+- `scripts/release.sh` bumps every version-bearing file in the checklist and preserves file modes, with `tests/test-release-sh.sh` registered in the runner (S-16).
+
+**Docs:** a 60-line slice-card template and the dispatch-from-card rule in `docs/v10/SWARM.md` (S-77, D26 guard 6).
+
 ## v9.58.0
 
 **Release train 3: the release-speed fixes from CEO Part C.** Shell tests run in 8 duration-balanced shards with a 10-minute job cap, the argmax suite drops from about 22 minutes to seconds, Homebrew no longer waits on Docker, and Docker builds arm64 natively.
