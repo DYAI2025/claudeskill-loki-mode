@@ -856,8 +856,41 @@ PY
 # absent measurement is not evidence, and inventing a PASS here would be worse
 # than inventing a FAIL.
 loki_remote_attestation_status() {
-    local pj="$1" url="$2"
+    local pj="$1" url="$2" _jh
     [ -n "$url" ] || { printf ''; return 0; }
+    # A JWKS key set travels over the same channel as the receipt it certifies.
+    # Plain http lets anyone on the network path swap in their own key set, and
+    # the attestation would then "verify" against a forged key -- a MITM the
+    # TLS the API already uses is meant to prevent. Only https is trusted;
+    # loopback http and file:// are the exceptions, because neither one leaves
+    # this machine for anyone to sit on. Checked here, before python is even
+    # invoked, so a rejected URL is never fetched -- not "fetched and then
+    # distrusted". Same check in loki_proof_attestation_check below -- change
+    # both.
+    #
+    # The host is bounded exactly (up to the first "/", then stripped of any
+    # port) rather than matched with a trailing glob, and a userinfo "@" is
+    # rejected outright -- "http://127.0.0.1:80@evil.com" is host evil.com to
+    # any real URL parser (userinfo before the @, host after), and a loose
+    # `http://127.0.0.1:*` glob would wrongly wave that straight through.
+    case "$url" in
+        https://*|file://*) ;;
+        http://*)
+            _jh="${url#http://}"; _jh="${_jh%%/*}"
+            case "$_jh" in
+                *@*) printf ''; return 0 ;;
+            esac
+            case "$_jh" in
+                \[*\]*) _jh="${_jh#\[}"; _jh="${_jh%%\]*}" ;;
+                *) _jh="${_jh%%:*}" ;;
+            esac
+            case "$_jh" in
+                127.0.0.1|localhost|::1) ;;
+                *) printf ''; return 0 ;;
+            esac
+            ;;
+        *) printf ''; return 0 ;;
+    esac
     command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
     local tok
     # jq's `//` treats JSON false the same as null/missing, which is exactly
@@ -954,8 +987,33 @@ PY
 # testing found exactly this: a mutation applied to the first copy left every
 # assertion of the second suite green.
 loki_proof_attestation_check() {
-    local pj="$1" src="$2"
+    local pj="$1" src="$2" _jh
     [ -n "$src" ] || { printf ''; return 0; }
+    # Same MITM guard as loki_remote_attestation_status above -- change both.
+    # Only applies to a URL source; a local file (the third-party offline case)
+    # never travels a network and needs no scheme at all. The host is bounded
+    # exactly and a userinfo "@" is rejected outright -- see the sibling
+    # function's comment for why a trailing glob is not safe here.
+    if [ ! -f "$src" ]; then
+        case "$src" in
+            https://*|file://*) ;;
+            http://*)
+                _jh="${src#http://}"; _jh="${_jh%%/*}"
+                case "$_jh" in
+                    *@*) printf ''; return 0 ;;
+                esac
+                case "$_jh" in
+                    \[*\]*) _jh="${_jh#\[}"; _jh="${_jh%%\]*}" ;;
+                    *) _jh="${_jh%%:*}" ;;
+                esac
+                case "$_jh" in
+                    127.0.0.1|localhost|::1) ;;
+                    *) printf ''; return 0 ;;
+                esac
+                ;;
+            *) printf ''; return 0 ;;
+        esac
+    fi
     command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
     python3 -E - "$pj" "$src" "${_LOKI_SCRIPT_DIR}" <<'PY' 2>/dev/null || printf ''
 # The cwd is the checkout being verified: drop it from sys.path before any
@@ -1177,7 +1235,8 @@ loki_remote_verify_receipt() {
     # gpg-unavailable branch above: NOT CHECKED, return 0, provenance unproven.
     if [ -z "$_attest" ] && jq -e '.verification.attestation // empty' "$pj" >/dev/null 2>&1; then
         echo -e "  ${YELLOW}NOT CHECKED${NC}: the receipt carries an attestation, but it could not be checked"
-        echo "    against ${_attest_url:-<no url>} (JWKS unreachable, or python cryptography missing)."
+        echo "    against ${_attest_url:-<no url>} (JWKS unreachable, python cryptography missing, or"
+        echo "    the JWKS URL is not https -- only loopback is allowed over plain http)."
         echo "    Its integrity hash matches. Provenance is unproven here, not disproven."
         echo "    Install python3 cryptography, or re-run where the build server is reachable."
         return 0
@@ -37014,7 +37073,8 @@ print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
                         # read as either a pass or an accusation, so it exits 2
                         # (could not check). A tamper/drift 1 from the base
                         # verifier is a finding and is never softened to 2.
-                        echo -e "${YELLOW}attestation: NOT CHECKED -- could not check against ${_pv_jwks} (key set unreadable, or verifier dependency missing).${NC}" >&2
+                        echo -e "${YELLOW}attestation: NOT CHECKED -- could not check against ${_pv_jwks} (key set unreadable,${NC}" >&2
+                        echo -e "${YELLOW}  verifier dependency missing, or the JWKS URL is not https -- only loopback is allowed over plain http).${NC}" >&2
                         echo "  This is not a failure of the receipt. Nothing was proven either way (exit 2)." >&2
                         if [ "$_pv_rc" -eq 0 ]; then _pv_rc=2; fi
                         _pv_attestation_field="NOT CHECKED"
