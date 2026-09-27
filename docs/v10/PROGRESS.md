@@ -513,4 +513,15 @@ runner) rather than continuing to treat each hang as a one-off. On
 NO_RECENT_RELEASE specifically: the next time CI goes green, cut the
 release BEFORE dispatching or merging anything else that turn, even if
 something else is mid-review -- the queue will still be there after.
-since it just paid off twice.
+
+**Self-caught process gap (same session, before the next audit is due):**
+S-30 and S-32 were both marked `review@` on BOARD.md with no reviewer
+agent actually dispatched -- caught only because the pulse's
+REVIEW_STALE violation fired at the 45-minute mark for each. Root
+cause: both were part of a 4-slice sequential group (S-29/S-30/S-31/
+S-32, same file) where dispatching S-29's rework consumed the turn and
+the status line for S-30/S-32 got written as if the dispatch had
+happened, when it hadn't. Fix going forward: after writing a `review@`
+status, verify the dispatch actually happened (check ListAgents or the
+tool result) in the SAME turn, not just write the intended status and
+move on.
