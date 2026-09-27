@@ -1104,3 +1104,16 @@ committing to "wait for approval" (S-74, S-82 did the same). Root cause
 is the old CLAUDE.md commit workflow text that every subagent loads;
 S-78's trim removes it. Until S-78 merges, slice cards should say
 "commit when done, you are authorized" explicitly.
+
+## Drift audit, turn 192
+
+**Matched:** release train 1 is one job from publishing (only Tests
+shard 0, the argmax shard, still running on b651b98d); the two slices
+that remove that shard's cost (S-79 fixture shrink, S-81 balanced
+sharding) are built or nearly built. S-72 freed 12 GB with zero forced
+removals.
+
+**Watch item:** a builder reported an unusually clean number (all 8
+shards projected at exactly 197 s). Reviewers are instructed to
+recompute it from the raw table rather than trust the report. Clean
+numbers get the same evidence bar as alarming ones.
