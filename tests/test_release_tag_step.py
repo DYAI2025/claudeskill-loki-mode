@@ -72,12 +72,15 @@ class CreateGitTagStep(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _prepush(self, sha):
-        """Release Manager pushes the tag with their own credentials, then the
-        tag is dropped locally (as if checkout had not fetched it)."""
+    def _prepush(self, sha, keep_local=False):
+        """Release Manager pushes the tag with their own credentials. By
+        default the tag is then dropped locally (pushed after checkout);
+        keep_local models the usual case, where the fetch-depth: 0 checkout
+        already fetched it."""
         _git(self.work, "tag", "-a", _TAG, "-m", "rm", sha)
         _git(self.work, "push", "-q", "origin", "refs/tags/" + _TAG)
-        _git(self.work, "tag", "-d", _TAG)
+        if not keep_local:
+            _git(self.work, "tag", "-d", _TAG)
 
     def _reject_pushes(self):
         hook = pathlib.Path(self.origin, "hooks", "pre-receive")
@@ -86,7 +89,9 @@ class CreateGitTagStep(unittest.TestCase):
         hook.chmod(0o755)
 
     def _run(self):
-        return subprocess.run(["bash", "-c", _tag_step_script()], cwd=self.work,
+        # GitHub runs step bodies as bash --noprofile --norc -eo pipefail.
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
+                               _tag_step_script()], cwd=self.work,
                               env=_ENV, capture_output=True, text=True, timeout=60)
 
     def _remote_tag(self):
@@ -115,6 +120,20 @@ class CreateGitTagStep(unittest.TestCase):
         self.assertIn("Release Manager pushes the tag", r.stdout)
         self.assertNotIn("continuing", r.stdout)
         self.assertEqual(self._remote_tag(), "")
+
+    def test_fetched_prepushed_tag_at_release_sha_is_reused(self):
+        self._prepush(self.release_sha, keep_local=True)
+        before = _git(self.origin, "rev-parse", "refs/tags/" + _TAG)
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(_git(self.origin, "rev-parse", "refs/tags/" + _TAG), before)
+
+    def test_fetched_prepushed_tag_at_wrong_sha_fails(self):
+        self._prepush(self.old_sha, keep_local=True)
+        r = self._run()
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("not the release SHA", r.stdout)
+        self.assertEqual(self._remote_tag(), self.old_sha, "remote tag must never be moved")
 
     def test_happy_path_pushes_tag_at_release_sha(self):
         r = self._run()
