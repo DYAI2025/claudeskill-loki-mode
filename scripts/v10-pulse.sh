@@ -343,8 +343,9 @@ NOW = now_epoch()
 # the TOP violation -- an accidental ordering-by-discovery would misrank it.
 VIOLATION_PRIORITY = [
     "CI_RED", "CI_CANCELLED_STREAK", "MOAT_REGRESSION", "UNRELEASED_MERGE",
-    "TRAIN_LATE", "REVIEW_STALE", "AGENT_OVER_BUDGET", "IDLE_BUILDERS",
-    "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
+    "TRAIN_LATE", "REVIEW_STALE", "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM",
+    "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME",
+    "CONTROL_OVERSIZE",
 ]
 
 violations = []          # list of (code, text)
@@ -1384,6 +1385,83 @@ else:
         )
 
 
+# --- 9. UNEVIDENCED_CLAIM: D26 guard 4 (evidence-or-it-didn't-happen) -------
+# Kept in its own function on purpose: a separate slice (S-94) adds its own
+# check elsewhere in this same file, and each check owning one function
+# means the two never touch the same lines.
+#
+# A claim word alone ("verified", "green", "fixed", "confirmed", "passes",
+# "no fix needed") is not evidence -- D26 guard 4 requires a citation
+# alongside it: a backticked command, an rc=/exit result, an N/N count, or a
+# SHA. This scans ADDED lines only (the `+` side of a unified diff, never
+# `+++`), over the last 20 commits on MAIN_REF touching docs/v10/BOARD.md or
+# docs/v10/PROGRESS.md -- hardcoded relative paths, like
+# moat_baseline_at_last_release's "tests/moat/pending.txt" above, since a
+# `git log -- <path>` filter needs a path inside the repo, not whatever
+# BOARD_MD/CONTROL_MD happen to be overridden to in a test.
+_CLAIM_RE = re.compile(
+    r"\b(verified|green|fixed|confirmed|passes|no[- ]fix[- ]needed)\b",
+    re.IGNORECASE,
+)
+_EVIDENCE_RE = re.compile(
+    r"`[^`]+`"                                    # a backticked command
+    r"|\brc\s*=\s*-?\d+\b"                        # rc=<n>
+    r"|\bexit(?:\s*code)?\s*-?\d+\b|\bexit(?:ed)?\b"  # exit / exit 0 / exited
+    r"|\b\d+\s*/\s*\d+\b"                         # N/N (e.g. 42/42)
+    r"|\b[0-9a-f]{7,40}\b",                        # a SHA
+    re.IGNORECASE,
+)
+_CLAIM_DOC_PATHS = ("docs/v10/BOARD.md", "docs/v10/PROGRESS.md")
+
+
+def check_unevidenced_claims():
+    """Scan the last 20 commits on MAIN_REF touching docs/v10/BOARD.md or
+    docs/v10/PROGRESS.md for an added line making an evidence-word claim
+    with no citation next to it. Returns {"checked": int, "flagged": [(sha,
+    line), ...]}, or None if the git log call itself failed (never a false
+    clean -- routed through UNKNOWN like every other check here)."""
+    rc, out, _ = git(
+        ["log", MAIN_REF, "-n", "20", "--format=%H", "--"] + list(_CLAIM_DOC_PATHS)
+    )
+    if rc != 0:
+        return None
+    shas = [s for s in out.splitlines() if s.strip()]
+    flagged = []
+    for sha in shas:
+        drc, dout, _ = git(["show", sha, "--"] + list(_CLAIM_DOC_PATHS))
+        if drc != 0:
+            continue
+        for line in dout.splitlines():
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            added = line[1:]
+            if _CLAIM_RE.search(added) and not _EVIDENCE_RE.search(added):
+                flagged.append((sha[:8], added.strip()[:160]))
+    return {"checked": len(shas), "flagged": flagged}
+
+
+claims = safe(check_unevidenced_claims)
+if claims is None:
+    mark_unknown("unevidenced_claims")
+    emit("Unevidenced-claim check: UNKNOWN (git log/show against %s failed)" % MAIN_REF)
+else:
+    emit(
+        "Unevidenced-claim check: %d commit(s) scanned touching BOARD.md/PROGRESS.md, %d flagged line(s)"
+        % (claims["checked"], len(claims["flagged"]))
+    )
+    if claims["flagged"]:
+        shown = claims["flagged"][:5]
+        desc = "; ".join("%s: %s" % (sha, text) for sha, text in shown)
+        more = "" if len(claims["flagged"]) <= 5 else " (+%d more)" % (len(claims["flagged"]) - 5)
+        add_violation(
+            "UNEVIDENCED_CLAIM",
+            "%d added line(s) in the last %d commit(s) touching BOARD.md/PROGRESS.md claim "
+            "verified/green/fixed/confirmed/passes/no-fix-needed with no command, rc=/exit, "
+            "N/N, or SHA citation: %s%s"
+            % (len(claims["flagged"]), claims["checked"], desc, more),
+        )
+
+
 _NEXT_ACTION_TEXT = {
     "CI_RED": "investigate and fix the red main CI run before anything else",
     "CI_CANCELLED_STREAK": "investigate why Tests keeps getting cancelled on main before anything else",
@@ -1392,6 +1470,7 @@ _NEXT_ACTION_TEXT = {
     "TRAIN_LATE": "push a release train now, merged-unreleased commits exist and cadence has slipped past the 25-minute budget",
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
     "AGENT_OVER_BUDGET": "check in on the named agent(s), they have exceeded their role/tier time budget",
+    "UNEVIDENCED_CLAIM": "add a command/output citation to the named line(s) or retract the claim (D26 guard 4)",
     "IDLE_BUILDERS": "dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md",
     "LOW_READY": "the Product Owner should cut the named number of additional slices onto the ready queue",
     "NO_RECENT_RELEASE": "cut a release now, none has shipped in over 90 minutes",

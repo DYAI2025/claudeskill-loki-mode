@@ -1334,6 +1334,77 @@ else
 fi
 (cd "$FAKE_REPO" || exit 1; git reset -q --hard v1.0.0)
 
+echo "T30 -- D26 guard 4: UNEVIDENCED_CLAIM fires on an added claim line with no citation"
+# A dedicated, isolated repo (its own docs/v10/BOARD.md and PROGRESS.md, like
+# NO_PENDING_REPO above) so this test never depends on or mutates FAKE_REPO's
+# shared history. One commit adds a claim word ("verified", "no fix needed")
+# to PROGRESS.md with nothing next to it that could count as a citation: no
+# backticked command, no rc=/exit, no N/N count, no SHA.
+CLAIM_REPO_FLAGGED="$WORK/claim-repo-flagged"
+mkdir -p "$CLAIM_REPO_FLAGGED/docs/v10"
+(
+    cd "$CLAIM_REPO_FLAGGED" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '# Board\n' > docs/v10/BOARD.md
+    printf '# Progress\n' > docs/v10/PROGRESS.md
+    git add docs/v10/BOARD.md docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "seed docs"
+    printf 'S-99 verified and merged, no fix needed.\n' >> docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:05:00Z" GIT_COMMITTER_DATE="2026-09-27T00:05:00Z" \
+        git commit -q -m "docs(v10): S-99 status (unevidenced-claim fixture)"
+)
+if run_pulse "PULSE_REPO_ROOT=$CLAIM_REPO_FLAGGED" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$CLAIM_REPO_FLAGGED")" \
+    "PULSE_MOAT_RESULT=" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -qF "Unevidenced-claim check: 2 commit(s) scanned touching BOARD.md/PROGRESS.md, 1 flagged line(s)" \
+    && printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNEVIDENCED_CLAIM:" \
+    && printf '%s\n' "$OUT" | grep -qF "S-99 verified and merged, no fix needed."; then
+    ok "an added claim line with no citation fires UNEVIDENCED_CLAIM and quotes the offending line"
+else
+    bad "T30 flagged case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T30b -- D26 guard 4: a claim line WITH a citation (N/N count + backticked command) is not flagged"
+CLAIM_REPO_CLEAN="$WORK/claim-repo-clean"
+mkdir -p "$CLAIM_REPO_CLEAN/docs/v10"
+(
+    cd "$CLAIM_REPO_CLEAN" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '# Board\n' > docs/v10/BOARD.md
+    printf '# Progress\n' > docs/v10/PROGRESS.md
+    git add docs/v10/BOARD.md docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "seed docs"
+    printf 'S-100 verified: full suite 42/42 passing (`bash tests/run-all-tests.sh`).\n' >> docs/v10/PROGRESS.md
+    git add docs/v10/PROGRESS.md
+    GIT_AUTHOR_DATE="2026-09-27T00:05:00Z" GIT_COMMITTER_DATE="2026-09-27T00:05:00Z" \
+        git commit -q -m "docs(v10): S-100 status (evidenced-claim fixture)"
+)
+if run_pulse "PULSE_REPO_ROOT=$CLAIM_REPO_CLEAN" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$CLAIM_REPO_CLEAN")" \
+    "PULSE_MOAT_RESULT=" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNEVIDENCED_CLAIM:" \
+    && printf '%s\n' "$OUT" | grep -qF "Unevidenced-claim check: 2 commit(s) scanned touching BOARD.md/PROGRESS.md, 0 flagged line(s)"; then
+    ok "a claim line carrying an N/N count and a backticked command is not flagged"
+else
+    bad "T30b clean case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
 if command -v /bin/sh >/dev/null 2>&1 && /bin/sh -c 'case "$BASH_VERSION" in 3.2*) exit 0;; *) exit 1;; esac' 2>/dev/null; then
