@@ -636,6 +636,7 @@ run_test "PAUSED.md states the pause reason" "$SCRIPT_DIR/test-paused-md-reason.
 run_test "per-outcome next-step guidance" "$SCRIPT_DIR/test-outcome-guidance.sh"
 run_test "Evidence Receipt run-level baseline (signed diff stat)" "$SCRIPT_DIR/test-receipt-run-baseline.sh"
 run_test "no hardcoded home-directory paths in tests" "$SCRIPT_DIR/test-no-hardcoded-paths.sh"
+run_test "no ambient gitconfig writes without top-level isolation" "$SCRIPT_DIR/test-no-ambient-gitconfig-writes.sh"
 run_test "loki why honest reporting (gate named, diff re-derived)" "$SCRIPT_DIR/test-why-honest-report.sh"
 run_test "status surfaces agree (STATUS.txt vs COMPLETION.txt, --json staleness)" "$SCRIPT_DIR/test-status-surface-agrees.sh"
 run_test "emit.sh append lock never hangs (telemetry must not outlive the run)" "$SCRIPT_DIR/test-emit-lock-no-hang.sh"

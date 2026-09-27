@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
 # Test: no test suite may run `git config --global` or write the ambient
-# ~/.gitconfig / $HOME/.gitconfig without isolating HOME or
-# GIT_CONFIG_GLOBAL earlier in the same file (or inline on the same line).
+# ~/.gitconfig / $HOME/.gitconfig unless it first isolates HOME or
+# GIT_CONFIG_GLOBAL at the top level of the same file.
 #
 # THE RISK: a test that runs `git config --global` against the real user
 # HOME corrupts the developer's or CI runner's actual git identity/config.
-# Every legitimate use in this repo isolates first -- see
-# test-trusted-push-agent-config.sh:53 (`export HOME=`) and
-# test-acceptance-resume-idempotence.sh:71 (`export GIT_CONFIG_GLOBAL=`).
 #
-# Proven directions:
-#   POSITIVE : a planted offender with no isolation is flagged, rc=1.
-#   NEGATIVE : the same fixture WITH `export HOME=` first is not flagged,
-#              rc=0 -- the control that proves this isn't "flag everything".
-#   REAL     : scanning this repo's tests/*.sh and tests/moat/*.sh is clean,
-#              because every real `git config --global` call here already
-#              isolates (verified by hand before writing this guard).
+# FAIL CLOSED. Two earlier versions tried to model shell scope and each
+# ambiguity resolved to "isolated", which a reviewer turned into a bypass.
+# This version accepts exactly one shape and flags everything else:
+#
+#   (a) a line at column 0 that is only `export HOME=RHS` or
+#       `export GIT_CONFIG_GLOBAL=RHS` (optionally `|| exit 1`), placed
+#       before the first offending line;
+#   (b) at that line the scanner is at top level: not inside a quote, a
+#       heredoc, a function, a subshell, or an if/for/while/until/case
+#       block, and no unmatched closer (for example a case pattern `a)`)
+#       has been seen before it;
+#   (c) RHS has scratch provenance: it contains `mktemp`, or references only
+#       variables that were themselves assigned at top level from mktemp (or
+#       from such a variable); it never references HOME;
+#   (d) no other assignment or `unset` of that variable appears anywhere
+#       later in the file (a restore, an inline prefix, a subshell write:
+#       all cancel isolation);
+#   (e) a redirect into ~/.gitconfig or $HOME/.gitconfig needs HOME
+#       isolation; GIT_CONFIG_GLOBAL does not redirect a literal path.
+#
+# The scan is static: fixtures are read, never executed.
 
 set -uo pipefail
 
@@ -26,122 +37,174 @@ FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  FAIL: %s\n' "$1"; FAIL=$((FAIL+1)); }
 
-echo "=== no ambient ~/.gitconfig writes without HOME/GIT_CONFIG_GLOBAL isolation ==="
+echo "=== no ambient ~/.gitconfig writes without top-level HOME/GIT_CONFIG_GLOBAL isolation ==="
 
-# ponytail: isolation tracking is "an assignment to HOME or GIT_CONFIG_GLOBAL
-# appears earlier in the file, or as an inline prefix on the same line" --
-# it does not track function/subshell scope, and a later `HOME=$ORIG_HOME`
-# restore is not distinguished from a scratch-dir assignment. That matches
-# every real pattern in this repo (isolate once near the top of the file).
-# Upgrade to real scope tracking if a suite isolates only inside one function
-# while calling --global from another.
+# ponytail: a line lexer, not a shell parser. Its ceiling: a deliberately
+# obfuscated call (`git config --glo""bal`, `eval`, an alias) is not seen.
+# Constructs it cannot place (a case pattern, a stray closer, an unclosed
+# heredoc) resolve to "flagged", not "isolated".
 scan() {
-    # python3, not grep: this needs multi-line state (has an earlier line in
-    # THIS file assigned HOME/GIT_CONFIG_GLOBAL?) that a single grep pattern
-    # can't express, and BSD/GNU grep already disagree on anchoring (see
-    # test-no-hardcoded-paths.sh).
     python3 - "$@" <<'PYEOF'
 import os, re, sys
 
 SELF = "test-no-ambient-gitconfig-writes.sh"
 
-# An assignment to HOME or GIT_CONFIG_GLOBAL: anchored at start/space/;/( so
-# `ORIG_HOME=$HOME` (assigning ORIG_HOME, merely reading HOME) does not
-# count as isolating. Captures the var name and raw RHS token so
-# _is_noop_selfref can reject `HOME="$HOME"` (assigned, but never changed).
-ISO = re.compile(r'(?:^|[\s;(])(?:export\s+|local\s+)?(HOME|GIT_CONFIG_GLOBAL)=(\S*)')
+GIT_GLOBAL = re.compile(r'\bgit\b[^#\n]*\bconfig\b[^#\n]*--global\b')
+AMBIENT_REDIRECT = re.compile(r'>{1,2}\s*(?:"?\$\{?HOME\}?"?|~)/\.gitconfig\b')
+ISO_LINE = re.compile(r'^export (HOME|GIT_CONFIG_GLOBAL)=("[^"]*"|[^\s;&|]+)(?: \|\| exit 1)?\s*$')
+TOP_ASSIGN = re.compile(r'^(?:export )?([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
+VAR_REF = re.compile(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)')
+HEREDOC = re.compile(r'(?<!<)<<(-?)\s*[\'"]?([A-Za-z_][A-Za-z0-9_]*)[\'"]?')
+OPEN_KW = {"if", "case", "for", "while", "until", "select"}
+CLOSE_KW = {"fi", "esac", "done"}
+LEAD_KW = {"then", "do", "else", "elif", "!", "time"}
 
-# `git config --global ...` (any flags/subcommand path in between), OR a
-# direct redirect into the ambient ~/.gitconfig or $HOME/.gitconfig. A
-# custom-named *.gitconfig file (e.g. "$PL/inc.gitconfig") is a deliberate,
-# non-ambient file and is not flagged.
-OFFENDER = re.compile(
-    r'git\s+(?:-[A-Za-z]\s+\S+\s+)*config\b[^#\n]*--global'
-    r'|[>]{1,2}\s*"?\$\{?HOME\}?"?/\.gitconfig\b'
-    r'|[>]{1,2}\s*~/\.gitconfig\b'
-)
 
-def _is_noop_selfref(var, rhs):
-    # `HOME="$HOME"` / `HOME=$HOME` is an assignment that never changes the
-    # value -- not isolation. Trim at the first `;` or `)` so a trailing
-    # separator on the same line doesn't stay part of the token.
-    token = re.split(r'[;)]', rhs, maxsplit=1)[0].strip('"\'')
-    return token in ("$" + var, "${" + var + "}")
+def assigns(var):
+    return re.compile(
+        r'(?:^|[\s;&|(`])(?:(?:export|local|readonly|typeset|declare)(?:\s+-\w+)*\s+)?'
+        + var + r'(?:\+)?='
+        r'|\bunset\b[^;&|\n]*\b' + var + r'\b')
 
-def _join_continuations(raw_lines):
-    # Join a physical line ending in a single (unescaped) backslash with the
-    # next physical line, so `git config \` / `--global ...` split across a
-    # line continuation is scanned as one logical line. Reports use the
-    # FIRST physical line number of the join.
-    joined, line_nos = [], []
-    i, n = 0, len(raw_lines)
-    while i < n:
-        buf = raw_lines[i]
-        start_no = i + 1
-        while buf.endswith('\\') and not buf.endswith('\\\\') and i + 1 < n:
+
+def join_continuations(raw):
+    out, nos, i = [], [], 0
+    while i < len(raw):
+        buf, start = raw[i], i + 1
+        while buf.endswith('\\') and not buf.endswith('\\\\') and i + 1 < len(raw):
             i += 1
-            buf = buf[:-1] + ' ' + raw_lines[i]
-        joined.append(buf)
-        line_nos.append(start_no)
+            buf = buf[:-1] + ' ' + raw[i]
+        out.append(buf)
+        nos.append(start)
         i += 1
-    return joined, line_nos
+    return out, nos
 
-def _depth_at(line, index, start_depth):
-    # Count unmatched literal '(' up to `index`, starting from `start_depth`
-    # (carried over from prior lines), skipping over $(...) command
-    # substitutions (non-nested) so they never count as subshell scope.
-    depth = start_depth
-    i = 0
-    while i < index and i < len(line):
-        if line[i] == '$' and i + 1 < len(line) and line[i + 1] == '(':
-            j = line.find(')', i + 2)
-            if j == -1 or j >= index:
-                break
-            i = j + 1
+
+def lex(line, state):
+    """Advance quote state and structural depth over one line. Returns the
+    list of heredoc delimiters opened on the line."""
+    code = []
+    i, n = 0, len(line)
+    end = n
+    while i < n:
+        c = line[i]
+        if state["sq"]:
+            if c == "'":
+                state["sq"] = False
+            i += 1
             continue
-        if line[i] == '(':
-            depth += 1
-        elif line[i] == ')':
-            depth = max(0, depth - 1)
+        if c == '\\':
+            i += 2
+            continue
+        if state["dq"]:
+            if c == '"':
+                state["dq"] = False
+            i += 1
+            continue
+        if c == "'":
+            state["sq"] = True
+        elif c == '"':
+            state["dq"] = True
+        elif c == '#' and (i == 0 or line[i - 1] in ' \t;'):
+            end = i
+            break
+        else:
+            code.append(c)
+            if c == '(':
+                state["depth"] += 1
+            elif c == ')':
+                state["depth"] -= 1
         i += 1
-    return depth
+    text = ''.join(code)
+    # Block keywords count only at command position: the first word of a
+    # segment split on ; & | ( ), after then/do/else/elif/!. `echo done`
+    # is an argument, not a closer.
+    for seg in re.split(r'[;&|()]', text):
+        words = seg.split()
+        while words and words[0] in LEAD_KW:
+            words.pop(0)
+        if not words:
+            continue
+        if words[0] == '{' or words[0] in OPEN_KW:
+            state["depth"] += 1
+        elif words[0] == '}' or words[0] in CLOSE_KW:
+            state["depth"] -= 1
+    if state["depth"] < 0:
+        state["poisoned"] = True
+        state["depth"] = 0
+    # Heredoc detection keeps quotes: `<<'EOF'` is the common form. A `<<`
+    # inside a string opens a spurious heredoc, which only hides later
+    # isolation lines (fail closed); skipped lines are still offender-checked.
+    return HEREDOC.findall(line[:end])
 
-def _real_iso_before(text):
-    # Is there a genuine (non-no-op) isolating assignment anywhere in `text`?
-    # Used only for the same-line prefix check, where the offender and its
-    # isolation share one physical/joined line -- subshell scope does not
-    # apply since both live in the same scope.
-    for im in ISO.finditer(text):
-        if not _is_noop_selfref(im.group(1), im.group(2)):
-            return True
-    return False
 
 def scan_file(path):
-    hits = []
     try:
-        raw_lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+        raw = open(path, encoding="utf-8", errors="replace").read().split("\n")
     except OSError:
-        return hits
-    lines, line_nos = _join_continuations(raw_lines)
-    isolated = False
-    depth = 0
-    for line, lineno in zip(lines, line_nos):
-        if line.lstrip().startswith("#"):
-            depth = _depth_at(line, len(line), depth)
+        return []
+    lines, nos = join_continuations(raw)
+    state = {"sq": False, "dq": False, "depth": 0, "poisoned": False}
+    scratch = set()
+    iso = {"HOME": False, "GIT_CONFIG_GLOBAL": False}
+    pending_heredocs = []
+    hits = []
+    for line, no in zip(lines, nos):
+        if pending_heredocs:
+            strip_tabs, word = pending_heredocs[0]
+            if (line.lstrip('\t') if strip_tabs else line) == word:
+                pending_heredocs.pop(0)
+            elif GIT_GLOBAL.search(line) or AMBIENT_REDIRECT.search(line):
+                hits.append("%s:%d:%s" % (path, no, line.strip()))
             continue
-        line_start_depth = depth
-        m = OFFENDER.search(line)
-        if m and not isolated and not _real_iso_before(line[:m.start()]):
-            hits.append("%s:%d:%s" % (path, lineno, line.strip()))
-        for im in ISO.finditer(line):
-            if _is_noop_selfref(im.group(1), im.group(2)):
-                continue
-            # A subshell-local assignment (depth > 0 at the point it's made)
-            # never escapes to isolate code outside that subshell.
-            if _depth_at(line, im.start(), line_start_depth) == 0:
-                isolated = True
-        depth = _depth_at(line, len(line), line_start_depth)
+
+        top = (not state["sq"] and not state["dq"] and state["depth"] == 0
+               and not state["poisoned"])
+
+        # Scratch provenance is judged against the variables that were
+        # scratch BEFORE this line, so `W="$(cd "$W" && pwd -P)"` keeps W.
+        prior_scratch = set(scratch)
+
+        def scratch_rhs(rhs):
+            refs = VAR_REF.findall(rhs)
+            return "HOME" not in refs and ("mktemp" in rhs or
+                    (bool(refs) and all(r in prior_scratch for r in refs)))
+
+        # (d) any assignment/unset cancels isolation, and any write to a
+        # scratch variable drops its provenance. The (a)/(c) checks below
+        # re-grant only for a top-level line of the accepted shape.
+        for var in iso:
+            if assigns(var).search(line):
+                iso[var] = False
+        for name in list(scratch):
+            if assigns(name).search(line):
+                scratch.discard(name)
+
+        is_comment = top and line.lstrip().startswith('#')
+        if is_comment:
+            pass
+        elif GIT_GLOBAL.search(line):
+            if not (iso["HOME"] or iso["GIT_CONFIG_GLOBAL"]):
+                hits.append("%s:%d:%s" % (path, no, line.strip()))
+        elif AMBIENT_REDIRECT.search(line):
+            if not iso["HOME"]:
+                hits.append("%s:%d:%s" % (path, no, line.strip()))
+
+        opened = lex(line, state)
+        top_after = top and not state["sq"] and not state["dq"] \
+            and state["depth"] == 0 and not state["poisoned"] and not opened
+
+        if top_after:
+            m = ISO_LINE.match(line)
+            a = TOP_ASSIGN.match(line)
+            if m:
+                if scratch_rhs(m.group(2)):
+                    iso[m.group(1)] = True
+            elif a and a.group(1) not in iso and scratch_rhs(a.group(2)):
+                scratch.add(a.group(1))
+        pending_heredocs.extend((s == '-', w) for s, w in opened)
     return hits
+
 
 hits = []
 for directory in sys.argv[1:]:
@@ -159,90 +222,179 @@ PYEOF
 
 # ---- REAL: this repo's suites -----------------------------------------
 real_offenders="$(scan "$SCRIPT_DIR" "$SCRIPT_DIR/moat")"
-
 if [ -z "$real_offenders" ]; then
-    ok "no test writes the ambient gitconfig without isolating HOME/GIT_CONFIG_GLOBAL first"
+    ok "no test writes the ambient gitconfig without top-level isolation first"
 else
     bad "unisolated ambient gitconfig writes found:"
     printf '%s\n' "$real_offenders" | sed 's/^/        /' | head -20
 fi
 
-# ---- RED: a planted offender with no isolation must be flagged --------
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/loki-gitconfig-XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-cat > "$TMP/offender.sh" <<'EOF'
-#!/usr/bin/env bash
+# expect_flag NAME  -- fixture body on stdin must be flagged
+# expect_clean NAME -- fixture body on stdin must NOT be flagged
+expect_flag() {
+    local name="$1" out
+    rm -f "$TMP"/*.sh
+    cat > "$TMP/$name.sh"
+    out="$(scan "$TMP")"
+    if printf '%s' "$out" | grep -q "$name.sh"; then
+        ok "flagged: $name"
+    else
+        bad "NOT flagged (bypass): $name"
+    fi
+}
+expect_clean() {
+    local name="$1" out
+    rm -f "$TMP"/*.sh
+    cat > "$TMP/$name.sh"
+    out="$(scan "$TMP")"
+    if [ -z "$out" ]; then
+        ok "clean: $name"
+    else
+        bad "false flag: $name -> $out"
+    fi
+}
+
+# ---- controls ---------------------------------------------------------
+expect_flag no-isolation <<'EOF'
 git config --global user.name "unsafe"
 EOF
 
-red="$(scan "$TMP")"
-if printf '%s' "$red" | grep -q 'offender.sh'; then
-    ok "detector flags an unisolated git config --global (non-vacuous)"
-else
-    bad "detector missed a planted unisolated offender -- the scan is broken"
-fi
-
-# ---- GREEN: the same call, isolated first, must NOT be flagged --------
-rm -f "$TMP/offender.sh"
-cat > "$TMP/isolated.sh" <<'EOF'
-#!/usr/bin/env bash
+expect_clean isolated-mktemp <<'EOF'
 export HOME="$(mktemp -d)"
 git config --global user.name "safe"
 EOF
 
-green="$(scan "$TMP")"
-if [ -z "$green" ]; then
-    ok "an isolated git config --global is not flagged (control passes)"
-else
-    bad "isolation control was flagged anyway -- guard is too broad: $green"
-fi
+# Real-file shape: helper functions, a multi-line single-quoted awk program,
+# a heredoc, and a provenance chain all precede the isolation line.
+expect_clean real-shape <<'EOF'
+pass() {
+    PASS=$((PASS + 1))
+}
+W="$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")" || exit 1
+W="$(cd "$W" && pwd -P)"
+awk '
+    /^x$/ { on = 1 }
+' in > out
+cat > "$W/pre.sh" <<XEOF
+export HOME="$W"
+XEOF
+export HOME="$W/home"
+f() {
+    git config --global url.a.insteadOf b
+}
+EOF
 
-# ---- BYPASS 1: a no-op self-reassignment is not real isolation ---------
-rm -f "$TMP/isolated.sh"
-cat > "$TMP/bypass-noop.sh" <<'EOF'
-#!/usr/bin/env bash
+# ---- round 1 bypasses (849b655e review) ---------------------------------
+expect_flag noop-self-reassign <<'EOF'
 export HOME="$HOME"
 git config --global user.name "unsafe"
 EOF
 
-bypass1="$(scan "$TMP")"
-if printf '%s' "$bypass1" | grep -q 'bypass-noop.sh'; then
-    ok "a no-op HOME=\$HOME self-reassignment does not count as isolation"
-else
-    bad "no-op self-reassignment was treated as isolating -- bypass 1 not caught: $bypass1"
-fi
-
-# ---- BYPASS 2: --global split across a line continuation ---------------
-rm -f "$TMP/bypass-noop.sh"
-cat > "$TMP/bypass-continuation.sh" <<'EOF'
-#!/usr/bin/env bash
+expect_flag continuation-split <<'EOF'
 git config \
     --global user.name "unsafe"
 EOF
 
-bypass2="$(scan "$TMP")"
-if printf '%s' "$bypass2" | grep -q 'bypass-continuation.sh'; then
-    ok "a --global split across a line continuation is still flagged"
-else
-    bad "backslash-continuation split evaded the scan -- bypass 2 not caught: $bypass2"
-fi
-
-# ---- BYPASS 3: isolation set only inside a subshell ---------------------
-rm -f "$TMP/bypass-continuation.sh"
-cat > "$TMP/bypass-subshell.sh" <<'EOF'
-#!/usr/bin/env bash
+expect_flag subshell-only <<'EOF'
 ( export HOME=$(mktemp -d); true )
 git config --global user.name "unsafe"
 EOF
 
-bypass3="$(scan "$TMP")"
-if printf '%s' "$bypass3" | grep -q 'bypass-subshell.sh'; then
-    ok "isolation scoped to a subshell does not isolate the parent shell's later call"
-else
-    bad "subshell-local isolation leaked to the parent scope -- bypass 3 not caught: $bypass3"
+# ---- fail-closed shapes the scope-tracking versions accepted ------------
+expect_flag inside-if-block <<'EOF'
+if false; then
+export HOME="$(mktemp -d)"
 fi
-rm -f "$TMP/bypass-subshell.sh"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag inside-heredoc <<'EOF'
+cat > /dev/null <<XEOF
+export HOME="$(mktemp -d)"
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag inside-quoted-heredoc <<'EOF'
+cat > /dev/null <<'XEOF'
+export HOME="$(mktemp -d)"
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag inside-dquoted-heredoc <<'EOF'
+cat > /dev/null <<"XEOF"
+export HOME="$(mktemp -d)"
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag closer-word-argument <<'EOF'
+if true; then
+echo done
+export HOME="$(mktemp -d)"
+fi
+git config --global user.name "unsafe"
+EOF
+
+expect_flag case-arm-nested-if <<'EOF'
+case x in
+x) if true; then
+export HOME="$(mktemp -d)"
+fi ;;
+esac
+git config --global user.name "unsafe"
+EOF
+
+expect_flag unindented-function <<'EOF'
+iso() {
+export HOME="$(mktemp -d)"
+}
+git config --global user.name "unsafe"
+EOF
+
+expect_flag multiline-string <<'EOF'
+echo "text
+export HOME=\"$(mktemp -d)\"
+"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag multiline-subshell <<'EOF'
+(
+export HOME="$(mktemp -d)"
+)
+git config --global user.name "unsafe"
+EOF
+
+expect_flag restored-after-isolation <<'EOF'
+ORIG_HOME="$HOME"
+export HOME="$(mktemp -d)"
+export HOME="$ORIG_HOME"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag provenance-from-home <<'EOF'
+W="$HOME"
+export HOME="$W"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag case-pattern-poisons <<'EOF'
+case "$1" in
+a) true ;;
+esac
+export HOME="$(mktemp -d)"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag redirect-needs-home <<'EOF'
+export GIT_CONFIG_GLOBAL="$(mktemp)"
+printf '[user]\n' >> "$HOME/.gitconfig"
+EOF
 
 echo ""
 echo "  Passed: $PASS   Failed: $FAIL"

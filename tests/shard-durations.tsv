@@ -82,6 +82,7 @@ PAUSED.md states the pause reason	0
 per-outcome next-step guidance	1
 Evidence Receipt run-level baseline (signed diff stat)	0
 no hardcoded home-directory paths in tests	0
+no ambient gitconfig writes without top-level isolation	1
 loki why honest reporting (gate named, diff re-derived)	1
 status surfaces agree (STATUS.txt vs COMPLETION.txt, --json staleness)	1
 emit.sh append lock never hangs (telemetry must not outlive the run)	1
