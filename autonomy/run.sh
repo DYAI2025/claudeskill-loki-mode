@@ -21589,16 +21589,19 @@ except (json.JSONDecodeError, KeyError, TypeError, OSError):
         RETRY_COUNT=0
     fi
     # A session that starts at iteration 0 has run nothing yet, so a leftover
-    # freshness marker or unit-tests.pass is a previous session's evidence.
-    # Iterations restart at 0, so keeping them would let an old pass:true read
-    # as this iteration's result.
+    # freshness marker, unit-tests.pass, or static-analysis.pass is a previous
+    # session's evidence. Iterations restart at 0, so keeping them would let
+    # an old pass:true read as this iteration's result.
     if [ "${ITERATION_COUNT:-0}" = "0" ]; then
-        # Same path the writer (enforce_test_coverage) and the freshness
-        # readers use.
+        # Same path the writer (enforce_test_coverage, enforce_static_analysis)
+        # and the freshness readers use.
         local _q="${TARGET_DIR:-.}/.loki/quality"
         # test-results.json too: with the marker gone the receipt's quality
         # gates fall back to its status, reporting a previous session's run.
-        rm -f "$_q/.test-results.iter" "$_q/unit-tests.pass" "$_q/test-results.json" 2>/dev/null || true
+        # static-analysis.pass has no freshness marker of its own, so a stale
+        # copy from a previous session reads as a pass of this session's
+        # exogenous static_analysis gate unless it is dropped here too.
+        rm -f "$_q/.test-results.iter" "$_q/unit-tests.pass" "$_q/test-results.json" "$_q/static-analysis.pass" 2>/dev/null || true
     fi
 }
 
