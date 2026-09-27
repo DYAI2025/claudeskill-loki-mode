@@ -463,6 +463,12 @@ def tests_axis(path):
         # exit 0 alone is green only if nothing else contradicts it (checked below).
     def _nonzero_int(v):
         return isinstance(v, int) and not isinstance(v, bool) and v != 0
+    # Zero-test record: nothing actually ran, regardless of self-reported
+    # pass/fail. Checked before the pass:true/false branches below so a
+    # plausible {"pass": true, "total": 0} shape cannot slip through the
+    # pass:true branch as a false green.
+    if isinstance(d.get("total"), int) and d.get("total") == 0:
+        return "unknown"
     p = d.get("pass")
     if p is True:
         # A self-reported pass contradicted by a nonzero failure count (under
@@ -476,9 +482,6 @@ def tests_axis(path):
         return "red"
     # Legacy / generic shapes.
     failed = d.get("failed")
-    total = d.get("total")
-    if isinstance(total, int) and total == 0:
-        return "unknown"  # zero-test record: nothing actually ran
     if isinstance(failed, int):
         return "green" if failed == 0 else "red"
     if status in ("pass", "passed", "green", "ok", "success", "verified"):

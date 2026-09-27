@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/test-done-recognition-tests-axis.sh -- the tests_axis classifier inside
 # autonomy/lib/done-recognition.sh (reuse_done_recognition_gate's fresh-test
-# read). Scoped to three shapes the classifier must get right:
+# read). Scoped to four shapes the classifier must get right:
 #
 #   (1) zero-test record {"passed":0,"failed":0,"total":0} -- nothing actually
 #       ran (total is 0). Must classify "unknown", never "green".
@@ -10,6 +10,12 @@
 #       classify "red", never "green".
 #   (3) real green {"pass":true,"exit_code":0,"failed_count":0} -- a genuine
 #       clean pass with the same failed_count key at zero. Must stay "green".
+#   (4) {"pass":true,"total":0} -- self-reported pass on a zero-test record.
+#       The total==0 check must apply before the pass:true branch returns
+#       early, or this shape falls through as a false "green" (S-125 review
+#       finding #1: reproduced live through reuse_done_recognition_gate,
+#       produced a completion-evidence.md that falsely claimed tests were
+#       re-run and passed). Must classify "unknown", never "green".
 #
 # The classifier is a python function private to a bash function (no seam to
 # call directly), so this drives it the same way tests/test-reuse-done-
@@ -127,6 +133,28 @@ if [ -f "$EV" ] && grep -q "Fresh-test axis: green" "$EV"; then
     ok "(3) real green record classifies green"
 else
     fail "(3) real green record did not classify green (evidence=$([ -f "$EV" ] && grep 'Fresh-test axis' "$EV" || echo 'missing'))"
+fi
+cleanup_project
+
+#==============================================================================
+# (4) pass:true with total:0 -- self-reported pass on a zero-test record.
+#     Must classify unknown (nothing ran), never green. Review finding #1.
+#==============================================================================
+new_project
+printf '{"pass":true,"total":0}\n' > "$TARGET_DIR/.loki/quality/test-results.json"
+GENERATED_PRD_ACTION="reuse"
+reuse_done_recognition_gate ".loki/generated-prd.md" >/dev/null 2>&1
+rc=$?
+EV="$TARGET_DIR/.loki/completion-evidence.md"
+if [ -f "$EV" ] && grep -q "Fresh-test axis: unknown" "$EV"; then
+    ok "(4) pass:true with total:0 classifies unknown"
+else
+    fail "(4) pass:true with total:0 did not classify unknown (rc=$rc, evidence=$([ -f "$EV" ] && grep 'Fresh-test axis' "$EV" || echo 'missing'))"
+fi
+if [ -f "$EV" ] && ! grep -qiE 're-ran the tests|against re-run tests' "$EV"; then
+    ok "(4) receipt does not overclaim a test run for pass:true+total:0"
+else
+    fail "(4) receipt overclaims a passing test run for pass:true+total:0 (unknown-axis) record"
 fi
 cleanup_project
 
