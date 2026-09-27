@@ -5,6 +5,20 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.63.0
+
+**First release under the verified-tree rule (D28): this tree passed Tests, Bun Parity and Security Audit on commit 1bc02bce before the version was bumped.** It carries trains 5 to 7 plus the P0 fixes.
+
+**Versions that were never published:** v9.58.0 was bumped but superseded by v9.59.0, which contains all of it. v9.60.0, v9.61.0 and v9.62.0 were bumped and tagged on trees whose Tests were red (a CI-only P9 harness gap and the lineage race below), so their releases were stopped before publishing. Their CHANGELOG entries below describe changes that first ship in this release.
+
+**Fixes:**
+- Provider launch race: `spawn_tracked` read the child's `/proc/<pid>/environ` before exec had finished and failed closed with "provider attempt lineage marker is unavailable" (exit 127) under load. The child now signals readiness after exec, and the launcher waits for it (30s cap, fail closed). Linux, 2x load: 20 of 20 test runs failed before, 0 of 30 after (S-102).
+- P9 Rule of Two harness: the scenarios now unset `XDG_CONFIG_HOME` and `GH_CONFIG_DIR`, so the planted `hosts.yml` is where gh actually looks. On GitHub runners two P9 checks had been passing without measuring anything (S-107).
+- Tests and agent runs never open a browser: every open site goes through one guard that declines under `LOKI_NO_BROWSER=1`, CI, a test runner or a non-TTY. `loki migrate` had opened its dashboard with an unguarded `open` (S-103).
+- `scripts/release.sh` refuses any version bump unless Tests and Bun Parity passed on that exact commit, and gains `--bump-only` (S-108).
+
+**CI:** the Python suite runs serially again (the `pytest -n auto` switch is reverted until the race fix is proven on CI). Four suites are time-boxed in `tests/quarantine.txt` until 2026-10-03 (S-106, S-110).
+
 ## v9.62.0
 
 **Release train 7: test hygiene, a test quarantine, and two P7 fabricated-data scanner gaps closed.** Released on the founder's instruction to ship completed work without further review cycles.
