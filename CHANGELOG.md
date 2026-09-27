@@ -5,6 +5,19 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.62.0
+
+**Release train 7: test hygiene, a test quarantine, and two P7 fabricated-data scanner gaps closed.** Released on the founder's instruction to ship completed work without further review cycles.
+
+**Tests and CI:**
+- `tests/quarantine.txt` lets a listed suite run without blocking, with an owner, an issue and an expiry no more than 7 days out. Expired entries, moat suites and review suites are rejected (S-92, Part C item 14).
+- 52 test suites that no runner invoked are now registered, and 4 obsolete ones are deleted with stated reasons. The pass surfaced real fixes: `learning/suggest.sh` emitted invalid Python for its verbose flag; a dashboard hook test had aged out of its own 7-day window; a Cline e2e test hard-failed without the CLI; `loki welcome` never confirmed that the telemetry opt-out took effect. 8 suites were silently exiting under `set -e` at their first counter increment (S-93, item 15).
+- `tests/test-review-assurance-tail.sh` dispatches only the requirements verifier for its contract-only cases, about 1.9x faster per case (S-95).
+
+**Moat P7 (no fabricated data):**
+- The scanner catches a literal-rows default on a destructured binding or a function parameter (S-28, BACKLOG 125 B-2).
+- It tolerates spread, nested-call and trailing-call sinks and more helper shapes, and closes a useMemo-then-set fabrication bypass (S-31, BACKLOG 125 B-7).
+
 ## v9.61.0
 
 **Release train 6: no shipped GitHub Action step runs the agent while holding a token.**
