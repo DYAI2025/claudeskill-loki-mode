@@ -33945,8 +33945,10 @@ except Exception:
         # Only scan added lines (starting with "+") to avoid flagging deleted code
         while IFS= read -r match; do
             [ -z "$match" ] && continue
-            local ml
-            ml=$(echo "$match" | cut -d: -f1)
+            # grep -n emits "N:content"; take the number before the first
+            # colon without forking echo+cut per line (matters at finding
+            # counts in the thousands+).
+            local ml="${match%%:*}"
             _ci_add_finding "diff" "$ml" "$sev" "$cat" "$finding" "$suggestion"
         done < <(printf '%s\n' "$diff_content" \
             | grep -n '^+' \
@@ -34089,8 +34091,11 @@ TEST_SUGGEST_PY
     # --- Tally findings ---
     local count_critical=0 count_high=0 count_medium=0 count_low=0 count_info=0
     for f in "${findings[@]+"${findings[@]}"}"; do
-        local sev
-        sev=$(echo "$f" | cut -d'|' -f3)
+        # "file|line|sev|cat|finding|suggestion" (see _ci_add_finding above).
+        # No echo+cut fork per finding -- this loop runs once per finding and
+        # dominated the runtime at the fixture's old ARG_MAX-scale sizes.
+        local sev _tally_file _tally_line _tally_cat _tally_finding _tally_suggestion
+        IFS='|' read -r _tally_file _tally_line sev _tally_cat _tally_finding _tally_suggestion <<< "$f"
         case "$sev" in
             CRITICAL) count_critical=$((count_critical + 1)) ;;
             HIGH) count_high=$((count_high + 1)) ;;

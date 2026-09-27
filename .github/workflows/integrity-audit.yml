@@ -56,6 +56,11 @@ jobs:
         id: shell_tests
         if: always()
         continue-on-error: true
+        env:
+          # Full ARG_MAX-scale test-ci-json-argmax.sh fixture on this weekly
+          # run only; the per-push tier (test.yml) uses the smaller default
+          # fixture (BACKLOG 143 / S-79).
+          LOKI_ARGMAX_FULL: "1"
         run: bash tests/run-all-tests.sh
 
       - name: Bash syntax validation

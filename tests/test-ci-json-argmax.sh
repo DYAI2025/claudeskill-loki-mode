@@ -19,7 +19,9 @@
 # to temp files read as sys.argv[1]/[2]; only the small, fixed-width META and
 # COUNTS strings stay as env vars. This test drives the real end-to-end
 # command (not a unit-level extraction) against a fixture sized to clear
-# ARG_MAX, and asserts exit 0 with valid, complete JSON.
+# MAX_ARG_STRLEN on Linux (the per-string ceiling that actually crashes) or
+# ARG_MAX on Darwin, and asserts exit 0 with valid, complete JSON. Set
+# LOKI_ARGMAX_FULL=1 to run the full ARG_MAX-scale fixture on Linux too.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,10 +71,31 @@ mkdir -p "$REPO_DIR"
 # there and the crash this test exists to catch goes unexercised -- exactly
 # how a fixture this size passed locally and then still failed to prove
 # anything on CI. 2x margin over the measured ARG_MAX, ~72 bytes/finding.
+#
+# On Linux the crash actually trips on ONE exported string clearing
+# MAX_ARG_STRLEN (131072 bytes, linux/binfmts.h) -- a per-string cap that
+# execve() enforces BEFORE it ever totals argv+envp against ARG_MAX. Sizing
+# for total ARG_MAX (~4 MiB on the GitHub Actions ubuntu runner) overshoots
+# the real threshold ~30x and was measured at 1327s (22m07s, run 36299762731,
+# 2026-09-27) -- most of the whole shard's wall clock for margin the crash
+# never needed. Darwin has no such per-string cap, so ARG_MAX is still the
+# real ceiling there and keeps the original sizing. LOKI_ARGMAX_FULL=1 forces
+# the full ARG_MAX-scale fixture on Linux too, for the nightly/full-scale run
+# (see .github/workflows/integrity-audit.yml).
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
 _argmax_for_sizing="$ARG_MAX"
 case "$_argmax_for_sizing" in '' | 0 | *[!0-9]*) _argmax_for_sizing=1048576 ;; esac
-FINDING_COUNT=$(( (_argmax_for_sizing * 2) / 72 ))
-[ "$FINDING_COUNT" -lt 16000 ] && FINDING_COUNT=16000
+if [ "$UNAME_S" = "Linux" ] && [ "${LOKI_ARGMAX_FULL:-0}" != "1" ]; then
+    FINDING_COUNT=$(( (2 * 131072) / 72 ))
+    [ "$FINDING_COUNT" -lt 4000 ] && FINDING_COUNT=4000
+    SIZING_CEILING=131072
+    SIZING_CEILING_LABEL="MAX_ARG_STRLEN"
+else
+    FINDING_COUNT=$(( (_argmax_for_sizing * 2) / 72 ))
+    [ "$FINDING_COUNT" -lt 16000 ] && FINDING_COUNT=16000
+    SIZING_CEILING="$ARG_MAX"
+    SIZING_CEILING_LABEL="ARG_MAX"
+fi
 (
     cd "$REPO_DIR" || exit 1
     python3 -c "
@@ -118,10 +141,10 @@ OUT_SIZE=${OUT_SIZE:-0}
 # real crash threshold instead of a looser proxy for it.
 RAW_LINE='diff|9|MEDIUM|anti-pattern|Bare except clause|Catch specific exceptions'
 RAW_SIZE=$(( (${#RAW_LINE} + 1) * FINDING_COUNT ))
-if [ "$ARG_MAX" -gt 0 ] && [ "$RAW_SIZE" -le "$ARG_MAX" ]; then
-    log_fail "fixture clears ARG_MAX on the raw export" "raw findings string is only ~$RAW_SIZE bytes (ARG_MAX $ARG_MAX) -- fixture too small to exercise the crash this fix addresses"
+if [ "$SIZING_CEILING" -gt 0 ] && [ "$RAW_SIZE" -le "$SIZING_CEILING" ]; then
+    log_fail "fixture clears $SIZING_CEILING_LABEL on the raw export" "raw findings string is only ~$RAW_SIZE bytes ($SIZING_CEILING_LABEL $SIZING_CEILING) -- fixture too small to exercise the crash this fix addresses"
 else
-    log_pass "fixture clears ARG_MAX on the raw export (~$RAW_SIZE bytes, ARG_MAX $ARG_MAX; rendered JSON output $OUT_SIZE bytes)"
+    log_pass "fixture clears $SIZING_CEILING_LABEL on the raw export (~$RAW_SIZE bytes, $SIZING_CEILING_LABEL $SIZING_CEILING; rendered JSON output $OUT_SIZE bytes)"
 fi
 
 if [ -s "$OUT_FILE" ]; then

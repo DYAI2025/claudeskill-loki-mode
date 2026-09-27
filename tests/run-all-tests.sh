@@ -64,7 +64,7 @@ fi
 # of a new process group and the suite inherits that group, so a signal sent
 # to the RUNNER's own process group (an interactive Ctrl-C) never reaches it.
 # Without this trap, stopping a run stuck in a timeout-wrapped hang means
-# waiting out the full per-suite budget (up to 2400s for the argmax override)
+# waiting out the full per-suite budget (up to 900s for the trust-core override)
 # instead of a normal Ctrl-C.
 #
 # Installed ONLY when a real per-suite timeout is in play (a timeout binary
@@ -109,14 +109,16 @@ _suite_timeout_for() {
         return
     fi
     case "$(basename -- "$1")" in
-        # 1327s (22m07s) measured on CI (shard 2 job 108565132341, run
-        # 36299762731, 2026-09-27): builds a real ~116K-finding diff on Linux
-        # CI's ARG_MAX and runs `loki ci --format json` over it end to end.
-        # This is the suite BACKLOG 143 is about: it is slow, not hung, and
-        # its runtime should be brought down in a follow-up (smaller fixture,
-        # or move it out of the sharded job) rather than budgeted around
-        # forever. ~1.8x margin over the measured time, not a round number.
-        test-ci-json-argmax.sh) echo 2400 ;;
+        # BACKLOG 143 / S-79: test-ci-json-argmax.sh used to need 2400s
+        # (1327s measured, run 36299762731, 2026-09-27) because its default
+        # fixture was sized for total ARG_MAX (~116K findings) when the crash
+        # it guards only needs ONE exported string past Linux's MAX_ARG_STRLEN
+        # (131072 bytes). Re-sized to a ~4000-finding fixture on Linux; the
+        # full ARG_MAX-scale fixture still exists behind LOKI_ARGMAX_FULL=1
+        # for the nightly run (see .github/workflows/integrity-audit.yml), so
+        # no override is needed here -- the default sizing now fits the
+        # suite's own default timeout.
+        #
         # Real `bun test` mutation probes (trust-core regression detection),
         # not a fixed-size fixture. Measured: 191s solo (CI shard 2, run
         # 36299762731); locally on this machine, 281s solo (4-shard parallel
