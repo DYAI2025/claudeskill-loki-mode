@@ -13979,8 +13979,8 @@ if not isinstance(d, dict):
 verdict = d.get('verdict', 'unknown')
 diff = d.get('diff', {}) if isinstance(d.get('diff'), dict) else {}
 tests = d.get('tests', {}) if isinstance(d.get('tests'), dict) else {}
-diff_ok = diff.get('ok')
-tests_ok = tests.get('ok')
+diff_ok = 'inconclusive' if diff.get('inconclusive') else diff.get('ok')
+tests_ok = 'inconclusive' if tests.get('inconclusive') else tests.get('ok')
 runner = tests.get('runner', 'none')
 parts = ['verdict=%s' % verdict]
 parts.append('diff_ok=%s' % diff_ok)
