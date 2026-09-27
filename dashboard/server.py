@@ -8352,6 +8352,8 @@ def _compute_cost_timeline() -> dict:
             "generated_at": data.get("generated_at"),
             "model": (data.get("provider") or {}).get("model"),
             "cost_usd": round(run_cost_num, 6) if run_cost_num is not None else None,
+            # A partly priced run's cost is a lower bound (efficiency_cost.py).
+            "cost_partial": (data.get("cost") or {}).get("cost_partial") is True,
             "files_changed": (data.get("files_changed") or {}).get("count"),
             "final_verdict": (data.get("council") or {}).get("final_verdict"),
         })
@@ -12536,6 +12538,8 @@ async def list_proofs():
             "generated_at": data.get("generated_at"),
             "loki_version": data.get("loki_version"),
             "cost_usd": (data.get("cost") or {}).get("usd"),
+            # A partly priced run's cost is a lower bound (efficiency_cost.py).
+            "cost_partial": (data.get("cost") or {}).get("cost_partial") is True,
             "files_changed": (data.get("files_changed") or {}).get("count"),
             "final_verdict": (data.get("council") or {}).get("final_verdict"),
             "headline": headline,
