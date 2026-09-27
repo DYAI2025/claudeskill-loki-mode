@@ -5,6 +5,23 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.67.0
+
+**Delegate pushes never target the default branch, verdict honesty fixes, and https-only attestation keys.** Released from green tree 28926937 (Tests run 36341205226 and Bun Parity run 36341205233 both success before the bump).
+
+**Security:**
+- Loki's trusted push refuses the repository's actual default branch (and main, master and HEAD) for every caller, resolving the default from the pinned origin and refusing when it cannot be resolved (S-100).
+- JWKS attestation keys are fetched only over https (loopback http allowed); a URL-named file in the checkout can no longer stand in for a fetch. An unsigned receipt checked against a missing key file still fails (S-123).
+- The command guard closes four more bypasses: quote state carried across heredoc lines, exact terminator lines, a quoted redirect token hiding an rm target, and tool writes to BOARD.md before a commit (S-99).
+
+**Honest verdicts:**
+- A stale static-analysis pass from a previous session is dropped at iteration 0 and on a corrupted-state restart (S-124).
+- The done-recognition tests axis reads a zero-test record as unknown and a pass with failed tests as red (S-125).
+- The P7 scanner rejects empty-object, whitespace and zero-valued siblings as exemptions for a fabricated array (S-30).
+- Dashboard scope-audit tests discover /api/v2 routes dynamically, so they cannot pass vacuously on newer FastAPI (S-126).
+
+**CI:** Tier A caches its installs and its R0 step no longer times out before its job (S-96). The pulse no longer flags a claim that was later cited or retracted.
+
 ## v9.66.0
 
 **Council honesty, a faster moat, and a clean quarantine list.** Released from green tree 51ae52fe (Tests run 36338540948 and Bun Parity run 36338540897 both success before the bump).
