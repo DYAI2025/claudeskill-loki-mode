@@ -164,12 +164,21 @@ run_pulse() {
     return $rc
 }
 
+# A non-streak fixture for the CI_CANCELLED_STREAK check's default in
+# COMMON_ARGS below: a clean, completed, non-cancelled run. Using "false"
+# here (like PULSE_GH_CMD's own placeholder) would make ci_cancelled_streak
+# UNKNOWN on every test that does not explicitly override it, turning every
+# "rc = 0" clean-case assertion (T4 etc.) into rc = 2.
+GH_STREAK_OK_JSON="$WORK/gh-streak-ok.json"
+printf '[{"status":"completed","conclusion":"success"}]' > "$GH_STREAK_OK_JSON"
+
 COMMON_ARGS=(
     "PULSE_REPO_ROOT=$FAKE_REPO"
     "PULSE_MAIN_REF=main"
     "CONTROL_MD=$CONTROL_OK"
     "PULSE_NPM_CMD=false"
     "PULSE_GH_CMD=false"
+    "PULSE_GH_STREAK_CMD=cat $GH_STREAK_OK_JSON"
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")"
     "PULSE_MOAT_RESULT="
     "PULSE_SWARM_START=2026-09-26T23:00Z"
@@ -466,17 +475,20 @@ chmod +x "$SLOW_CMD"
 start_ts=$(date +%s)
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
     "PULSE_NPM_CMD=$SLOW_CMD" "PULSE_GH_CMD=$SLOW_CMD" "PULSE_WORKTREE_CMD=$SLOW_CMD" \
+    "PULSE_GH_STREAK_CMD=$SLOW_CMD" \
     "PULSE_DEADLINE_SECS=2"; then rc=0; else rc=$?; fi
 end_ts=$(date +%s)
 elapsed=$((end_ts - start_ts))
 if [ "$elapsed" -lt 10 ] \
     && printf '%s\n' "$OUT" | grep -q "^Releases (24h): UNKNOWN" \
     && printf '%s\n' "$OUT" | grep -q "^Active builder worktrees: UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -q "^CI cancelled streak (Tests, main): UNKNOWN" \
     && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: NO_RECENT_RELEASE" \
     && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: LOW_RELEASE_VOLUME" \
     && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: IDLE_BUILDERS" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: CI_CANCELLED_STREAK" \
     && [ "$rc" = 2 ]; then
-    ok "all-hung external calls: UNKNOWN metrics, no false violation, ${elapsed}s elapsed (< 10s), exit 2"
+    ok "all-hung external calls: UNKNOWN metrics (including the new streak check), no false violation, ${elapsed}s elapsed (< 10s), exit 2"
 else
     bad "timeout case: rc=$rc elapsed=${elapsed}s output follows"
     printf '%s\n' "$OUT"
@@ -513,7 +525,7 @@ mkdir -p "$NO_GIT_REPO/tests/moat"
 printf 'P1.case-a milestone reason\n' > "$NO_GIT_REPO/tests/moat/pending.txt"
 if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
     "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
-    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" "PULSE_GH_STREAK_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
 # No .git at all in NO_GIT_REPO: the pending-derived informational count is
@@ -542,7 +554,7 @@ echo "      report UNKNOWN (fail closed), NOT fire MOAT_REGRESSION, even though 
 write_moat_sha "$MOAT_RESULT_FAIL" "$FAKE_REPO" main
 if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
     "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
-    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" "PULSE_GH_STREAK_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
     "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
@@ -551,11 +563,17 @@ if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
 # from this fixture's shape. The assertion below isolates the thing this test
 # actually verifies: MOAT_REGRESSION must NOT be among the fired violations,
 # and moat_regression must be UNKNOWN with the provenance-unresolvable reason.
+# This fixture also has no resolvable main_sha (no .git at all), so main_ci
+# itself reads UNKNOWN here too -- IDLE_BUILDERS firing anyway is exactly
+# finding 3's contract: an UNKNOWN main-CI reading must never suppress an
+# unrelated violation that should still fire.
 if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: MOAT_REGRESSION" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*main_ci" \
     && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline" \
     && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
-    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (could not verify PULSE_MOAT_RESULT's provenance: main's current HEAD could not be resolved)"; then
-    ok "with no .git anywhere, MAIN_REF's HEAD cannot be resolved either, so the measured FAIL correctly downgrades to UNKNOWN instead of firing"
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (could not verify PULSE_MOAT_RESULT's provenance: main's current HEAD could not be resolved)" \
+    && printf '%s\n' "$OUT" | grep -q "^VIOLATION: IDLE_BUILDERS"; then
+    ok "with no .git anywhere, MAIN_REF's HEAD cannot be resolved either, so the measured FAIL correctly downgrades to UNKNOWN instead of firing, AND IDLE_BUILDERS still fires despite main_ci also being UNKNOWN (finding 3)"
 else
     bad "T9b baseline-unknown-but-measured case: rc=$rc output follows"
     printf '%s\n' "$OUT"
@@ -874,7 +892,7 @@ mkdir -p "$NO_PENDING_REPO"
 write_moat_sha "$MOAT_RESULT_FAIL" "$NO_PENDING_REPO" main
 if run_pulse "PULSE_REPO_ROOT=$NO_PENDING_REPO" "PULSE_MAIN_REF=main" \
     "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
-    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" "PULSE_GH_STREAK_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
     "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
@@ -885,6 +903,130 @@ if [ "$rc" = 1 ] \
     ok "pending-derived read AND release-baseline both UNKNOWN (no pending.txt blob anywhere) do not stop the independent, SHA-verified measured-result check from firing"
 else
     bad "T17 decoupling case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T18 -- CI_CANCELLED_STREAK: 3 consecutive cancelled Tests runs (skipping the in_progress head) fires"
+GH_STREAK_3="$WORK/gh-streak-3.json"
+python3 -c "
+import json
+print(json.dumps([
+    {'status': 'in_progress', 'conclusion': None},
+    {'status': 'completed', 'conclusion': 'cancelled'},
+    {'status': 'completed', 'conclusion': 'cancelled'},
+    {'status': 'completed', 'conclusion': 'cancelled'},
+    {'status': 'completed', 'conclusion': 'success'},
+]))
+" > "$GH_STREAK_3"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_ANY" "PULSE_GH_STREAK_CMD=cat $GH_STREAK_3"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "CI cancelled streak (Tests, main): 3 consecutive" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: CI_CANCELLED_STREAK: 3 consecutive cancelled Tests runs on main (threshold 3)"; then
+    ok "3 consecutive cancelled runs (in_progress head correctly skipped, not counted as a break): CI_CANCELLED_STREAK fires"
+else
+    bad "T18 streak-fires case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T18b -- CI_CANCELLED_STREAK: non-consecutive cancelled runs never fire"
+GH_STREAK_NONCONSEC="$WORK/gh-streak-nonconsec.json"
+python3 -c "
+import json
+print(json.dumps([
+    {'status': 'completed', 'conclusion': 'cancelled'},
+    {'status': 'completed', 'conclusion': 'cancelled'},
+    {'status': 'completed', 'conclusion': 'success'},
+    {'status': 'completed', 'conclusion': 'cancelled'},
+]))
+" > "$GH_STREAK_NONCONSEC"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_ANY" "PULSE_GH_STREAK_CMD=cat $GH_STREAK_NONCONSEC"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "CI cancelled streak (Tests, main): 2 consecutive" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: CI_CANCELLED_STREAK"; then
+    ok "2 consecutive (broken by an intervening success) stays under threshold, no violation"
+else
+    bad "T18b non-consecutive case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T18c -- CI_CANCELLED_STREAK: no completed runs at all (all still in progress) is UNKNOWN, not a false 0"
+GH_STREAK_NONE_COMPLETED="$WORK/gh-streak-none-completed.json"
+printf '[{"status":"in_progress","conclusion":null},{"status":"queued","conclusion":null}]' > "$GH_STREAK_NONE_COMPLETED"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_ANY" "PULSE_GH_STREAK_CMD=cat $GH_STREAK_NONE_COMPLETED"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^CI cancelled streak (Tests, main): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*ci_cancelled_streak" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: CI_CANCELLED_STREAK"; then
+    ok "no completed runs yet: UNKNOWN, never a false streak of 0"
+else
+    bad "T18c no-completed-runs case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T19 -- finding 2/3: UNRELEASED_MERGE fires past 45 minutes even when main CI is UNKNOWN"
+BOARD_UNRELEASED_UNKNOWN="$WORK/BOARD-unreleased-unknown.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    for i in 1 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_UNRELEASED_UNKNOWN"
+(
+    cd "$FAKE_REPO" || exit 1
+    echo "change" > file.txt
+    git add file.txt
+    GIT_AUTHOR_DATE="2026-09-27T01:00:00Z" GIT_COMMITTER_DATE="2026-09-27T01:00:00Z" \
+        git commit -q -m "unreleased change, CI unknown"
+)
+UNRELEASED_UNKNOWN_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 HEAD)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_UNRELEASED_UNKNOWN" \
+    "PULSE_GH_CMD=cat $GH_CANCELLED_JSON"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^Main CI (main @ $UNRELEASED_UNKNOWN_SHA): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: UNRELEASED_MERGE: 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_UNKNOWN_SHA) (CI status: UNKNOWN)"; then
+    ok "60-minute unreleased-merge age fires UNRELEASED_MERGE even though main CI reads UNKNOWN (finding 2/3 fixed)"
+else
+    bad "T19 unreleased-merge-under-unknown-ci case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+(cd "$FAKE_REPO" || exit 1; git reset -q --hard v1.0.0)
+
+echo "T19b -- UNRELEASED_MERGE threshold: 40 minutes with UNKNOWN CI does NOT fire (45-min budget pinned)"
+(
+    cd "$FAKE_REPO" || exit 1
+    echo "change" > file.txt
+    git add file.txt
+    GIT_AUTHOR_DATE="2026-09-27T01:20:00Z" GIT_COMMITTER_DATE="2026-09-27T01:20:00Z" \
+        git commit -q -m "unreleased change, 40 min old"
+)
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_UNRELEASED_UNKNOWN" \
+    "PULSE_GH_CMD=cat $GH_CANCELLED_JSON"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Merged-but-unreleased age: 40.0 min" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNRELEASED_MERGE"; then
+    ok "40 minutes under UNKNOWN CI stays under the 45-minute independent budget, no violation"
+else
+    bad "T19b threshold case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+(cd "$FAKE_REPO" || exit 1; git reset -q --hard v1.0.0)
+
+echo "T20 -- finding 3: an UNKNOWN main CI reading does not suppress LOW_READY, an unrelated violation"
+BOARD_LOW_READY_ONLY="$WORK/BOARD-low-ready-only.md"
+cat > "$BOARD_LOW_READY_ONLY" <<'EOF'
+| ID | Owner | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|
+| S-01 | a | x | LOW | ready@2026-09-27T01:00Z | |
+EOF
+WT_T20=()
+for i in 1 2 3 4 5 6; do
+    d="$WORK/wt20-$i"; mkdir -p "$d"; make_worktree "$d" 5 1790474400
+    WT_T20+=("$d")
+done
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_LOW_READY_ONLY" \
+    "PULSE_GH_CMD=cat $GH_CANCELLED_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_T20[@]}")"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*main_ci" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: LOW_READY: only 1 ready slice(s) on BOARD (want at least 8); cut 7 more" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: IDLE_BUILDERS"; then
+    ok "main CI UNKNOWN does not suppress LOW_READY (6 active worktrees correctly means no IDLE_BUILDERS here either)"
+else
+    bad "T20 unknown-does-not-suppress case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 

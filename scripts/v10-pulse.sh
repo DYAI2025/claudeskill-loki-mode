@@ -33,6 +33,12 @@
 #   PULSE_NPM_CMD       npm command to run (default: npm view loki-mode time --json)
 #   PULSE_GH_CMD        gh command to run (default: gh run list --branch main
 #                       --commit <main-sha> --json status,conclusion,workflowName --limit 20)
+#   PULSE_GH_STREAK_CMD gh command for the CI_CANCELLED_STREAK check (default:
+#                       gh run list --branch main --workflow Tests --json
+#                       status,conclusion --limit 10). Independent of
+#                       PULSE_GH_CMD/main_sha on purpose -- it must still run
+#                       (and be able to fire) even when the main-CI-status
+#                       lookup above cannot resolve a SHA and reads UNKNOWN.
 #   PULSE_WORKTREE_CMD  git worktree list command (default: git worktree list --porcelain)
 #   PULSE_MOAT_RESULT   path to a file holding the real captured stdout of a
 #                       `bash tests/moat/run.sh` run (its own summary lines
@@ -96,6 +102,7 @@ export PULSE_REPO_ROOT BOARD_MD CONTROL_MD
 export PULSE_MAIN_REF="${PULSE_MAIN_REF:-main}"
 export PULSE_NPM_CMD="${PULSE_NPM_CMD:-}"
 export PULSE_GH_CMD="${PULSE_GH_CMD:-}"
+export PULSE_GH_STREAK_CMD="${PULSE_GH_STREAK_CMD:-}"
 export PULSE_WORKTREE_CMD="${PULSE_WORKTREE_CMD:-}"
 export PULSE_MOAT_RESULT="${PULSE_MOAT_RESULT:-}"
 export PULSE_SWARM_START="${PULSE_SWARM_START:-}"
@@ -296,9 +303,9 @@ NOW = now_epoch()
 # docs/v10/CONTROL.md's Rule says the first action of every turn addresses
 # the TOP violation -- an accidental ordering-by-discovery would misrank it.
 VIOLATION_PRIORITY = [
-    "CI_RED", "MOAT_REGRESSION", "UNRELEASED_MERGE", "REVIEW_STALE",
-    "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME",
-    "CONTROL_OVERSIZE",
+    "CI_RED", "CI_CANCELLED_STREAK", "MOAT_REGRESSION", "UNRELEASED_MERGE",
+    "REVIEW_STALE", "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE",
+    "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
 ]
 
 violations = []          # list of (code, text)
@@ -357,17 +364,28 @@ if main_sha is not None:
             "--json", "status,conclusion,workflowName", "--limit", "20",
         ]
 
+_gh_streak_argv = shlex.split(os.environ["PULSE_GH_STREAK_CMD"]) if os.environ.get("PULSE_GH_STREAK_CMD") else [
+    "gh", "run", "list", "--branch", MAIN_REF, "--workflow", "Tests",
+    "--json", "status,conclusion", "--limit", "10",
+]
+
 _npm_proc = safe(start_proc, _npm_argv, REPO_ROOT)
 # gh resolves its repo through git, so it must see the same scrubbed
 # environment as every direct git call -- a GIT_DIR inherited from the
 # eventual pre-push hook would misdirect gh's repo detection too.
 _gh_proc = safe(start_proc, _gh_argv, REPO_ROOT, _clean_env()) if _gh_argv is not None else None
+# Deliberately NOT gated on main_sha like _gh_argv above: CI_CANCELLED_STREAK
+# must still be able to run (and fire) even when the main-CI-status lookup
+# cannot resolve a SHA and reads UNKNOWN -- that independence is the whole
+# point of this check (see finding 3).
+_gh_streak_proc = safe(start_proc, _gh_streak_argv, REPO_ROOT, _clean_env())
 
 _npm_rc, _npm_out, _npm_err = safe(finish_proc, _npm_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
 _gh_rc, _gh_out, _gh_err = (
     safe(finish_proc, _gh_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
     if _gh_proc is not None else (None, "", "")
 )
+_gh_streak_rc, _gh_streak_out, _gh_streak_err = safe(finish_proc, _gh_streak_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
 
 
 # --- 1. releases in the last 24h / minutes since last release -------------
@@ -465,6 +483,67 @@ else:
         if ci_status == "red":
             workflows = ", ".join(sorted(set(ci_failing_workflows or []))) or "unknown workflow"
             add_violation("CI_RED", "main CI is RED at %s (%s)" % (main_sha[:8], workflows))
+
+
+# --- 2b. CI_CANCELLED_STREAK: 3+ consecutive cancelled Tests runs on main ---
+# Independent of the main-CI-status lookup above on purpose (see the
+# _gh_streak_proc comment): a run of cancelled Tests runs is itself a signal
+# worth flagging even when (especially when) the SHA-pinned CI status above
+# cannot resolve and reads UNKNOWN. A push cancelling the previous run's
+# Tests job is routine (see the CI_RED section's own comment on this), so a
+# streak of them isn't automatically a real problem -- but 3+ in a row means
+# nothing has finished checking main in a while, which the swarm should know.
+_CANCELLED_STREAK_THRESHOLD = 3
+
+
+def parse_ci_cancelled_streak(rc, out):
+    """Count consecutive 'cancelled' conclusions from the most recent
+    COMPLETED run backward. A still-running run at the head (status not
+    'completed') is skipped before counting starts, not counted as a
+    non-cancelled break -- every push cancels the PRIOR run's Tests job, so
+    the newest run is normally in_progress/queued and would otherwise mask a
+    real streak sitting right behind it. Returns None (UNKNOWN) if the call
+    failed or produced no usable run list -- never a false 0."""
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        runs = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(runs, list):
+        return None
+    parsed = [r for r in runs if isinstance(r, dict)]
+    if not parsed:
+        return None
+    streak = 0
+    seen_completed = False
+    for r in parsed:
+        if r.get("status") != "completed":
+            if seen_completed:
+                break
+            continue
+        seen_completed = True
+        if r.get("conclusion") == "cancelled":
+            streak += 1
+        else:
+            break
+    if not seen_completed:
+        return None
+    return streak
+
+
+ci_streak = safe(parse_ci_cancelled_streak, _gh_streak_rc, _gh_streak_out)
+if ci_streak is None:
+    mark_unknown("ci_cancelled_streak")
+    emit("CI cancelled streak (Tests, %s): UNKNOWN (gh check failed, timed out, or no completed runs)" % MAIN_REF)
+else:
+    emit("CI cancelled streak (Tests, %s): %d consecutive" % (MAIN_REF, ci_streak))
+    if ci_streak >= _CANCELLED_STREAK_THRESHOLD:
+        add_violation(
+            "CI_CANCELLED_STREAK",
+            "%d consecutive cancelled Tests runs on %s (threshold %d)"
+            % (ci_streak, MAIN_REF, _CANCELLED_STREAK_THRESHOLD),
+        )
 
 
 # --- 3/4. BOARD.md status counts + review-pending age ----------------------
@@ -633,13 +712,27 @@ else:
             "Merged-but-unreleased age: %.1f min (%d commit(s) since %s, oldest %s)"
             % (age, unreleased["unreleased_commits"], unreleased["tag"], unreleased["oldest_sha"][:8])
         )
+        merged_rows = [rid for rid, tok, _ in board_rows if tok == "merged"]
+        merged_desc = (", ".join(merged_rows) + " ") if merged_rows else ""
         if age > 30 and ci_status == "green":
-            merged_rows = [rid for rid, tok, _ in board_rows if tok == "merged"]
-            merged_desc = (", ".join(merged_rows) + " " ) if merged_rows else ""
             add_violation(
                 "UNRELEASED_MERGE",
                 "%s%d commit(s) merged but unreleased for %.1f minutes since %s (oldest %s) while CI is green"
                 % (merged_desc, unreleased["unreleased_commits"], age, unreleased["tag"], unreleased["oldest_sha"][:8]),
+            )
+        # Independent of CI status (finding 2/3): a merge sitting unreleased
+        # past 45 minutes is itself a violation regardless of what CI reads --
+        # including UNKNOWN, which must never read as "safe, do nothing" the
+        # way `ci_status == "green"` above silently did. This is a longer
+        # budget than the CI-green case (30 min) precisely because it has no
+        # green-CI corroboration; it must never fire twice for the same
+        # window, so it is an elif against the same `age` check above.
+        elif age > 45:
+            add_violation(
+                "UNRELEASED_MERGE",
+                "%s%d commit(s) merged but unreleased for %.1f minutes since %s (oldest %s) (CI status: %s)"
+                % (merged_desc, unreleased["unreleased_commits"], age, unreleased["tag"], unreleased["oldest_sha"][:8],
+                   (ci_status or "unknown").upper()),
             )
 
 
@@ -1067,6 +1160,7 @@ else:
 
 _NEXT_ACTION_TEXT = {
     "CI_RED": "investigate and fix the red main CI run before anything else",
+    "CI_CANCELLED_STREAK": "investigate why Tests keeps getting cancelled on main before anything else",
     "MOAT_REGRESSION": "identify which moat property regressed and revert or fix it before any further merge",
     "UNRELEASED_MERGE": "cut a release now, main has been unreleased past the 30-minute budget",
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
