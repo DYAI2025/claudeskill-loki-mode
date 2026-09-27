@@ -943,6 +943,24 @@ EOF
         fi
         [ "$out" = "$w" ] || bad="$bad [$leg _council_convergence_evidence_green: got rc '$out' want $w]"
     done
+    # Fail closed (no plant needed): a malformed queue file must block, not read
+    # as 0, and no isolated interpreter must veto, not approve.
+    d="$RUN/pth-badqueue"; b="$(council_repo "$d" "$green")" || { _why="fixture badqueue failed"; return; }
+    mkdir -p "$d/.loki/queue"
+    printf '{not json\n' > "$d/.loki/queue/pending.json"
+    printf '{not json\n' > "$d/.loki/queue/failed.json"
+    out="$(council_call_args "$d" "$b" council_evaluate_member requirements_verifier)"
+    [ "$out" = CONTINUE ] || bad="$bad [badqueue council_evaluate_member: got '$out' want CONTINUE]"
+    out="$(council_call_args "$d" "$b" council_devils_advocate_review)"
+    [ "$out" = OVERRIDE_CONTINUE ] || bad="$bad [badqueue council_devils_advocate_review: got '$out' want OVERRIDE_CONTINUE]"
+    d="$RUN/pth-nopy"; b="$(council_repo "$d" "$green")" || { _why="fixture nopy failed"; return; }
+    # The library copy is guarded by declare -F, so this stub wins in the subshell.
+    _loki_snapshot_py_tool() { return 1; }
+    out="$(council_call_args "$d" "$b" council_devils_advocate_review)"
+    [ "$out" = OVERRIDE_CONTINUE ] || bad="$bad [nopy council_devils_advocate_review: got '$out' want OVERRIDE_CONTINUE]"
+    out="$(council_call "$d" "$b" _council_convergence_evidence_green)"
+    [ "$out" = 1 ] || bad="$bad [nopy _council_convergence_evidence_green: got rc '$out' want 1]"
+    unset -f _loki_snapshot_py_tool
     [ ! -s "$mark" ] || bad="$bad [the planted .pth forged a council read: $(sort -u "$mark" | tr '\n' ' ')]"
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
 }
