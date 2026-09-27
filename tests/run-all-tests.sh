@@ -953,6 +953,7 @@ run_test "web-app has no orphaned modules (reachable from main.tsx)" "$SCRIPT_DI
 # registered here: it ratchets against the last release tag, which a depth-1
 # shard checkout does not have. It runs in its own "Moat suite" job instead.
 run_test "the moat runner enforces every ratchet rule" "$SCRIPT_DIR/test-moat-runner.sh"
+run_test "v10-pulse anti-drift status/violation reporter" "$SCRIPT_DIR/test-v10-pulse.sh"
 run_test "ShellCheck Linting" "$SCRIPT_DIR/run-shellcheck.sh"
 
 # Summary
