@@ -34,8 +34,27 @@
 #   PULSE_GH_CMD        gh command to run (default: gh run list --branch main
 #                       --commit <main-sha> --json status,conclusion,workflowName --limit 20)
 #   PULSE_WORKTREE_CMD  git worktree list command (default: git worktree list --porcelain)
-#   PULSE_MOAT_RESULT   optional file with a "moat: N of 9" line, used
-#                       instead of deriving N from pending.txt
+#   PULSE_MOAT_RESULT   path to a file holding the real captured stdout of a
+#                       `bash tests/moat/run.sh` run (its own summary lines
+#                       are parsed: "moat: N of 9 properties proven" and, on
+#                       failure, "moat suite: FAIL (K rule failure(s))").
+#                       This is the ONLY source MOAT_REGRESSION trusts: the
+#                       pending.txt-derived count is ratchet-only (its id set
+#                       can only shrink release over release, per
+#                       tests/moat/run.sh's own contract) and so can never by
+#                       itself register a real regression -- it is shown as
+#                       informational context only. With no PULSE_MOAT_RESULT
+#                       (or an unreadable/unparseable one), MOAT_REGRESSION
+#                       reports UNKNOWN rather than silently falling back to
+#                       the pending-derived count. Typical use:
+#                         bash tests/moat/run.sh > moat-result.txt
+#                         PULSE_MOAT_RESULT=moat-result.txt bash scripts/v10-pulse.sh
+#                       Known limitation: this file carries no SHA or
+#                       timestamp of its own, so a STALE captured result
+#                       (from an earlier commit) fed in repeatedly reads as
+#                       current -- this script cannot detect that; the
+#                       caller is responsible for regenerating it per commit
+#                       it cares about pinning to.
 #   PULSE_SWARM_START   swarm start time override, epoch seconds or ISO8601
 #   PULSE_NOW           "now" override, epoch seconds or ISO8601
 #   PULSE_PYTHON        python3 interpreter to use (default: python3)
@@ -542,11 +561,23 @@ else:
 
 # --- 4b. merged-but-unreleased age, cross-checked against git --------------
 def check_unreleased_merge_age():
-    rc, out, _ = git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"])
+    # Pin to MAIN_REF explicitly: with no ref argument, `git describe` walks
+    # from the CALLING PROCESS'S OWN HEAD, which is wrong whenever this script
+    # runs from a builder worktree checked out somewhere other than main (the
+    # documented, and intended, way to run it) -- see PULSE_MAIN_REF's header
+    # comment. Reviewer-reproduced from a scratch checkout at an older tag.
+    rc, out, _ = git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", MAIN_REF])
     if rc != 0:
         return None
     tag = out.strip()
-    rc, out, _ = git(["log", "%s..%s" % (tag, MAIN_REF), "--format=%H %ct"])
+    # --first-parent: without it, this walks INTO a merged branch's own
+    # history and finds commits' ORIGINAL authorship/commit timestamps, which
+    # can be much older than when they actually landed on MAIN_REF via merge.
+    # That produced a false UNRELEASED_MERGE positive on ordinary swarm
+    # `merge:` commits whose source branch had older pre-merge commits.
+    # --first-parent restricts the walk to MAIN_REF's own direct history, so
+    # "oldest commit since the tag" reflects real merge order/time.
+    rc, out, _ = git(["log", "--first-parent", "%s..%s" % (tag, MAIN_REF), "--format=%H %ct"])
     if rc != 0:
         return None
     commits = []
@@ -628,7 +659,11 @@ _BASELINE_UNKNOWN = object()
 
 
 def moat_baseline_at_last_release():
-    rc, out, err = git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"])
+    # Pin to MAIN_REF for the same reason as check_unreleased_merge_age: with
+    # no ref argument, `git describe` follows the calling process's own HEAD,
+    # not the swarm's actual main line, which flips the baseline count when
+    # run from a builder worktree at an older tag/branch.
+    rc, out, err = git(["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", MAIN_REF])
     if rc != 0:
         no_tag = ("no names found" in err.lower()) or ("no tags can describe" in err.lower())
         return None if no_tag else _BASELINE_UNKNOWN
@@ -639,69 +674,173 @@ def moat_baseline_at_last_release():
     return proven_properties(list_pending_ids(out2))
 
 
-def check_moat():
+def moat_pending_count_at(ref):
+    """Pending-derived proven count read via `git show REF:...`, never a raw
+    working-tree file read -- the informational count must reflect
+    PULSE_MAIN_REF, not whatever the calling process's own working tree
+    happens to hold (finding 1 applies here too: a builder worktree's HEAD
+    can be a feature branch checked out at a different commit than main)."""
+    rc, out, _ = git(["show", "%s:tests/moat/pending.txt" % ref])
+    if rc != 0:
+        return None
+    return len(proven_properties(list_pending_ids(out)))
+
+
+# tests/moat/pending.txt's own documented invariant (see tests/moat/run.sh) is
+# a ratchet: a property's failing-case IDs are removed once truly fixed, never
+# added back, so the SET of pending ids can only shrink release over release.
+# That means a "proven" count inferred purely from "zero pending ids for Pn"
+# can only ever stay flat or INCREASE from an older ref to a newer one -- it
+# is structurally unable to register a real regression, even while
+# tests/moat/run.sh itself reports a live FAIL with an unlisted
+# "REGRESSION: ... FAIL but not listed in tests/moat/pending.txt" line (a
+# property can have zero pending.txt lines at BOTH the baseline tag and HEAD
+# while its suite fails live in between -- verified on this repo: pulse's old
+# pending-only heuristic read "3 of 9 proven" while `bash tests/moat/run.sh`
+# reported "2 of 9 proven, FAIL (3 rule failures)" for the identical commit,
+# because P7 has no pending.txt line at either ref).
+#
+# So MOAT_REGRESSION below never uses the pending-derived count as its source
+# of truth -- only PULSE_MOAT_RESULT, which must point to a file holding the
+# real captured stdout of a `tests/moat/run.sh` run (its own summary lines are
+# parsed verbatim: "moat: N of 9 properties proven" and, when the suite
+# failed, "moat suite: FAIL (K rule failure(s))"). Typical use:
+#   bash tests/moat/run.sh > /path/to/moat-result.txt   # takes minutes
+#   PULSE_MOAT_RESULT=/path/to/moat-result.txt bash scripts/v10-pulse.sh
+# Re-running the suite inside this script's own ~9s budget is not an option
+# (the suite alone takes minutes), so when no result file is supplied, or it
+# cannot be read, or its summary lines cannot be parsed, MOAT_REGRESSION is
+# reported UNKNOWN rather than silently falling back to the pending-derived
+# approximation as if it were a real measurement -- that fallback was the
+# original bug. The pending-derived count is still shown, but only as
+# informational context, explicitly labelled as not suite-verified, and it
+# never feeds a violation.
+_MOAT_COUNT_RE = re.compile(r"moat:\s*(\d+)\s*of\s*9\s*properties\s*proven", re.IGNORECASE)
+_MOAT_FAIL_RE = re.compile(r"moat suite:\s*FAIL\s*\((\d+)\s*rule failure", re.IGNORECASE)
+# tests/moat/run.sh's own terminal verdict lines (see its final echo calls):
+# exactly one of these three appears on any run that reached a real verdict.
+# Requiring one of them (not just the count line) guards against a truncated
+# or could-not-check capture that happens to contain a "moat: N of 9" count
+# substring from something else (e.g. a mid-run progress line) without ever
+# reaching run.sh's actual conclusion.
+_MOAT_VERDICT_RE = re.compile(
+    r"moat suite:\s*(?:FAIL\s*\(\d+\s*rule failure|all 9 properties proven|no rule failed)",
+    re.IGNORECASE,
+)
+
+
+def parse_moat_result(text):
+    """Parse tests/moat/run.sh's own captured stdout. Returns
+    {"count": int, "suite_failed": bool, "rule_failures": int or None} or
+    None if the count line or a recognized terminal verdict line is missing
+    (an unparseable, truncated, or unrelated file -- never guessed at)."""
+    m = _MOAT_COUNT_RE.search(text)
+    if not m or not _MOAT_VERDICT_RE.search(text):
+        return None
+    count = int(m.group(1))
+    fm = _MOAT_FAIL_RE.search(text)
+    return {
+        "count": count,
+        "suite_failed": fm is not None,
+        "rule_failures": int(fm.group(1)) if fm else None,
+    }
+
+
+def check_moat_pending():
+    """Informational-only pending-derived count at MAIN_REF (see the ratchet
+    comment below check_unreleased_merge_age/moat_baseline_at_last_release):
+    read via `git show`, never the raw working tree, for the same reason as
+    finding 1 -- this script is meant to run from a builder worktree whose
+    own HEAD can differ from MAIN_REF."""
+    return moat_pending_count_at(MAIN_REF)
+
+
+def check_moat_regression():
+    """The only source of truth for MOAT_REGRESSION: PULSE_MOAT_RESULT. Kept
+    entirely independent of check_moat_pending so a `git show`/pending-read
+    failure never silently blanks this check (and vice versa) -- each is
+    wrapped in its own safe() call below."""
     result_path = os.environ.get("PULSE_MOAT_RESULT", "")
     baseline = moat_baseline_at_last_release()
     baseline_unknown = baseline is _BASELINE_UNKNOWN
     baseline_set = None if baseline_unknown else baseline
+    at_release = len(baseline_set) if baseline_set is not None else None
 
+    measured = None
+    measured_error = None
     if result_path:
-        with open(result_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        m = re.search(r"moat:\s*(\d+)\s*of\s*9", text)
-        if not m:
-            return None
-        current_count = int(m.group(1))
-        return {
-            "current": current_count,
-            "current_set": None,
-            "at_last_release": len(baseline_set) if baseline_set is not None else None,
-            "baseline_set": baseline_set,
-            "baseline_unknown": baseline_unknown,
-            "source": "PULSE_MOAT_RESULT file",
-        }
+        try:
+            with open(result_path, "r", encoding="utf-8") as f:
+                result_text = f.read()
+        except OSError as exc:
+            measured_error = "could not read PULSE_MOAT_RESULT file: %s" % exc
+        else:
+            measured = parse_moat_result(result_text)
+            if measured is None:
+                measured_error = (
+                    "PULSE_MOAT_RESULT file did not contain a parseable 'moat: N of 9' "
+                    "count line plus one of run.sh's terminal verdict lines"
+                )
 
-    pending_path = os.path.join(REPO_ROOT, "tests", "moat", "pending.txt")
-    with open(pending_path, "r", encoding="utf-8") as f:
-        current_text = f.read()
-    current_set = proven_properties(list_pending_ids(current_text))
     return {
-        "current": len(current_set),
-        "current_set": current_set,
-        "at_last_release": len(baseline_set) if baseline_set is not None else None,
-        "baseline_set": baseline_set,
+        "at_last_release": at_release,
         "baseline_unknown": baseline_unknown,
-        "source": "pending-derived (upper bound, suite not run)",
+        "measured": measured,
+        "measured_error": measured_error,
+        "result_path": result_path,
     }
 
 
-moat = safe(check_moat)
-if moat is None:
+pending_count = safe(check_moat_pending)
+if pending_count is None:
     mark_unknown("moat_proven")
-    emit("Moat proven: UNKNOWN (could not read pending.txt)")
+    emit("Moat proven (pending-derived, informational, NOT suite-verified): UNKNOWN (git show against %s failed)" % MAIN_REF)
 else:
-    src = moat["source"]
-    at_release = moat.get("at_last_release")
-    if moat.get("baseline_unknown"):
+    emit(
+        "Moat proven (pending-derived, informational, NOT suite-verified): %d of 9"
+        % pending_count
+    )
+
+regression = safe(check_moat_regression)
+if regression is None:
+    mark_unknown("moat_regression")
+    emit("Moat regression check: UNKNOWN (could not evaluate PULSE_MOAT_RESULT or the baseline tag)")
+else:
+    if regression["baseline_unknown"]:
         mark_unknown("moat_baseline")
-        emit("Moat proven: %d of 9 (%s; baseline at last release UNKNOWN, git check failed or timed out)" % (moat["current"], src))
-    elif at_release is None:
-        emit("Moat proven: %d of 9 (%s; no prior release to compare)" % (moat["current"], src))
-    else:
-        emit(
-            "Moat proven: %d of 9 (%s; %d of 9 at last release)"
-            % (moat["current"], src, at_release)
-        )
-        if moat["current"] < at_release:
-            regressed = ""
-            if moat.get("current_set") is not None and moat.get("baseline_set") is not None:
-                dropped = sorted(moat["baseline_set"] - moat["current_set"])
-                if dropped:
-                    regressed = " (P%s)" % ", P".join(str(n) for n in dropped)
+
+    if regression["measured"] is not None:
+        m = regression["measured"]
+        emit("Moat proven (measured, PULSE_MOAT_RESULT): %d of 9" % m["count"])
+        if regression["at_last_release"] is not None:
+            emit("Moat proven at last release (pending-derived baseline): %d of 9" % regression["at_last_release"])
+        if m["suite_failed"]:
             add_violation(
                 "MOAT_REGRESSION",
-                "moat proven count dropped to %d of 9 (was %d of 9 at last release)%s"
-                % (moat["current"], at_release, regressed),
+                "measured moat suite reports FAIL (%s rule failure(s)) -- a live suite failure is always a "
+                "regression regardless of the proven count (see %s)"
+                % (m["rule_failures"] if m["rule_failures"] is not None else "unknown", regression["result_path"]),
+            )
+        elif regression["at_last_release"] is not None and m["count"] < regression["at_last_release"]:
+            add_violation(
+                "MOAT_REGRESSION",
+                "measured moat proven count dropped to %d of 9 (was %d of 9 pending-derived at last release)"
+                % (m["count"], regression["at_last_release"]),
+            )
+    else:
+        # No real measurement available. This is the load-bearing fix for
+        # finding 3: never treat the pending-derived count as if it were a
+        # measured result, and never let MOAT_REGRESSION silently read as
+        # clean just because nothing was supplied -- route it through
+        # UNKNOWN, per this script's own "never silently read as clean"
+        # contract (see the header).
+        mark_unknown("moat_regression")
+        if regression["measured_error"]:
+            emit("Moat regression check: UNKNOWN (%s)" % regression["measured_error"])
+        else:
+            emit(
+                "Moat regression check: UNKNOWN (no PULSE_MOAT_RESULT supplied; run "
+                "`bash tests/moat/run.sh > FILE` and pass PULSE_MOAT_RESULT=FILE for a real measurement)"
             )
 
 

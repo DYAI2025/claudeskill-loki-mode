@@ -72,6 +72,32 @@ for i in range(50):
     print('line %d' % i)
 " > "$CONTROL_OVERSIZE"
 
+# Real tests/moat/run.sh summary-line fixtures (finding 3): a measured PASS
+# result (7 of 9, no rule failures) and a measured FAIL result (SAME count,
+# 7 of 9, with an unlisted REGRESSION line, so only the suite-failed check
+# can explain a violation, not a count drop), matching run.sh's own exact
+# wording ("moat: N of 9 properties proven", "moat suite: FAIL (K rule
+# failure(s))").
+MOAT_RESULT_PASS="$WORK/moat-result-pass.txt"
+cat > "$MOAT_RESULT_PASS" <<'EOF'
+P1 portable proof: PROVEN
+moat: 7 of 9 properties proven
+moat suite: no rule failed (7 of 9 proven; the moat is NOT proven)
+EOF
+
+# Deliberately the SAME count as the v1.0.0 baseline (7 of 9): this isolates
+# the suite_failed check from the separate count-drop check. If the count
+# path alone explained a violation here, mutating away the suite_failed
+# check (finding 3's actual fix) would not turn this test red -- exactly the
+# real-repo case (measured 2 of 9 with baseline ALSO 2 of 9; P7 has no
+# pending.txt line at either ref, so only the live FAIL line reveals it).
+MOAT_RESULT_FAIL="$WORK/moat-result-fail.txt"
+cat > "$MOAT_RESULT_FAIL" <<'EOF'
+FAIL: REGRESSION P7.dashboard-client-routes-exist: FAIL but not listed in tests/moat/pending.txt
+moat: 7 of 9 properties proven
+moat suite: FAIL (1 rule failure(s))
+EOF
+
 # A worktree-list fixture builder. Writes a porcelain listing (primary
 # worktree first, always skipped by position) followed by N builder
 # worktrees, each a real .git-file + gitdir with HEAD/index/logs/HEAD, whose
@@ -282,23 +308,40 @@ WT_CLEAN_STALE="$WORK/wtc-stale"; mkdir -p "$WT_CLEAN_STALE"
 make_worktree "$WT_CLEAN_STALE" 120 1790474400
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
     "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_PASS" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}" "$WT_CLEAN_STALE")"; then rc=0; else rc=$?; fi
 if [ "$rc" = 0 ] \
     && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
     && printf '%s\n' "$OUT" | grep -q "^=== v10-pulse status" \
     && printf '%s\n' "$OUT" | grep -q "^BOARD status counts:" \
-    && printf '%s\n' "$OUT" | grep -q "^Moat proven:" \
+    && printf '%s\n' "$OUT" | grep -q "^Moat proven (pending-derived, informational, NOT suite-verified):" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat proven (measured, PULSE_MOAT_RESULT): 7 of 9" \
     && printf '%s\n' "$OUT" | grep -qF "Active builder worktrees (last 30 min): 6 of 7 checked" \
     && printf '%s\n' "$OUT" | grep -q "^CONTROL.md line count:"; then
-    ok "clean case: exit 0, no VIOLATION lines, full status block present, worktree count 6 of 7"
+    ok "clean case: exit 0, no VIOLATION lines, full status block present, worktree count 6 of 7, measured moat 7 of 9"
 else
     bad "clean case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T4b -- clean case but with NO PULSE_MOAT_RESULT: moat regression is UNKNOWN, not falsely clean"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}" "$WT_CLEAN_STALE")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (no PULSE_MOAT_RESULT supplied"; then
+    ok "no PULSE_MOAT_RESULT: moat_regression reports UNKNOWN (exit 2), never a false clean"
+else
+    bad "T4b no-measured-result case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
 echo "T5 -- CONTROL.md over the 40-line budget"
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OVERSIZE" \
     "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_PASS" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
 if [ "$rc" = 1 ] && printf '%s\n' "$OUT" | grep -qF "VIOLATION: CONTROL_OVERSIZE: docs/v10/CONTROL.md is 50 lines (budget is 40); trim 10 line(s)"; then
     ok "exact CONTROL_OVERSIZE violation line fires, exit 1"
@@ -307,21 +350,50 @@ else
     printf '%s\n' "$OUT"
 fi
 
-echo "T6 -- moat regression (fewer proven than at last release), names the regressed property"
-(
-    cd "$FAKE_REPO" || exit 1
-    # v1.0.0 has P1,P2 pending -> 7 of 9 proven at release. Widen to also
-    # cover P3 -> 6 of 9 now. Regression should name P3.
-    printf 'P1.case-a milestone reason\nP2.case-b milestone reason\nP3.case-c milestone reason\n' > tests/moat/pending.txt
+echo "T6 -- finding-3 exact repro: pending.txt UNCHANGED (ratchet-legal) between baseline and current,"
+echo "      but a measured/live moat result reports FAIL -- MOAT_REGRESSION must still fire, not stay clean"
+# pending.txt at HEAD is byte-identical to v1.0.0's (no widening at all, the
+# ratchet's most favorable case for the old, broken heuristic) yet the
+# measured result (as tests/moat/run.sh would really report, see the P7
+# fixture above) says the suite FAILED. The old pending-only logic could
+# never flag this: proven-by-absence at both refs reads as "no drop". Fixed
+# logic must fire on the measured FAIL regardless. MOAT_RESULT_FAIL's count
+# (7 of 9) deliberately equals the baseline's 7 of 9, isolating the
+# suite-failed check from the separate count-drop check -- only the fixed
+# suite_failed path can explain this violation, so a clean CLEAN_ARGS give a
+# meaningful exit-code assertion: exit 1 becomes exit 0 if that check is
+# ever reverted (verified: mutation testing exit 0 under the reverted code).
+CLEAN_MOAT_ARGS=(
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON"
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"
 )
-if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN"; then rc=0; else rc=$?; fi
-if [ "$rc" = 1 ] && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: moat proven count dropped to 6 of 9 (was 7 of 9 at last release) (P3)"; then
-    ok "exact MOAT_REGRESSION violation line fires and names P3, exit 1"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
+    "${CLEAN_MOAT_ARGS[@]}"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): 7 of 9" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL (1 rule failure(s))" \
+    && [ "$(printf '%s\n' "$OUT" | grep -c '^VIOLATION:')" = 1 ]; then
+    ok "unchanged/ratchet-legal pending.txt still correctly flags MOAT_REGRESSION from the measured FAIL (exit 1, the ONLY violation)"
 else
-    bad "MOAT_REGRESSION case: rc=$rc output follows"
+    bad "T6 finding-3 repro case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
-(cd "$FAKE_REPO" || exit 1; git checkout -q v1.0.0 -- tests/moat/pending.txt)
+
+echo "T6c -- measured count drop with no suite failure also fires MOAT_REGRESSION (count-based path)"
+MOAT_RESULT_COUNT_DROP="$WORK/moat-result-count-drop.txt"
+cat > "$MOAT_RESULT_COUNT_DROP" <<'EOF'
+moat: 6 of 9 properties proven
+moat suite: no rule failed (6 of 9 proven; the moat is NOT proven)
+EOF
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_COUNT_DROP"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat proven count dropped to 6 of 9 (was 7 of 9 pending-derived at last release)"; then
+    ok "measured count drop with no live suite failure still fires MOAT_REGRESSION"
+else
+    bad "T6c count-drop case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 
 echo "T7 -- timeout case: all three external calls hang, script still finishes fast with honest UNKNOWNs, exit 2"
 SLOW_CMD="$WORK/slow.sh"
@@ -383,11 +455,35 @@ if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
     "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
-if printf '%s\n' "$OUT" | grep -q "^Moat proven: 8 of 9 (pending-derived (upper bound, suite not run); baseline at last release UNKNOWN" \
-    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline"; then
-    ok "moat baseline UNKNOWN (no .git at all) reported honestly, not as 'no prior release'"
+# No .git at all in NO_GIT_REPO: the pending-derived informational count is
+# now read via `git show MAIN_REF:...` (never the raw working tree, per
+# finding 1's fix applied here too), so with no git repository present at
+# all it correctly reads UNKNOWN rather than falling back to a working-tree
+# file read that would silently ignore PULSE_MAIN_REF.
+if printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_proven"; then
+    ok "moat baseline AND pending-derived count both UNKNOWN (no .git at all), reported honestly, not as 'no prior release'"
 else
     bad "moat-baseline-unknown case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T9b -- moat baseline UNKNOWN but a measured PULSE_MOAT_RESULT is still usable for MOAT_REGRESSION"
+# A missing/unreadable baseline (git tag lookup failed) must not block using
+# a real measured result for the suite-FAIL check, since that check does not
+# need the baseline count at all -- only the count-drop path does.
+if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_baseline"; then
+    ok "measured suite FAIL still fires MOAT_REGRESSION even when the pending-derived baseline is UNKNOWN"
+else
+    bad "T9b baseline-unknown-but-measured case: output follows"
     printf '%s\n' "$OUT"
 fi
 
@@ -435,9 +531,10 @@ print(json.dumps({
 )
 if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_ALL" \
     "PULSE_NPM_CMD=cat $NPM_OLD_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
     "PULSE_SWARM_START=2026-09-01T00:00Z"; then rc=0; else rc=$?; fi
 UNRELEASED_ALL_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 main)"
-EXPECTED_ALL="VIOLATION: MOAT_REGRESSION: moat proven count dropped to 6 of 9 (was 7 of 9 at last release) (P3)
+EXPECTED_ALL="VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL (1 rule failure(s)) -- a live suite failure is always a regression regardless of the proven count (see $MOAT_RESULT_FAIL)
 VIOLATION: UNRELEASED_MERGE: 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_ALL_SHA) while CI is green
 VIOLATION: REVIEW_STALE: review-pending past 45 minutes: S-01 (60.0 min)
 VIOLATION: IDLE_BUILDERS: only 0 active builder worktree(s) while 1 ready slice(s) exist on BOARD (S-02)
@@ -445,7 +542,7 @@ VIOLATION: LOW_READY: only 1 ready slice(s) on BOARD (want at least 8); cut 7 mo
 VIOLATION: NO_RECENT_RELEASE: no release in the last 90 minutes (3000.0 minutes since last release)
 VIOLATION: LOW_RELEASE_VOLUME: only 0 release(s) in the last 24h (want at least 30) after 626.0 hours of swarm operation"
 assert_exact_violations "T11 all-except-CI_RED" "$EXPECTED_ALL"
-EXPECTED_NEXT_ALL="NEXT ACTION: MOAT_REGRESSION: identify which moat property regressed and revert or fix it before any further merge -- moat proven count dropped to 6 of 9 (was 7 of 9 at last release) (P3)
+EXPECTED_NEXT_ALL="NEXT ACTION: MOAT_REGRESSION: identify which moat property regressed and revert or fix it before any further merge -- measured moat suite reports FAIL (1 rule failure(s)) -- a live suite failure is always a regression regardless of the proven count (see $MOAT_RESULT_FAIL)
 NEXT ACTION: UNRELEASED_MERGE: cut a release now, main has been unreleased past the 30-minute budget -- 1 commit(s) merged but unreleased for 60.0 minutes since v1.0.0 (oldest $UNRELEASED_ALL_SHA) while CI is green
 NEXT ACTION: REVIEW_STALE: escalate or finish review for the named slice(s), they have exceeded the 45-minute budget -- review-pending past 45 minutes: S-01 (60.0 min)
 NEXT ACTION: IDLE_BUILDERS: dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md -- only 0 active builder worktree(s) while 1 ready slice(s) exist on BOARD (S-02)
@@ -508,6 +605,163 @@ if [ "$rc" = 2 ] && printf '%s\n' "$OUT" | grep -q "^PULSE ERROR:"; then
     ok "malformed PULSE_DEADLINE_SECS: PULSE ERROR line, exit 2 (not 1)"
 else
     bad "excepthook case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T14 -- finding 1: git-derived metrics pin to PULSE_MAIN_REF, not the calling process's own HEAD"
+# Build a second tag (v2.0.0) ahead of v1.0.0 on main, add tests/moat/pending.txt
+# content that differs between the two tags, then run the script with
+# PULSE_REPO_ROOT's HEAD DETACHED at the OLDER tag (v1.0.0) while main has
+# moved on to v2.0.0 -- exactly the reviewer's repro ("a scratch checkout at
+# an older tag"). If the tag lookup, the moat-baseline read, or the pending-
+# derived informational read ever again followed the calling process's own
+# HEAD/working-tree instead of PULSE_MAIN_REF, this would resolve v1.0.0
+# (2 pending -> 7 of 9) instead of v2.0.0 (0 pending -> 9 of 9), and would
+# compute unreleased-merge age from v1.0.0 instead of v2.0.0's (later,
+# smaller) commit set.
+(
+    cd "$FAKE_REPO" || exit 1
+    printf '' > tests/moat/pending.txt
+    git add tests/moat/pending.txt
+    GIT_AUTHOR_DATE="2026-09-25T00:00:00Z" GIT_COMMITTER_DATE="2026-09-25T00:00:00Z" \
+        git commit -q -m "close out remaining moat properties"
+    git tag v2.0.0
+    # One commit after v2.0.0 so "merged but unreleased" has something to
+    # measure relative to the NEWER tag, not the older one.
+    echo "post-v2 change" > post-v2.txt
+    git add post-v2.txt
+    GIT_AUTHOR_DATE="2026-09-27T01:30:00Z" GIT_COMMITTER_DATE="2026-09-27T01:30:00Z" \
+        git commit -q -m "unreleased after v2.0.0"
+    # Detach HEAD at the OLDER tag: this is what a "scratch checkout at an
+    # older tag" (the reviewer's repro) looks like. main still points at the
+    # tip. PULSE_REPO_ROOT is this same working copy either way -- only HEAD
+    # differs from main.
+    git checkout -q v1.0.0
+)
+DETACHED_HEAD_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 HEAD)"
+MAIN_TIP_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 main)"
+if [ "$DETACHED_HEAD_SHA" = "$MAIN_TIP_SHA" ]; then
+    bad "T14 fixture setup: detached HEAD accidentally matches main tip, test would not discriminate"
+fi
+MOAT_RESULT_T14="$WORK/moat-result-t14.txt"
+cat > "$MOAT_RESULT_T14" <<'EOF'
+moat: 9 of 9 properties proven
+moat suite: all 9 properties proven
+EOF
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_T14"; then rc=0; else rc=$?; fi
+# Both the pending-derived informational count and the release-baseline read
+# via `git show`, so both must resolve against PULSE_MAIN_REF's v2.0.0 (empty
+# pending.txt -> 9 of 9), NEVER the detached HEAD's own working tree (which
+# still holds v1.0.0's 2 pending ids -> 7 of 9, if either read regressed back
+# to a raw file read). The unreleased-merge age must likewise read "since
+# v2.0.0", never "since v1.0.0".
+if printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): 9 of 9" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat proven at last release (pending-derived baseline): 9 of 9" \
+    && printf '%s\n' "$OUT" | grep -q "since v2.0.0" \
+    && ! printf '%s\n' "$OUT" | grep -q "since v1.0.0"; then
+    ok "moat pending-derived count, baseline, and unreleased-merge age all resolve against PULSE_MAIN_REF's v2.0.0 tag, not the detached HEAD's v1.0.0"
+else
+    bad "T14 finding-1 repro case: rc=$rc output follows (HEAD detached at $DETACHED_HEAD_SHA, main at $MAIN_TIP_SHA)"
+    printf '%s\n' "$OUT"
+fi
+(cd "$FAKE_REPO" || exit 1; git checkout -q main; git tag -d v2.0.0 >/dev/null; git reset -q --hard v1.0.0)
+
+echo "T15 -- finding 2: merged-but-unreleased age walks --first-parent, not into a merged branch's own history"
+# A side branch with a commit dated BEFORE the release tag, merged into main
+# AFTER it. Non-first-parent history would find the side commit's original
+# (pre-release) timestamp and report a much older "oldest since tag" -- a
+# false UNRELEASED_MERGE age. --first-parent must instead report the merge
+# commit's own (post-release) time.
+(
+    cd "$FAKE_REPO" || exit 1
+    git checkout -q -b side-branch v1.0.0
+    echo "side work" > side.txt
+    git add side.txt
+    # Committed on the side branch BEFORE v1.0.0 was tagged (backdated,
+    # simulating work started earlier and merged much later).
+    GIT_AUTHOR_DATE="2026-09-10T00:00:00Z" GIT_COMMITTER_DATE="2026-09-10T00:00:00Z" \
+        git commit -q -m "side branch work, authored well before the release"
+    git checkout -q main
+    GIT_AUTHOR_DATE="2026-09-27T01:45:00Z" GIT_COMMITTER_DATE="2026-09-27T01:45:00Z" \
+        git merge -q --no-ff -m "merge: side branch work" side-branch
+)
+MERGE_SHA="$(cd "$FAKE_REPO" && git rev-parse --short=8 main)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT="; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Merged-but-unreleased age: 15.0 min (1 commit(s) since v1.0.0, oldest $MERGE_SHA)"; then
+    ok "first-parent walk reports the MERGE commit's time (15.0 min), not the side branch's backdated commit"
+else
+    bad "T15 finding-2 repro case: rc=$rc output follows (merge sha $MERGE_SHA)"
+    printf '%s\n' "$OUT"
+fi
+(cd "$FAKE_REPO" || exit 1; git branch -D side-branch >/dev/null; git reset -q --hard v1.0.0)
+
+echo "T16 -- finding 3 (verdict-line strictness): a bare count line with no terminal verdict line is UNKNOWN"
+# A truncated or unrelated capture could contain a "moat: N of 9" substring
+# without ever reaching tests/moat/run.sh's actual conclusion. Requiring one
+# of its recognized terminal verdict lines guards against reading that as a
+# real measurement.
+MOAT_RESULT_NO_VERDICT="$WORK/moat-result-no-verdict.txt"
+cat > "$MOAT_RESULT_NO_VERDICT" <<'EOF'
+some unrelated log noise mentioning moat: 9 of 9 properties proven in passing
+EOF
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_NO_VERDICT" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (PULSE_MOAT_RESULT file did not contain a parseable"; then
+    ok "count line without a terminal verdict line is rejected as UNKNOWN, not treated as a real measurement"
+else
+    bad "T16 no-verdict-line case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T16b -- finding 3: tests/moat/run.sh's own COULD-NOT-CHECK verdict is never read as a measured clean"
+# tests/moat/run.sh exits 2 (could not check, e.g. no release tag reachable)
+# and in that case prints "moat suite: COULD NOT CHECK (...)" -- NOT one of
+# the PASS/FAIL verdict lines -- even though it still unconditionally prints
+# the "moat: N of 9 properties proven" count line first (see tests/moat/run.sh
+# around its final echo block). If pulse's verdict-line regex ever matched
+# this wording (or matched on the count line alone), a run that could not
+# even check the ratchets would silently read as a real measured result.
+MOAT_RESULT_COULD_NOT_CHECK="$WORK/moat-result-could-not-check.txt"
+cat > "$MOAT_RESULT_COULD_NOT_CHECK" <<'EOF'
+could not check: no release tag reachable; fetch tags
+moat: 0 of 9 properties proven
+moat suite: COULD NOT CHECK (the ratchets did not run; this is not a pass)
+EOF
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_MOAT_RESULT=$MOAT_RESULT_COULD_NOT_CHECK" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if [ "$rc" = 2 ] \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION:" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*moat_regression" \
+    && printf '%s\n' "$OUT" | grep -qF "Moat regression check: UNKNOWN (PULSE_MOAT_RESULT file did not contain a parseable"; then
+    ok "a real 'COULD NOT CHECK' capture is rejected as UNKNOWN, never read as a measured clean"
+else
+    bad "T16b could-not-check case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T17 -- finding 3 (decoupling): a failed pending-derived read does not blank the measured MOAT_REGRESSION check"
+# NO_GIT_REPO (from T9) has no .git at all, so the pending-derived
+# informational read (git show) fails -- but a measured PULSE_MOAT_RESULT
+# result must still be evaluated and still fire on a live suite FAIL. The two
+# checks are independent safe() calls specifically so one's failure cannot
+# silently blank the other.
+if run_pulse "PULSE_REPO_ROOT=$NO_GIT_REPO" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK" \
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO")" \
+    "PULSE_MOAT_RESULT=$MOAT_RESULT_FAIL" \
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"; then rc=0; else rc=$?; fi
+if [ "$rc" = 1 ] \
+    && printf '%s\n' "$OUT" | grep -qF "Moat proven (pending-derived, informational, NOT suite-verified): UNKNOWN" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: MOAT_REGRESSION: measured moat suite reports FAIL"; then
+    ok "pending-derived read UNKNOWN (no .git) does not stop the independent measured-result check from firing"
+else
+    bad "T17 decoupling case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
