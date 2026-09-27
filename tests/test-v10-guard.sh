@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #===============================================================================
-# Loki Mode - v10-guard.sh fixture tests (slice S-73, founder directive D26 guard 1)
+# Loki Mode - v10-guard.sh fixture tests (slice S-73 rework, founder directive
+# D26 guard 1)
 #
 # Exercises scripts/v10-guard.sh, the PreToolUse hook that blocks specific
 # dangerous Bash tool calls, against the real hook contract: JSON on stdin
@@ -8,8 +9,9 @@
 # + stderr message to block, exit 0 to allow (verified against
 # code.claude.com/docs/en/hooks, 2026-09-27).
 #
-# One BLOCKED and one ALLOWED case per rule, plus broad sanity checks for
-# common unrelated commands that must never be blocked.
+# GUARD can be overridden (V10_GUARD=/path/to/mutant) to run this same suite
+# against a mutated copy for a mutation-kill check, without ever editing the
+# tracked script while it runs.
 #===============================================================================
 
 set -uo pipefail
@@ -24,7 +26,7 @@ FAIL=0
 TOTAL=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GUARD="$SCRIPT_DIR/scripts/v10-guard.sh"
+GUARD="${V10_GUARD:-$SCRIPT_DIR/scripts/v10-guard.sh}"
 
 # Run-owned temp dir per CLAUDE.md Test and Resource Cleanup mandate.
 TEMP_ROOT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
@@ -95,6 +97,7 @@ assert_allowed() {
 }
 
 echo -e "${BOLD}v10-guard.sh fixture tests${NC}"
+echo "GUARD=$GUARD"
 echo "=============================="
 
 # ------------------------------------------------------------------
@@ -124,56 +127,8 @@ mkdir -p "$REPO3/docs/v10"
 git -C "$REPO3" init -q -b main
 git -C "$REPO3" config user.email test@example.com
 git -C "$REPO3" config user.name "Test"
-cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
-# Board
-
-| Slice | Status | Notes |
-|---|---|---|
-| S-1 | ready@2026-09-01T00:00Z | first |
-| S-2 | ready@2026-09-01T00:00Z | second |
-EOF
-git -C "$REPO3" add docs/v10/BOARD.md
-git -C "$REPO3" commit -q -m "seed board"
-
-echo ""
-echo "--- Rule 1: process-kill-by-pattern (pkill/killall/kill-by-pattern) ---"
-assert_blocked "R1 blocked: pkill -f" \
-    "pkill -f loki-mode" "$SCRIPT_DIR" "RULE1"
-assert_allowed "R1 allowed: kill exact recorded PID" \
-    "kill -9 42123" "$SCRIPT_DIR"
-
-echo ""
-echo "--- Rule 2: git push --force / git reset --hard on main ---"
-assert_blocked "R2 blocked: git push --force" \
-    "git push --force origin main" "$REPO2" "RULE2"
-assert_blocked "R2 blocked: git push -f" \
-    "git push -f origin main" "$REPO2" "RULE2"
-assert_blocked "R2 blocked: git reset --hard on main" \
-    "git reset --hard HEAD~1" "$REPO2" "RULE2"
-assert_allowed "R2 allowed: git push origin main (no force)" \
-    "git push origin main" "$REPO2"
-assert_allowed "R2 allowed: git reset --hard on non-main branch" \
-    "git reset --hard HEAD" "$REPO2_FEATURE"
-
-echo ""
-echo "--- Rule 3: git commit dropping a BOARD.md row ---"
-# Stage a BOARD.md that DROPS S-2, then commit plainly.
-cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
-# Board
-
-| Slice | Status | Notes |
-|---|---|---|
-| S-1 | ready@2026-09-01T00:00Z | first |
-EOF
-git -C "$REPO3" add docs/v10/BOARD.md
-assert_blocked "R3 blocked: commit drops S-2 row" \
-    "git commit -m 'oops drop a row'" "$REPO3" "RULE3"
-# Reset the index back to HEAD's BOARD.md for the next (allowed) case.
-git -C "$REPO3" reset -q -- docs/v10/BOARD.md
-git -C "$REPO3" checkout -q -- docs/v10/BOARD.md
-
-# Allowed: commit that only ADDS a row (S-1, S-2 kept, S-3 added).
-cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
+board_seed() {
+    cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
 # Board
 
 | Slice | Status | Notes |
@@ -182,25 +137,19 @@ cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
 | S-2 | ready@2026-09-01T00:00Z | second |
 | S-3 | ready@2026-09-01T00:00Z | third |
 EOF
+}
+board_seed
 git -C "$REPO3" add docs/v10/BOARD.md
-assert_allowed "R3 allowed: commit only adds a row" \
-    "git commit -m 'add S-3'" "$REPO3"
-git -C "$REPO3" commit -q -m "add S-3" >/dev/null 2>&1 || true
+git -C "$REPO3" commit -q -m "seed board"
+# helper: reset repo3's index+worktree back to this clean HEAD
+board_reset() { git -C "$REPO3" reset -q --hard; }
 
 echo ""
-echo "--- Rule 3 continued: chained 'git add && git commit' must still be caught ---"
-# Reset repo3 back to HEAD (S-1, S-2, S-3 all present after the prior commit).
-git -C "$REPO3" reset -q --hard
-cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
-# Board
-
-| Slice | Status | Notes |
-|---|---|---|
-| S-1 | ready@2026-09-01T00:00Z | first |
-EOF
-assert_blocked "R3 blocked: chained 'git add && git commit' drops rows" \
-    "git add docs/v10/BOARD.md && git commit -m 'sneaky drop'" "$REPO3" "RULE3"
-git -C "$REPO3" reset -q --hard
+echo "--- Rule 1: process-kill-by-pattern (pkill/killall/kill-by-pattern) ---"
+assert_blocked "R1 blocked: pkill -f" \
+    "pkill -f loki-mode" "$SCRIPT_DIR" "RULE1"
+assert_allowed "R1 allowed: kill exact recorded PID" \
+    "kill -9 42123" "$SCRIPT_DIR"
 
 echo ""
 echo "--- Rule 1 continued: kill fed a pgrep/command-substitution PID list ---"
@@ -211,15 +160,214 @@ assert_blocked "R1 blocked: killall by name" \
     "killall node" "$SCRIPT_DIR" "RULE1"
 
 echo ""
-echo "--- Rule 4: rm -rf outside allowed roots ---"
-assert_blocked "R4 blocked: rm -rf on repo path (outside allowed roots)" \
-    "rm -rf $SCRIPT_DIR/docs" "$SCRIPT_DIR" "RULE4"
+echo "--- Rule 1 continued: the recorded-PID pattern stays allowed ---"
+# shellcheck disable=SC2016  # literal text passed as the guarded command string, not expanded here
+assert_allowed "R1 allowed: kill \"\$PID\"" \
+    'kill "$PID"' "$SCRIPT_DIR"
+# shellcheck disable=SC2016
+assert_allowed "R1 allowed: kill -9 \$(cat recorded-pid-file)" \
+    'kill -9 $(cat "$LOKI_RUN_TMP/child.pid")' "$SCRIPT_DIR"
+# shellcheck disable=SC2016
+assert_allowed "R1 allowed: kill -0 \"\$pid\"" \
+    'kill -0 "$pid"' "$SCRIPT_DIR"
+
+echo ""
+echo "--- Rule 1 continued: xargs kill piped from a process-search tool ---"
+assert_blocked "R1 blocked: pgrep | xargs kill -9" \
+    "pgrep -f loki | xargs kill -9" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: lsof -ti | xargs kill -9" \
+    "lsof -ti:57374 | xargs kill -9" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: pgrep | grep -v x | xargs kill (multi-hop pipe)" \
+    "pgrep -f loki | grep -v x | xargs kill" "$SCRIPT_DIR" "RULE1"
+assert_allowed "R1 allowed: unrelated xargs pipe (no process-search source)" \
+    "echo loki | xargs echo" "$SCRIPT_DIR"
+
+echo ""
+echo "--- Rule 1 continued: bash -c / sh -c payloads are unwrapped ---"
+assert_blocked "R1 blocked: bash -c 'pkill ...'" \
+    "bash -c 'pkill -f loki'" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: sh -c 'pkill ...'" \
+    "sh -c 'pkill -f loki'" "$SCRIPT_DIR" "RULE1"
+assert_allowed "R1 allowed: bash -c 'echo hi' (unrelated payload)" \
+    "bash -c 'echo hi'" "$SCRIPT_DIR"
+
+echo ""
+echo "--- Rule 1 continued: kill \$VAR sourced from a process-search tool in the same command ---"
+# shellcheck disable=SC2016
+assert_blocked "R1 blocked: for p in \$(pgrep ...); do kill \$p; done" \
+    'for p in $(pgrep -f loki); do kill $p; done' "$SCRIPT_DIR" "RULE1"
+
+echo ""
+echo "--- Rule 1 continued: shell keywords/negation before the real command ---"
+assert_blocked "R1 blocked: if/then wrapping pkill" \
+    "if true; then pkill -f loki; fi" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: brace group wrapping pkill" \
+    "{ pkill -f loki; }" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: negation wrapping pkill" \
+    "! pkill -f loki" "$SCRIPT_DIR" "RULE1"
+
+echo ""
+echo "--- Rule 1 continued: timeout/nice/sudo wrapper wraps the real command ---"
+assert_blocked "R1 blocked: timeout N pkill ..." \
+    "timeout 5 pkill -f loki" "$SCRIPT_DIR" "RULE1"
+assert_allowed "R1 allowed: timeout N <safe command>" \
+    "timeout 5 echo hi" "$SCRIPT_DIR"
+assert_blocked "R1 blocked: sudo -u USER pkill ..." \
+    "sudo -u www-data pkill -f loki" "$SCRIPT_DIR" "RULE1"
+
+echo ""
+echo "--- Rule 2: git push --force / git reset --hard on main ---"
+assert_blocked "R2 blocked: git push --force" \
+    "git push --force origin main" "$REPO2" "RULE2"
+assert_blocked "R2 blocked: git push -f" \
+    "git push -f origin main" "$REPO2" "RULE2"
+assert_blocked "R2 blocked: git push --force-with-lease=main (attached value)" \
+    "git push --force-with-lease=main origin main" "$REPO2" "RULE2"
+assert_blocked "R2 blocked: git reset --hard on main" \
+    "git reset --hard HEAD~1" "$REPO2" "RULE2"
+assert_allowed "R2 allowed: git push origin main (no force)" \
+    "git push origin main" "$REPO2"
+assert_allowed "R2 allowed: git reset --hard on non-main branch" \
+    "git reset --hard HEAD" "$REPO2_FEATURE"
+
+echo ""
+echo "--- Rule 2 continued: git -C / --git-dir= / --work-tree= target the NAMED repo, not hook cwd ---"
+assert_blocked "R2 blocked: git -C <repo-on-main> reset --hard (cwd is unrelated)" \
+    "git -C $REPO2 reset --hard HEAD~1" "$SCRIPT_DIR" "RULE2"
+assert_allowed "R2 allowed: git -C <repo-on-feature-branch> reset --hard (cwd is unrelated)" \
+    "git -C $REPO2_FEATURE reset --hard HEAD" "$SCRIPT_DIR"
+assert_blocked "R2 blocked: git --git-dir=/--work-tree= targets a repo on main" \
+    "git --git-dir=$REPO2/.git --work-tree=$REPO2 reset --hard HEAD~1" "$SCRIPT_DIR" "RULE2"
+
+echo ""
+echo "--- Rule 3: git commit dropping a BOARD.md row (isolated: index only) ---"
+board_reset
+# Stage a BOARD.md that drops S-3, but restore the WORKING COPY to the full
+# set afterward -- this isolates the index check (a mutation to only the
+# working-tree check must not make this fixture pass).
+cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+| S-2 | ready@2026-09-01T00:00Z | second |
+EOF
+git -C "$REPO3" add docs/v10/BOARD.md
+board_seed
+assert_blocked "R3 blocked: staged BOARD.md drops S-3 (working copy intact)" \
+    "git commit -m 'oops drop a row'" "$REPO3" "RULE3"
+board_reset
+
+echo ""
+echo "--- Rule 3 continued: working-tree-only drop (isolated: combined short flags) ---"
+# Index matches HEAD exactly; only the unstaged working copy drops a row.
+# git commit -am/-qam commits the working-tree state for tracked files, so
+# this must block without any short-flag-cluster parsing.
+cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+| S-2 | ready@2026-09-01T00:00Z | second |
+EOF
+assert_blocked "R3 blocked: git commit -am x (working copy drops S-3, index clean)" \
+    "git commit -am x" "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git commit -qam x (combined short flags)" \
+    "git commit -qam x" "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git commit -m x docs/ (broad pathspec, unstaged drop)" \
+    "git commit -m x docs/" "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git commit -m x . (broad pathspec, unstaged drop)" \
+    "git commit -m x ." "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git add docs && git commit (add not yet run, worktree already dropped)" \
+    "git add docs && git commit -m x" "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git add -u && git commit" \
+    "git add -u && git commit -m x" "$REPO3" "RULE3"
+assert_blocked "R3 blocked: git stage <path> && git commit" \
+    "git stage docs/v10/BOARD.md && git commit -m x" "$REPO3" "RULE3"
+board_reset
+
+echo ""
+echo "--- Rule 3 continued: BOARD.md missing from the index (real staged delete) ---"
+git -C "$REPO3" rm -q --cached docs/v10/BOARD.md
+assert_blocked "R3 blocked: BOARD.md staged-removed from the index (worktree intact)" \
+    "git commit -m x" "$REPO3" "RULE3"
+board_reset
+git -C "$REPO3" add docs/v10/BOARD.md >/dev/null 2>&1 || true
+
+echo ""
+echo "--- Rule 3 continued: a pending git rm/mv in the SAME command removes BOARD.md ---"
+board_reset
+assert_blocked "R3 blocked: git rm BOARD.md && git commit (not yet executed)" \
+    "git rm docs/v10/BOARD.md && git commit -m x" "$REPO3" "RULE3"
+board_reset
+assert_blocked "R3 blocked: git mv BOARD.md away && git commit (not yet executed)" \
+    "git mv docs/v10/BOARD.md docs/v10/OLD.md && git commit -m x" "$REPO3" "RULE3"
+board_reset
+assert_blocked "R3 blocked: git -C <repo> rm BOARD.md && git commit" \
+    "git -C $REPO3 rm docs/v10/BOARD.md && git commit -m x" "$SCRIPT_DIR" "RULE3"
+board_reset
+
+echo ""
+echo "--- Rule 3 continued: allowed cases (no row dropped anywhere) ---"
+assert_allowed "R3 allowed: git commit -m x (nothing touched, board intact)" \
+    "git commit -m x" "$REPO3"
+cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+| S-2 | ready@2026-09-01T00:00Z | second |
+| S-3 | ready@2026-09-01T00:00Z | third |
+| S-4 | ready@2026-09-01T00:00Z | fourth |
+EOF
+git -C "$REPO3" add docs/v10/BOARD.md
+assert_allowed "R3 allowed: commit only adds a row (index and worktree agree)" \
+    "git commit -m 'add S-4'" "$REPO3"
+git -C "$REPO3" commit -q -m "add S-4" >/dev/null 2>&1 || true
+board_seed
+git -C "$REPO3" reset -q --hard HEAD~1 2>/dev/null || true
+board_seed
+git -C "$REPO3" checkout -q -- docs/v10/BOARD.md 2>/dev/null || true
+
+echo ""
+echo "--- Rule 3 continued: git commit -a from a repo SUBDIRECTORY resolves the real root ---"
+mkdir -p "$REPO3/docs/v10"
+board_reset
+assert_allowed "R3 allowed: git commit -a from subdirectory, clean tree (subdir path bug fixed)" \
+    "git commit -a -m x" "$REPO3/docs" "RULE3"
+cat > "$REPO3/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+| S-2 | ready@2026-09-01T00:00Z | second |
+EOF
+assert_blocked "R3 blocked: git commit -a from subdirectory, real drop" \
+    "git commit -a -m x" "$REPO3/docs" "RULE3"
+board_reset
+
+echo ""
+echo "--- Rule 4: rm -rf outside allowed roots (location-independent target) ---"
+assert_blocked "R4 blocked: rm -rf on a path outside any allowed root" \
+    "rm -rf /nonexistent-v10-guard-test-target-$$/docs" "$SCRIPT_DIR" "RULE4"
 mkdir -p "$SCRIPT_DIR/.claude/worktrees/scratch-fixture-$$"
 assert_allowed "R4 allowed: rm -rf under .claude/worktrees" \
     "rm -rf .claude/worktrees/scratch-fixture-$$" "$SCRIPT_DIR"
 rmdir "$SCRIPT_DIR/.claude/worktrees/scratch-fixture-$$" 2>/dev/null || true
 assert_allowed "R4 allowed: rm -rf under \$TMPDIR-rooted run tmp" \
     "rm -rf $LOKI_RUN_TMP/scratch-under-tmp" "$SCRIPT_DIR"
+assert_blocked "R4 blocked: rm -rf on .claude/worktrees ITSELF (the root, not under it)" \
+    "rm -rf .claude/worktrees" "$SCRIPT_DIR" "RULE4"
+assert_blocked "R4 blocked: rm -rf on /tmp ITSELF (the root, not under it)" \
+    "rm -rf /tmp" "$SCRIPT_DIR" "RULE4"
+assert_blocked "R4 blocked: for d in docs; do rm -rf docs; done (shell keyword prefix)" \
+    "for d in docs; do rm -rf docs; done" "$SCRIPT_DIR" "RULE4"
+assert_blocked "R4 blocked: timeout N rm -rf <outside> (timeout wrapper)" \
+    "timeout 10 rm -rf docs" "$SCRIPT_DIR" "RULE4"
 
 echo ""
 echo "--- Rule 5: writes to VERSION outside scripts/release.sh ---"
@@ -227,10 +375,70 @@ assert_blocked "R5 blocked: echo redirected into VERSION" \
     "echo '9.9.9' > VERSION" "$SCRIPT_DIR" "RULE5"
 assert_blocked "R5 blocked: sed -i editing VERSION" \
     "sed -i '' 's/9.55.0/9.56.0/' VERSION" "$SCRIPT_DIR" "RULE5"
+assert_blocked "R5 blocked: echo > ./VERSION (relative path prefix)" \
+    "echo 1 > ./VERSION" "$SCRIPT_DIR" "RULE5"
+assert_blocked "R5 blocked: echo > /abs/path/VERSION (absolute path prefix)" \
+    "echo 1 > $LOKI_RUN_TMP/VERSION" "$SCRIPT_DIR" "RULE5"
+assert_blocked "R5 blocked: no-space redirect (echo 9.9.9>VERSION)" \
+    "echo 9.9.9>VERSION" "$SCRIPT_DIR" "RULE5"
+assert_blocked "R5 blocked: noclobber-override redirect (printf 1 >| VERSION)" \
+    "printf 1 >| VERSION" "$SCRIPT_DIR" "RULE5"
 assert_allowed "R5 allowed: write to VERSION via scripts/release.sh" \
     "bash scripts/release.sh patch" "$SCRIPT_DIR"
 assert_allowed "R5 allowed: reading VERSION (no write)" \
     "cat VERSION" "$SCRIPT_DIR"
+assert_blocked "R5 blocked: release.sh exemption does not cover the WHOLE chained command" \
+    "scripts/release.sh --help; echo 1 > VERSION" "$SCRIPT_DIR" "RULE5"
+
+echo ""
+echo "--- Rule 6: git add blanket staging (CLAUDE.md: stage files individually) ---"
+assert_blocked "R6 blocked: git add -A" \
+    "git add -A" "$SCRIPT_DIR" "RULE6"
+assert_blocked "R6 blocked: git add ." \
+    "git add ." "$SCRIPT_DIR" "RULE6"
+assert_blocked "R6 blocked: git add --all" \
+    "git add --all" "$SCRIPT_DIR" "RULE6"
+assert_blocked "R6 blocked: git add :/" \
+    "git add :/" "$SCRIPT_DIR" "RULE6"
+assert_blocked "R6 blocked: git add -vA (combined short flag)" \
+    "git add -vA" "$SCRIPT_DIR" "RULE6"
+assert_allowed "R6 allowed: git add <file> (staged individually by name)" \
+    "git add scripts/v10-guard.sh" "$SCRIPT_DIR"
+
+echo ""
+echo "--- Heredocs: an apostrophe in a heredoc body must not cause a false PARSE block ---"
+assert_allowed "Heredoc allowed: apostrophe in a plain heredoc body" \
+    "cat > $LOKI_RUN_TMP/notes.txt <<EOF
+we can't confirm this
+EOF" "$SCRIPT_DIR"
+assert_allowed "Heredoc allowed: apostrophe in a quoted-delimiter heredoc (commit -F -)" \
+    "git commit -F - <<'EOF'
+fix: it's done
+EOF" "$REPO3"
+
+echo ""
+echo "--- Fail-closed on an internal guard crash (PY_EXIT != 0) ---"
+# A staged BOARD.md with invalid UTF-8 bytes makes the (unwrapped) index
+# read inside rule3 raise UnicodeDecodeError -- the python step crashes
+# after a rule was already in play. The wrapper must block, not fail open.
+REPO_CRASH="$LOKI_RUN_TMP/repo-crash"
+mkdir -p "$REPO_CRASH/docs/v10"
+git -C "$REPO_CRASH" init -q -b main
+git -C "$REPO_CRASH" config user.email test@example.com
+git -C "$REPO_CRASH" config user.name "Test"
+cat > "$REPO_CRASH/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+EOF
+git -C "$REPO_CRASH" add docs/v10/BOARD.md
+git -C "$REPO_CRASH" commit -q -m "seed"
+printf '\xff\xfe not valid utf-8' > "$REPO_CRASH/docs/v10/BOARD.md"
+git -C "$REPO_CRASH" add docs/v10/BOARD.md
+assert_blocked "Guard blocked: invalid-UTF8 staged BOARD.md crashes the python step, fails closed" \
+    "git commit -m x" "$REPO_CRASH" "PARSE"
 
 echo ""
 echo "--- Broad sanity checks: common commands must never be blocked ---"
@@ -242,6 +450,8 @@ assert_allowed "Sanity: unrelated string mentioning pkill in a comment/grep" \
     "grep -rn 'pkill -f' tests/" "$SCRIPT_DIR"
 assert_allowed "Sanity: quoted string mentioning git push --force" \
     "echo 'never run git push --force here'" "$SCRIPT_DIR"
+assert_allowed "Sanity: 'confirm'/'term' do not false-trigger the rm/kill prefilter" \
+    "echo 'we can confirm the terms'" "$SCRIPT_DIR"
 
 echo ""
 echo "=============================="
