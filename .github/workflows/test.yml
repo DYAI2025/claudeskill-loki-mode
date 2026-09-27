@@ -70,7 +70,7 @@ jobs:
           python3 -m pip install -r requirements-test.txt
 
       - name: Run tests
-        run: python3 -m pytest
+        run: python3 -m pytest -n auto
 
   shell-tests:
     name: Shell tests (shard ${{ matrix.shard }}/4)
