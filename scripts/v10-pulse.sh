@@ -1747,7 +1747,13 @@ def check_unevidenced_claims():
             if not line.startswith("+") or line.startswith("+++"):
                 continue
             added = line[1:]
-            if _CLAIM_RE.search(added) and not _EVIDENCE_RE.search(added):
+            # A BOARD slice row's Wall-check cell is a spec ("... passes"), not
+            # a claim; only its status and notes cells (the last two) can claim.
+            text = added
+            cells = added.split("|")
+            if added.startswith("| S-") and len(cells) >= 9:
+                text = "|".join(cells[-3:-1])
+            if _CLAIM_RE.search(text) and not _EVIDENCE_RE.search(text):
                 if current and added.strip() not in current:
                     continue
                 flagged.append((sha[:8], added.strip()[:160]))

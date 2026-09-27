@@ -87,3 +87,248 @@ Candidates I dropped because they are already fixed or would not help:
 - Waiting on a slice in this set: BACKLOG 127 remainder (`run.sh` auto_capture_episode, `cd "$PROJECT_DIR"` with no unset guard, ~21361) after S-140; BACKLOG 38 after S-141; BACKLOG 133 after S-139.
 
 I edited no files. The only temp file was a log saved under `$TMPDIR` and deleted in the same command. I started no background processes.
+
+## 19:10Z cut (S-154..S-173)
+
+I edited no files and started no background processes. Each red condition below comes from reading or grepping the current tree at e952e1ae. Two numbers were measured on this host (load average about 9):
+- `python3 tests/lib/scan-unreachable-shipped.py` ran in 47s, rc 0.
+- `EVENT_NAME=push SHA=8d17be2b bash scripts/ci/version-bump-only.sh check` printed `normalizer: not on the allowlist: web-app/src/components/Footer.tsx`, rc 1.
+
+`tests/test-sentrux-init-rules.sh` ran once for timing. It removed its own mktemp dir through its EXIT trap: `ls -d /tmp/loki-test-sentrux-init-*` found 0 entries. The working tree shows only the Chief of Staff's uncommitted BOARD.md and TODO.md edits.
+
+Rules that apply to every row:
+- No file set includes a hot file.
+- Any new test file is registered in `tests/run-all-tests.sh` by the Captain.
+- Dashboard-ui rows need the Captain to rebuild `dashboard/static/index.html`. Web-app rows need a `web-app/dist` rebuild.
+- UI walls follow the pattern already in the repo. Web-app rows pull the copy decision into a named pure function tested with `node --test`, like `web-app/src/cockpit/useCockpitState.derive-view.test.mjs`. Dashboard-ui rows drive the real component class against a DOM stub, like `dashboard-ui/tests/loki-empty-vs-error.node.test.mjs`.
+- Each UI wall includes a negative assertion: the error render must not contain the empty-state sentence. A grep for the absence of a string is not accepted as a wall.
+
+### S-154: prune-worktrees.sh treats a cherry-picked branch as merged (GUARDS 5, TODO item 8)
+- Files: scripts/prune-worktrees.sh, tests/test-prune-worktrees.sh (new)
+- Tier: MEDIUM (it removes worktrees)
+- Red: the script counts a worktree as merged only through `git merge-base --is-ancestor`. The Chief of Staff lands slices by cherry-pick, so no slice branch is ever an ancestor of main, and the dry run lists 0 of them. That is why pruning is still manual (TODO item 8: "count now 7 of 15"). No test file for the script exists (`ls tests | grep -i prune` shows only checkpoint tests).
+- Green, on a fixture repo:
+  - A branch whose commits are all patch-equivalent on main (`git cherry main <branch>` shows no `+` lines) is listed as removable.
+  - A branch with one `+` commit is kept.
+  - A locked worktree is kept, and so is a dirty one.
+  - `--apply` removes only through `git worktree remove`.
+  - The test also greps the script and fails on any `stat`, `mtime`, `-mmin` or `-newer` token, so GUARDS 5 finally has a checked-in test.
+- Wall: `bash tests/test-prune-worktrees.sh` exits 0 with every case PASS. A mutation that drops the `git cherry` branch makes the cherry-picked fixture case FAIL.
+
+### S-155: shipped-module reachability scan under 10s, same verdicts (velocity)
+- Files: tests/lib/scan-unreachable-shipped.py (referenced_from_runtime and its caller only)
+- Tier: LOW
+- Red: the scan takes 47s locally and 95s on CI (`tests/shard-durations.tsv`: "shipped modules have a recorded reachability verdict 95"). It is the 4th slowest suite. Every module runs one large alternation regex over every corpus file, including a `(node|bun)\s+[^\n]*` arm, and nothing filters the files first.
+- Green:
+  - The builder first measures where the time goes (regex or I/O) and puts the numbers in the commit.
+  - Then add a substring prefilter: skip any corpus file that does not contain the module's stem. This is sound because every pattern alternative contains the stem literally. Also compile the regex once per module.
+  - stdout and rc are byte-identical to a capture taken before the change.
+- Wall: the scan runs in under 10s wall time. `bash tests/test-no-unreachable-shipped.sh` shows 4 passed, 0 failed. A mutation that removes one real require of a listed module still gets reported (rc 1).
+
+### S-156: auto-capture shadow_write runs the agent repo's memory package when PROJECT_DIR is unset, and splices importance into python source (BACKLOG 127 remainder)
+- Files: autonomy/run.sh (the managed-memory auto-capture block, found by grepping `shadow_write`, about line 21380-21396 only), tests/test-autocapture-shadow-write-guard.sh (new)
+- Tier: HIGH (code execution on a verdict-adjacent path)
+- Red: `cd "$PROJECT_DIR" 2>/dev/null && ... python3 -m memory.managed_memory.shadow_write` has no `-n PROJECT_DIR` guard. On bash 3.2, `cd ""` succeeds silently and the cwd stays inside the agent repo. Also, `python3 -c "print('yes' if float('$_ep_imp') >= 0.6 else 'no')"` interpolates an episode-file value straight into the python source.
+- Green:
+  - The block is skipped when PROJECT_DIR is empty.
+  - `importance` is passed through argv or env and never spliced into source.
+  - A planted `memory/managed_memory/shadow_write.py` in the cwd writes no marker file, run under `/bin/bash` and under bash 5.
+  - An importance value of `0.7'); open('PWNED','w'); ('` writes no PWNED file.
+  - The builder names who writes `episode_path_file`.
+- Wall: `bash tests/test-autocapture-shadow-write-guard.sh` exits 0, and `bash tests/test-trust-core-tests-detect.sh` still passes. Reverting either guard makes its case FAIL.
+
+### S-157: council member vote and convergence floor read pass:true as green whatever failed_count says (BACKLOG 98 remainder, 89)
+- Files: autonomy/completion-council.sh (council_evaluate_member's test-results parser and `_council_convergence_evidence_green` only), tests/test-council-failed-count-honesty.sh (new)
+- Tier: HIGH (council verdict)
+- Red: both parsers test `passed is True` and never read `failed_count`. The convergence reader is `print('yes' if (runner != 'none' and passed is True and d.get('status') != 'no_tests_run') ...`. So `{"runner":"jest","pass":true,"failed_count":2}` reads green at both sites. The evidence gate at ~2014 already treats failed_count as winning.
+- Green:
+  - At both sites, failed_count above 0 means not green, using the same rule as the evidence gate.
+  - A real `{"pass":true,"failed_count":0}` stays green (positive control).
+  - `runner=none` behaviour is unchanged.
+- Wall: `bash tests/test-council-failed-count-honesty.sh` exits 0, and `bash tests/test-trust-core-tests-detect.sh` and `bash tests/test-council-convergence-floor.sh` pass. A mutation that reverts either site makes its case FAIL.
+
+### S-158: per-run cost_partial is dropped by /api/cost/timeline runs[] and /api/proofs (BACKLOG 118)
+- Files: dashboard/server.py (the runs.append in `_compute_cost_timeline` about line 8351, and the /api/proofs row builder about line 12538 only), dashboard/static/cost.html, dashboard/static/proofs.html, tests/dashboard/test_cost_partial_surfaced.py (new)
+- Tier: MEDIUM (response shape change)
+- Red: `autonomy/lib/efficiency_cost.py:209` writes `cost.cost_partial` into proof.json, but both endpoints copy only `cost.usd`. A partly priced run therefore shows as a complete total.
+- Green:
+  - Both endpoints carry `cost_partial` (a missing key becomes false).
+  - Both pages render a partial run as "at least $X".
+  - A fully priced run renders as today.
+  - The builder names every consumer of the two endpoints that was checked.
+- Wall: `python3 -m pytest tests/dashboard/test_cost_partial_surfaced.py -q` passes. A fixture proof.json with `cost_partial: true` gives `runs[0].cost_partial == true`, and a mutation that drops the key fails the test.
+
+### S-159: NLSearch says "No results found" when the search request failed (BACKLOG 114)
+- Files: web-app/src/components/NLSearch.tsx, web-app/src/components/NLSearch.state.test.mjs (new)
+- Tier: LOW
+- Red: the catch at ~140 does `setResults([])` ("show empty results gracefully"), so a failed API call renders "No results found. Try a different query." (~261).
+- Green:
+  - The failure is kept in state and renders "Search failed: <reason>".
+  - A real empty result still says "No results found".
+  - The branch decision lives in an exported pure function.
+- Wall: `node --test web-app/src/components/NLSearch.state.test.mjs` passes, including the negative assertion. `cd web-app && npx tsc -b` exits 0.
+
+### S-160: CommandPalette file search failure reads as no results (BACKLOG 114)
+- Files: web-app/src/components/CommandPalette.tsx, web-app/src/components/CommandPalette.state.test.mjs (new)
+- Tier: LOW
+- Red: the catch at ~171 does `setFileResults([])`, so a failed `api.searchFiles` renders "No results found" (~392).
+- Green: the error state renders "File search failed", and a genuine empty result keeps "No results found".
+- Wall: `node --test web-app/src/components/CommandPalette.state.test.mjs` passes, and `cd web-app && npx tsc -b` exits 0.
+
+### S-161: ProjectsPage ignores the poll error and says "No projects yet" (BACKLOG 114)
+- Files: web-app/src/pages/ProjectsPage.tsx, web-app/src/pages/ProjectsPage.state.test.mjs (new)
+- Tier: LOW
+- Red: `usePolling` returns `error` (web-app/src/hooks/usePolling.ts:7), but ProjectsPage destructures only `data` and `refresh` (~65). A failed history fetch renders "No projects yet. Start building." (~168).
+- Green:
+  - With error set and no data, the page renders "Could not load projects" plus a retry.
+  - With data present and a later poll error, the page keeps the data and shows a stale notice.
+  - Real empty data still says "No projects yet".
+- Wall: `node --test web-app/src/pages/ProjectsPage.state.test.mjs` passes, and `cd web-app && npx tsc -b` exits 0.
+
+### S-162: SecretsPanel and DocsPanel swallow fetch errors into empty states (BACKLOG 114)
+- Files: web-app/src/components/ProjectWorkspace.tsx (SecretsPanel fetchSecrets ~248-256 with its empty branch ~366-372, and DocsPanel fetchStatus ~432-442 with its empty branch ~589-592 only), web-app/src/components/ProjectWorkspace.panels.test.mjs (new)
+- Tier: LOW
+- Red: both catches are `// ignore`. A failed secrets fetch renders "No secrets configured yet". A failed docs fetch renders "No documentation generated yet". SecretsPanel even declares an `error` state that the catch never sets.
+- Green: each failure renders "Could not load secrets" or "Could not load documentation", and genuine empties are unchanged.
+- Wall: `node --test web-app/src/components/ProjectWorkspace.panels.test.mjs` passes, and `cd web-app && npx tsc -b` exits 0.
+
+### S-163: CICDPanel shows unknown conclusions as "Failed" and unknown statuses as running (BACKLOG 114)
+- Files: web-app/src/components/CICDPanel.tsx (normalizeRunStatus, normalizeJobStatus, normalizeStepStatus and the status style map only), web-app/src/components/CICDPanel.status.test.mjs (new)
+- Tier: LOW
+- Red: all three normalizers map `default: return 'failed'` for a completed item, so `neutral`, `action_required`, `stale` and a null conclusion read as Failed. Any unlisted `status` returns `'running'`.
+- Green:
+  - A new `unknown` status with a neutral style.
+  - `failure`, `timed_out` and `startup_failure` still map to failed.
+  - `success`, `cancelled` and `skipped` are unchanged.
+- Wall: `node --test web-app/src/components/CICDPanel.status.test.mjs` passes and covers each conclusion. `cd web-app && npx tsc -b` exits 0.
+
+### S-164: AIChatPanel prints "Done." for a task that failed with no output (BACKLOG 114)
+- Files: web-app/src/components/AIChatPanel.tsx (the two `|| 'Done.'` fallbacks at ~543 and ~622 only), web-app/src/components/AIChatPanel.result.test.mjs (new)
+- Tier: LOW
+- Red: both completion paths render `content || 'Done.'` whatever `returncode` is, so a non-zero exit with no output reads as success.
+- Green: a non-zero returncode with no output renders "Failed (exit N), no output". Zero with no output renders "Finished with no output". Real output is unchanged.
+- Wall: `node --test web-app/src/components/AIChatPanel.result.test.mjs` passes, and `cd web-app && npx tsc -b` exits 0.
+
+### S-165: TrustedBy asserts a trust claim and ChangelogWidget shows March 2026 v6.x as "Recent Changes" (BACKLOG 117 remainder)
+- Files: web-app/src/components/TrustedBy.tsx, web-app/src/components/ChangelogWidget.tsx
+- Tier: LOW
+- Red: TrustedBy.tsx:70 renders "Trusted by developers building the future" on HomePage and ShowcasePage. ChangelogWidget.tsx hardcodes v6.71.1, v6.70.0 and v6.69.0 (dates Mar 20-24, 2026) under "Recent Changes" while VERSION is 9.x.
+- Green:
+  - The headline becomes a factual label (for example "At a glance").
+  - The widget either drops the hardcoded list for a link to the changelog, or stops calling it recent.
+  - The remaining stats are checked against the code (5 providers, template count) and noted in the commit.
+- Wall: `grep -n "Trusted by developers" web-app/src/components/TrustedBy.tsx` returns rc 1. `grep -n "6.71.1" web-app/src/components/ChangelogWidget.tsx` returns rc 1. `cd web-app && npx tsc -b` exits 0.
+
+### S-166: checkpoint viewer drops a rejected fetch and clears the error (BACKLOG 114)
+- Files: dashboard-ui/components/loki-checkpoint-viewer.js (the load at ~95-110 only), dashboard-ui/tests/loki-checkpoint-viewer-fetch-error.node.test.mjs (new)
+- Tier: LOW
+- Red: `Promise.allSettled` never throws. On `status === 'rejected'` the code keeps the old or empty list and then sets `this._error = null`, so a failed read renders as "no checkpoints".
+- Green: a rejected result sets `_error` and renders a load-failure message. A fulfilled empty result still renders the empty state.
+- Wall: `node --test dashboard-ui/tests/loki-checkpoint-viewer-fetch-error.node.test.mjs` passes, including the negative assertion.
+
+### S-167: council transcripts hide a failed hook-events read as zero events (BACKLOG 114)
+- Files: dashboard-ui/components/loki-council-transcripts.js (the hook events load at ~104-118 only), dashboard-ui/tests/loki-council-transcripts-fetch-error.node.test.mjs (new)
+- Tier: LOW
+- Red: the catch sets `this._hookEvents = []` and records no error, so a failed read renders the same as "no hook events".
+- Green: the failure is recorded and rendered as "Could not load hook events". A real empty list is unchanged.
+- Wall: `node --test dashboard-ui/tests/loki-council-transcripts-fetch-error.node.test.mjs` passes.
+
+### S-168: task board hides a load error whenever local tasks exist (BACKLOG 114)
+- Files: dashboard-ui/components/loki-task-board.js (the catch at ~164-169 and the error render at ~1585 only), dashboard-ui/tests/loki-task-board-fetch-error.node.test.mjs (new)
+- Tier: LOW
+- Red: the render shows the error only when `this._error && this._tasks.length === 0`, and the catch refills `_tasks` with local tasks. A failed server read with any local task therefore shows no error, and the board looks complete.
+- Green: with local tasks present, a server failure still shows a banner ("Server tasks could not be loaded; showing local tasks only") above the local tasks.
+- Wall: `node --test dashboard-ui/tests/loki-task-board-fetch-error.node.test.mjs` passes. `node --test dashboard-ui/tests/loki-task-board-modal-guard.node.test.mjs` still passes.
+
+### S-169: log stream swallows API failures silently (BACKLOG 114)
+- Files: dashboard-ui/components/loki-log-stream.js (the API poll catch at ~179 and the empty render only), dashboard-ui/tests/loki-log-stream-fetch-error.node.test.mjs (new)
+- Tier: LOW
+- Red: the catch body is only the comment `// API not available, will retry on next poll`. A panel that never reached the API looks like a quiet log.
+- Green: consecutive failures set a visible "Log source unreachable, retrying" state, and it clears on the next success. Polling is unchanged.
+- Wall: `node --test dashboard-ui/tests/loki-log-stream-fetch-error.node.test.mjs` passes. `node --test dashboard-ui/tests/loki-poll-registry.node.test.mjs` still passes.
+
+### S-170: API keys panel shows "No API keys configured" under its own load-error banner (BACKLOG 114)
+- Files: dashboard-ui/components/loki-api-keys.js (the table branch at ~568-575 only), dashboard-ui/tests/loki-api-keys-fetch-error.node.test.mjs (new)
+- Tier: LOW
+- Red: a failed load sets `_error = "Failed to load API keys: ..."`, which renders as a banner at ~652. The table branch still falls to `keys.length === 0` and prints "No API keys configured. Create one to get started." Both render together.
+- Green: when the list load failed, the empty-state sentence is not rendered. A real empty list keeps it.
+- Wall: `node --test dashboard-ui/tests/loki-api-keys-fetch-error.node.test.mjs` passes. It asserts that the error render does not contain "No API keys configured".
+
+### S-171: lint for response fields put into innerHTML without escaping (BACKLOG 124)
+- Files: tests/test-no-unescaped-innerhtml.sh (new), tests/lib/scan-unescaped-innerhtml.py (new)
+- Tier: MEDIUM
+- Red: no guard exists. A planted fixture component with ``el.innerHTML = `<b>${data.name}</b>` `` is flagged, rc 1.
+- Green:
+  - The scanner covers dashboard-ui/components and dashboard-ui/scripts/build-standalone.js.
+  - It flags a template-literal or string interpolation into innerHTML that is not wrapped in the file's escape helper.
+  - It must pass on today's tree. Every current offender goes in an in-file ALLOWLIST with a reason of at least 40 characters, the same pattern scan-unreachable-shipped.py uses. Any real XSS found is named in the report and not fixed here.
+  - A non-vacuity check asserts that 20 or more files were scanned.
+- Wall: `bash tests/test-no-unescaped-innerhtml.sh` exits 0 on main. The planted fixture case exits 1. An allowlist entry with an empty reason fails.
+
+### S-172: shadow-write mutant check depends on the bash version's `cd ""` behaviour (BACKLOG 132)
+- Files: tests/test-council-shadow-write-project-dir.sh
+- Tier: LOW
+- Red: the mutant that strips only the `-n PROJECT_DIR` guard stays GREEN under bash 5.3, because `cd ""` hard-fails there. It goes RED under /bin/bash 3.2.57. The file runs `bash -c` from `#!/usr/bin/env bash`.
+- Green:
+  - The GREEN and mutant runs execute under `/bin/bash` when it exists, and also under the PATH bash.
+  - The in-file mutant leg goes red under both interpreters. It asserts on the executed-module marker, not on the result of `cd`.
+- Wall: `bash tests/test-council-shadow-write-project-dir.sh` exits 0. Its mutant leg reports red under both `/bin/bash --version` and the PATH bash, and the two version strings are printed in the output.
+
+### S-173: P2.council-readers-not-shadowed does not drive the 6th reader, council_managed_should_stop (BACKLOG 135)
+- Files: tests/moat/p2-honest-verdict.sh (the council-readers-not-shadowed case only)
+- Tier: HIGH (moat)
+- Red: the case covers 5 readers. `council_managed_should_stop` (completion-council.sh ~4351) reads test-results.json behind `LOKI_EXPERIMENTAL_MANAGED_COUNCIL`/`LOKI_MANAGED_AGENTS` and is never driven.
+- Green:
+  - Add a leg that sets those flags and plants a cwd `json.py` or `hashlib.py`. It passes today, because the D7 sys.path filter is present.
+  - A scratch-copy mutation that removes that filter turns the case red.
+  - Scope is the cwd-shadow class only. This reader is still `python3 -E` with no `-I -S`, so a `.pth` leg would turn a proven case red on main. The `.pth` leg is deferred to the production fix, which is alternate A2 below.
+- Wall: `bash tests/moat/p2-honest-verdict.sh` prints `CASE P2.council-readers-not-shadowed PASS`, and the mutated copy prints FAIL for that case.
+
+**Risks and notes**
+1. **Fold into S-153 now (the biggest velocity finding).**
+   - Since S-144, every bump commit rewrites Footer.tsx, and Footer.tsx is on neither allowlist. `version-bump-only.sh check` against the v9.68.0 bump 8d17be2b is rc 1 ("not on the allowlist: web-app/src/components/Footer.tsx"). So S-132's Tests skip, merged at 19:06, cannot fire on any bump.
+   - S-153 changes only release.yml STEP 1. The script's header says it is a byte-for-byte copy of STEP 1, and `tests/test-version-bump-only.sh` checks parity against it.
+   - S-153's file set should therefore also include `scripts/ci/version-bump-only.sh` and Footer fixtures in `tests/test-version-bump-only.sh`. That also covers any web-app/dist files S-153 adds to the bump. Without both, the skip still never fires; with only one side changed, the parity test goes red.
+2. **Same-file neighbours.**
+   - S-156 (run.sh ~21390) and S-157 (completion-council.sh) are the only rows on those files, in regions far from S-135's test-only rework.
+   - Trust-core probes anchor into both files by content, so both walls run `tests/test-trust-core-tests-detect.sh`. If S-135 lands first, rebase.
+3. **Registration and rebuilds.**
+   - 17 rows add a new test file and need the Captain to register it: S-154, S-156, S-157, S-158, S-159 to S-164, S-166 to S-171.
+   - S-159 to S-165 need a `web-app/dist` rebuild. S-166 to S-170 need `dashboard/static/index.html` rebuilt.
+4. **Response shapes.** S-158 adds a field and changes the rendered copy. The builder must name the consumers it checked.
+5. **Held, not in the 20:**
+   - BACKLOG 19 (remote stripped signature from a signing server). `docs/exit-codes.md` documents UNSIGNED as helper return 0. Changing it is an exit-contract change on a verifier (CEO, like BACKLOG 4). A label-only version would need a new JWKS fetch, meaning egress on the verify path.
+   - BACKLOG 18, 77, 121, 123 and WhatsNew.tsx, as before.
+   - BACKLOG 52 (renaming the "Moat suite" check), because branch protection may key on the check name.
+6. **Alternates, ready once a file frees up:**
+   - A1: BACKLOG 17, the `/api/focus` POST fires with LOKI_DASHBOARD=false (run.sh ~24478). Cut it after S-156.
+   - A2: `council_managed_should_stop` still runs `python3 -E` with no `-I -S`, and has `project_dir="${PROJECT_DIR:-$(pwd)}"` (BACKLOG 127c). Cut it after S-157, then add S-173's `.pth` leg.
+   - A3: GUARDS 11 as a scripts/v10-guard.sh rule. Cut it after S-152, which owns that file.
+   - A4: BACKLOG 112 `/api/cost` tracker fallback and `/metrics` loki_cost_usd. Cut it after S-158 (dashboard/server.py).
+   - A5: "VERIFIED WITH GAPS" coloured as success in build-standalone.js. Cut it after S-146.
+7. **Already fixed, dropped after checking:**
+   - BACKLOG 38 (no_pass_recorded exists, completion-council.sh:2099).
+   - BACKLOG 56 (the Bun reader handles passed_count/failed_count and reuses the zero-test detector).
+   - BACKLOG 81 (python3 -E plus the sys.path filter at run.sh:13783).
+   - BACKLOG 116 memory-browser and overview keys (snake_case and `g.blocked` are in place).
+
+| S-154 | GUARDS 5 + TODO 8: prune-worktrees.sh treats a cherry-picked branch (git cherry, no + lines) as merged; test forbids mtime signals | scripts/prune-worktrees.sh, tests/test-prune-worktrees.sh (new) | MEDIUM | bash tests/test-prune-worktrees.sh exits 0; cherry-picked fixture listed, one-unique-commit, locked and dirty fixtures kept; dropping the git cherry branch fails the case | ready@2026-09-27T19:10Z | Removes worktrees only via git worktree remove. Captain registers the test. Source: 19:10Z cut. |
+| S-155 | Velocity: reachability scan (95s on CI, 47s local) under 10s via a per-module stem prefilter, identical verdicts | tests/lib/scan-unreachable-shipped.py | LOW | scan wall time under 10s; stdout and rc byte-identical to the pre-change capture; bash tests/test-no-unreachable-shipped.sh 4 passed 0 failed; removing one real require is still reported | ready@2026-09-27T19:10Z | Builder measures regex vs I/O first and records both numbers. Source: 19:10Z cut. |
+| S-156 | BACKLOG 127 remainder: auto-capture shadow_write runs with PROJECT_DIR unset, and float() splices episode importance into python source | autonomy/run.sh (shadow_write auto-capture block about 21380-21396 only), tests/test-autocapture-shadow-write-guard.sh (new) | HIGH | bash tests/test-autocapture-shadow-write-guard.sh exits 0 under /bin/bash and bash 5; no marker from a planted cwd memory package; no file from an injected importance; trust-core suite passes | ready@2026-09-27T19:10Z | Builder names who writes episode_path_file. Only run.sh row in this cut. Source: 19:10Z cut. |
+| S-157 | BACKLOG 98/89: council member vote and _council_convergence_evidence_green read pass:true as green whatever failed_count says | autonomy/completion-council.sh (those 2 parsers only), tests/test-council-failed-count-honesty.sh (new) | HIGH | pass:true with failed_count 2 is not green at both sites; failed_count 0 stays green; trust-core and convergence-floor suites pass; reverting either site fails its case | ready@2026-09-27T19:10Z | Mirrors the evidence gate rule (~2014). Only completion-council.sh row in this cut. Source: 19:10Z cut. |
+| S-158 | BACKLOG 118: per-run cost_partial dropped by /api/cost/timeline runs[] and /api/proofs; pages show a lower bound as a total | dashboard/server.py (runs.append in _compute_cost_timeline and the /api/proofs row only), dashboard/static/cost.html, dashboard/static/proofs.html, tests/dashboard/test_cost_partial_surfaced.py (new) | MEDIUM | pytest test_cost_partial_surfaced.py passes; fixture cost_partial true surfaces in both endpoints and renders as at least $X; dropping the key fails | ready@2026-09-27T19:10Z | Builder names the consumers checked. Source: 19:10Z cut. |
+| S-159 | BACKLOG 114: NLSearch renders No results found when the search request failed | web-app/src/components/NLSearch.tsx, web-app/src/components/NLSearch.state.test.mjs (new) | LOW | node --test NLSearch.state.test.mjs passes incl. the negative assertion; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-160 | BACKLOG 114: CommandPalette file-search failure reads as No results found | web-app/src/components/CommandPalette.tsx, web-app/src/components/CommandPalette.state.test.mjs (new) | LOW | node --test CommandPalette.state.test.mjs passes; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-161 | BACKLOG 114: ProjectsPage ignores usePolling error and says No projects yet on a failed fetch | web-app/src/pages/ProjectsPage.tsx, web-app/src/pages/ProjectsPage.state.test.mjs (new) | LOW | node --test ProjectsPage.state.test.mjs passes (error, stale-data and real-empty cases); npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-162 | BACKLOG 114: SecretsPanel and DocsPanel swallow fetch errors into No secrets / No documentation empty states | web-app/src/components/ProjectWorkspace.tsx (SecretsPanel and DocsPanel fetch and empty branches only), web-app/src/components/ProjectWorkspace.panels.test.mjs (new) | LOW | node --test ProjectWorkspace.panels.test.mjs passes; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-163 | BACKLOG 114: CICDPanel maps neutral/action_required/stale/null conclusions to Failed and unknown statuses to running | web-app/src/components/CICDPanel.tsx (3 normalizers and status map only), web-app/src/components/CICDPanel.status.test.mjs (new) | LOW | node --test CICDPanel.status.test.mjs passes for every conclusion; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-164 | BACKLOG 114: AIChatPanel prints Done. for a non-zero exit with no output | web-app/src/components/AIChatPanel.tsx (the two Done. fallbacks only), web-app/src/components/AIChatPanel.result.test.mjs (new) | LOW | node --test AIChatPanel.result.test.mjs passes; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-165 | BACKLOG 117 remainder: TrustedBy asserts Trusted by developers; ChangelogWidget shows March 2026 v6.x as Recent Changes | web-app/src/components/TrustedBy.tsx, web-app/src/components/ChangelogWidget.tsx | LOW | grep for Trusted by developers and 6.71.1 in those files returns rc 1; npx tsc -b exits 0 | ready@2026-09-27T19:10Z | Copy only. Captain rebuilds web-app/dist. Source: 19:10Z cut. |
+| S-166 | BACKLOG 114: checkpoint viewer ignores a rejected allSettled fetch and clears the error | dashboard-ui/components/loki-checkpoint-viewer.js (load block only), dashboard-ui/tests/loki-checkpoint-viewer-fetch-error.node.test.mjs (new) | LOW | node --test the new file passes incl. the negative assertion | ready@2026-09-27T19:10Z | Captain rebuilds dashboard/static/index.html. Source: 19:10Z cut. |
+| S-167 | BACKLOG 114: council transcripts render a failed hook-events read as zero events | dashboard-ui/components/loki-council-transcripts.js (hook events load only), dashboard-ui/tests/loki-council-transcripts-fetch-error.node.test.mjs (new) | LOW | node --test the new file passes | ready@2026-09-27T19:10Z | Captain rebuilds dashboard/static/index.html. Source: 19:10Z cut. |
+| S-168 | BACKLOG 114: task board hides a server load error whenever local tasks exist | dashboard-ui/components/loki-task-board.js (catch and error render only), dashboard-ui/tests/loki-task-board-fetch-error.node.test.mjs (new) | LOW | node --test the new file passes; loki-task-board-modal-guard test still passes | ready@2026-09-27T19:10Z | Captain rebuilds dashboard/static/index.html. Source: 19:10Z cut. |
+| S-169 | BACKLOG 114: log stream swallows API failures with an empty catch | dashboard-ui/components/loki-log-stream.js (API poll catch and empty render only), dashboard-ui/tests/loki-log-stream-fetch-error.node.test.mjs (new) | LOW | node --test the new file passes; loki-poll-registry test still passes | ready@2026-09-27T19:10Z | Captain rebuilds dashboard/static/index.html. Source: 19:10Z cut. |
+| S-170 | BACKLOG 114: API keys panel renders No API keys configured under its own load-error banner | dashboard-ui/components/loki-api-keys.js (table branch only), dashboard-ui/tests/loki-api-keys-fetch-error.node.test.mjs (new) | LOW | node --test the new file passes; error render lacks the empty-state sentence | ready@2026-09-27T19:10Z | Captain rebuilds dashboard/static/index.html. Source: 19:10Z cut. |
+| S-171 | BACKLOG 124: lint for response fields interpolated into innerHTML without the escape helper | tests/test-no-unescaped-innerhtml.sh (new), tests/lib/scan-unescaped-innerhtml.py (new) | MEDIUM | passes on main with a reasoned in-file allowlist; planted fixture exits 1; empty-reason entry fails; at least 20 files scanned | ready@2026-09-27T19:10Z | Real XSS found is reported, not fixed here. Captain registers. Source: 19:10Z cut. |
+| S-172 | BACKLOG 132: shadow-write mutant check is green on bash 5.3 and red on /bin/bash 3.2 | tests/test-council-shadow-write-project-dir.sh | LOW | bash tests/test-council-shadow-write-project-dir.sh exits 0; mutant leg red under both /bin/bash and PATH bash, both versions printed | ready@2026-09-27T19:10Z | Test-only. Source: 19:10Z cut. |
+| S-173 | BACKLOG 135: P2.council-readers-not-shadowed does not drive council_managed_should_stop (cwd-shadow class only) | tests/moat/p2-honest-verdict.sh (that case only) | HIGH | p2-honest-verdict.sh prints CASE P2.council-readers-not-shadowed PASS; removing the sys.path filter in a scratch copy prints FAIL | ready@2026-09-27T19:10Z | No .pth leg: that reader is still python3 -E, so a .pth leg would redden a proven case; follows alternate A2. Source: 19:10Z cut. |
