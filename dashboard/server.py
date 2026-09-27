@@ -7852,6 +7852,8 @@ def _compute_cost_snapshot() -> dict:
     budget_remaining = None
     # Did ANY record carry an observed value? Not "was a file present".
     cost_recorded = False
+    # Tokens were measured (tracker fallback) but no USD figure was recorded.
+    cost_unknown = False
 
     # Read efficiency files (one JSON file per iteration/task).
     # Use the iteration-*.json pattern so this reader sees the same
@@ -7929,25 +7931,32 @@ def _compute_cost_snapshot() -> dict:
                 total_input = totals.get("total_input", 0)
                 total_output = totals.get("total_output", 0)
                 if total_input > 0 or total_output > 0:
-                    # Real observed tokens from the context tracker: this IS a
-                    # measurement, even if the recorded USD total happens to
-                    # be 0.
+                    # Real observed tokens from the context tracker: the TOKENS
+                    # are a measurement. The USD figure is only a measurement
+                    # when the tracker recorded a number; a missing one is
+                    # unknown (null), while a recorded 0.0 stays 0.0.
                     cost_recorded = True
-                    estimated_cost = totals.get("total_cost_usd", 0.0)
+                    usd = totals.get("total_cost_usd")
+                    if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+                        estimated_cost = usd
+                    else:
+                        cost_unknown = True
+                    # No provider recorded -> the model is unknown, not sonnet.
+                    model = str(ctx.get("provider") or "unknown").lower()
                     # Rebuild by_model and by_phase from per_iteration data
                     for it in ctx.get("per_iteration", []):
                         inp = it.get("input_tokens", 0)
                         out = it.get("output_tokens", 0)
-                        cost = it.get("cost_usd", 0)
-                        model = ctx.get("provider", "sonnet").lower()
+                        cost = it.get("cost_usd")
+                        cost_is_num = isinstance(cost, (int, float)) and not isinstance(cost, bool)
                         if model not in by_model:
-                            by_model[model] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+                            by_model[model] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                                               "measured": False, "tokens_measured": True}
                         by_model[model]["input_tokens"] += inp
                         by_model[model]["output_tokens"] += out
-                        by_model[model]["cost_usd"] += cost
-                        # Observed tokens from the tracker (cost_recorded above).
-                        by_model[model]["measured"] = True
-                        by_model[model]["tokens_measured"] = True
+                        if cost_is_num:
+                            by_model[model]["cost_usd"] += cost
+                            by_model[model]["measured"] = True
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                 pass
 
@@ -7964,7 +7973,7 @@ def _compute_cost_snapshot() -> dict:
             # Spend against the cap only when something was measured: with
             # nothing recorded, "used" is unknown, not $0.00, and "remaining"
             # is unknown, not the whole cap.
-            if budget_limit is not None and cost_recorded:
+            if budget_limit is not None and cost_recorded and not cost_unknown:
                 budget_used = estimated_cost
                 budget_remaining = max(0.0, budget_limit - budget_used)
         except (json.JSONDecodeError, KeyError):
@@ -7988,7 +7997,7 @@ def _compute_cost_snapshot() -> dict:
             total_input + total_output + total_cache_read + total_cache_creation
         ) if cost_recorded else None,
         "cache_hit_ratio": round(total_cache_read / _read_in, 4) if _read_in > 0 else None,
-        "estimated_cost_usd": round(estimated_cost, 6) if cost_recorded else None,
+        "estimated_cost_usd": round(estimated_cost, 6) if cost_recorded and not cost_unknown else None,
         "cost_recorded": cost_recorded,
         "by_phase": {k: {
             "input_tokens": v["input_tokens"] if v.get("tokens_measured") else None,
