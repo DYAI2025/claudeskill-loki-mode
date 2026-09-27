@@ -612,7 +612,7 @@ outnsn="$(
     setup_agent_branch >/dev/null 2>&1
     rm -f .loki/state/preexisting-untracked.z
     # This models a session minted before the snapshot feature existed (no
-    # file was ever written for it), not this session's own file vanishing
+    # file was ever written for it), not a file of this same session vanishing
     # out from under it (BACKLOG 70 tampering, covered separately below): drop
     # the in-memory seal a real never-snapshotted session would never have set.
     _LOKI_SNAPSHOT_SEAL=""
@@ -777,12 +777,13 @@ outno="$(
     git checkout -q develop
     printf '{"user":"my real settings"}\n' > config.local.json
     base_ignores="$(git check-ignore -q config.local.json && echo yes || echo no)"
-    # BACKLOG 70: setup_agent_branch's seal lives in THIS process's memory
-    # (_LOKI_SNAPSHOT_SEAL), so session 2's commit_session_changes must run in
-    # the SAME bash -c as its setup_agent_branch, exactly as a real re-invoked
-    # `loki start` process would -- one process per session, start to finish.
-    # Running the commit in the outer subshell would compare session 2's files
-    # against session 1's (or no) seal and misreport tampering.
+    # BACKLOG 70: the seal of setup_agent_branch lives in the memory of THIS
+    # process (_LOKI_SNAPSHOT_SEAL), so commit_session_changes of session 2
+    # must run in the SAME bash -c as its setup_agent_branch, exactly as a real
+    # re-invoked `loki start` process would -- one process per session, start
+    # to finish. Running the commit in the outer subshell would compare the
+    # files of session 2 against the seal of session 1 (or no seal at all) and
+    # misreport tampering.
     s2out="$(bash -c '. "$1"; setup_agent_branch >/dev/null 2>&1
         printf "%s\n" "$(git rev-parse --abbrev-ref HEAD)"
         cat config.local.json 2>/dev/null
@@ -874,7 +875,7 @@ outir="$(
     record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
     nocommit="$( [ "$(git rev-parse HEAD)" = "$s1_head" ] && echo yes || echo no )"
     printf 'mine, between sessions\n' > 'user notes.txt'
-    # BACKLOG 70: setup_agent_branch's seal is a variable in THIS shell
+    # BACKLOG 70: the seal of setup_agent_branch is a variable in THIS shell
     # (_LOKI_SNAPSHOT_SEAL); `resume_log="$(setup_agent_branch ...)"` would run
     # it in a forked command-substitution subshell, whose variable changes
     # never reach back here (a real re-invoked process has no such split: one
@@ -1177,8 +1178,8 @@ outfa="$(
     # only the _loki_snapshot_digest call.
     awk_ran_during_setup="$( [ -f "$EVILBIN/.awk-ran" ] && echo yes || echo no )"
     rm -f "$EVILBIN/.awk-ran"
-    # Tamper AFTER sealing, same shape as T-snapshot-hash-deleted-disclosed's
-    # edit-after-seal scenario.
+    # Tamper AFTER sealing, same shape as the edit-after-seal scenario in
+    # T-snapshot-hash-deleted-disclosed.
     printf 'agent edit\n' >> .loki/state/preexisting-untracked.z 2>/dev/null || true
     live="$(PATH="$EVILBIN:$PATH" _loki_snapshot_digest)"
     awk_ran="$( [ -f "$EVILBIN/.awk-ran" ] && echo yes || echo no )"
@@ -1220,10 +1221,10 @@ outfar="$(
     source "$RED_AWK_PREAMBLE"
     SCRIPT_DIR="$PROJECT_DIR/autonomy"
     # The PATH must ALREADY be poisoned at seal time too: a real cached/stale
-    # digest bypass means the agent's fake awk emits the SAME fixed string on
-    # every call, so the seal itself (computed through the same fake awk) and
+    # digest bypass means the fake awk of the agent emits the SAME fixed string
+    # on every call, so the seal itself (computed through the same fake awk) and
     # a later live re-check (also through the fake awk) agree with each other
-    # -- while never reflecting the file's real, tampered content.
+    # -- while never reflecting the real, tampered content of the file.
     PATH="$EVILBIN:$PATH" setup_agent_branch >/dev/null 2>&1
     printf 'agent edit\n' >> .loki/state/preexisting-untracked.z 2>/dev/null || true
     live="$(PATH="$EVILBIN:$PATH" _loki_snapshot_digest)"
