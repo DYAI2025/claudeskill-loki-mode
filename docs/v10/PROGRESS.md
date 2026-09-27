@@ -1090,3 +1090,17 @@ take the live-agent list as input and must not use mtime.
 b651b98d; all wave-2 slices build in parallel; every review that
 found a blocker went back to the same engineer with the reviewers'
 exact reproductions (S-73, S-74, S-75), not to a fresh agent.
+
+## Drift audit, turn 186
+
+**Matched:** three reworks (S-74 round 2, S-75, S-18 round 3) came
+back within their budgets and each went straight to re-review with the
+prior reviewers' exact reproductions as the checklist. Reviews are
+finding real defects (S-73 x2 REJECT, S-74 CONCERN x2, S-75 REJECT),
+which is the review gate working, not noise.
+
+**Drifted, recurring:** a third builder (S-85) stopped short of
+committing to "wait for approval" (S-74, S-82 did the same). Root cause
+is the old CLAUDE.md commit workflow text that every subagent loads;
+S-78's trim removes it. Until S-78 merges, slice cards should say
+"commit when done, you are authorized" explicitly.
