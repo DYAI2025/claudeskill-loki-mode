@@ -618,7 +618,7 @@ EOF " "$SCRIPT_DIR" "RULE1"
 # swallows the NEXT token as its target -- rm's real target list must keep
 # every argument that was genuinely there.
 assert_blocked "S-99 R4: quoted \">\" must not hide the real rm target after it" \
-    'rm -rf /tmp/x ">" /Users/someone/important' "$SCRIPT_DIR" "RULE4"
+    'rm -rf /tmp/x ">" /srv/someone/important' "$SCRIPT_DIR" "RULE4"
 
 # (4) sed -i (and cp/mv/tee/truncate/dd/perl -pi/python3 open()) rewriting
 # BOARD.md in place, earlier in the same chained command, must set the
@@ -634,7 +634,7 @@ board_reset
 # payload is re-tokenized, or a quoted &&, >, & glues the payload into one
 # segment and hides every rule after its first word.
 assert_blocked "S-99 F1a: bash -c payload with && still scans the rm after it" \
-    "bash -c 'true && rm -rf /Users/nonexistent-s99'" "$SCRIPT_DIR" "RULE4"
+    "bash -c 'true && rm -rf /srv/nonexistent-s99'" "$SCRIPT_DIR" "RULE4"
 assert_blocked "S-99 F1b: sh -c payload with && still scans the force push after it" \
     'sh -c "true && git push --force"' "$SCRIPT_DIR" "RULE2"
 assert_blocked "S-99 F1c: bash -c payload with > VERSION still blocked" \
@@ -646,7 +646,7 @@ assert_blocked "S-99 F2: perl -i -pe rewriting BOARD.md sets pending before comm
 board_reset
 # (F3) A backslash-escaped ">" outside quotes is a literal argument too.
 assert_blocked "S-99 F3: escaped \\> must not hide the real rm target after it" \
-    'rm -rf /tmp/x \> /Users/someone/important' "$SCRIPT_DIR" "RULE4"
+    'rm -rf /tmp/x \> /srv/someone/important' "$SCRIPT_DIR" "RULE4"
 # (F4) python open() with a keyword mode= argument.
 board_reset
 assert_blocked "S-99 F4: python3 open(path, mode='w') on BOARD.md sets pending before commit" \
