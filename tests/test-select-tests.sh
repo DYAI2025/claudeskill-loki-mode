@@ -166,6 +166,99 @@ out="$(printf '' | bash "$SELECT" --files -)"
 expect_empty "no changes -> no output" "$out"
 expect_not_contains "no changes -> not R0" "$out" "R0"
 
+# ---------------------------------------------------------------------------
+# S-91 round 2 (Tech Lead REJECT on cb8ddb07): repro fixtures + guard.
+# ---------------------------------------------------------------------------
+
+# Repro 1a: a .py source is imported by its bare module name (sys.path style,
+# "from workspace_diff import x" / "import workspace_diff"), never by its
+# path or the ".py" suffix.
+out="$(sel 'autonomy/lib/workspace_diff.py')"
+expect_contains "repro1a: bare-module-name python import" "$out" "$(printf 'py_test\ttests/test_proof_generator.py')"
+
+# Repro 1b: the moat-relevant reference wraps the module name in this repo's
+# own case_<name> convention (tests/moat/p2-honest-verdict.sh's
+# case_fast_verify), which a strict identifier \b (underscore as a word char)
+# would still miss.
+out="$(sel 'autonomy/lib/fast_verify.py')"
+expect_contains "repro1b: case_<module> moat reference" "$out" "$(printf 'R6\tmoat\ttests/moat/p2-honest-verdict.sh')"
+
+# Repro 2: dashboard/api_keys.py -> tests/test_api_keys.py (top-level tests/,
+# not tests/dashboard/) via "from dashboard import api_keys". The R5 area
+# rule (tests/dashboard) must not replace R3's per-file import matching.
+out="$(sel 'dashboard/api_keys.py')"
+expect_contains "repro2: top-level tests/ import match" "$out" "$(printf 'py_test\ttests/test_api_keys.py')"
+expect_contains "repro2: R5 area rule still present too" "$out" "$(printf 'R5\tpytest\ttests/dashboard')"
+
+# Repro 3: dashboard-ui has its own recognized shape, an area rule that runs
+# its node --test suite (mirroring run-all-tests.sh's own 4 registrations),
+# and its tests are in the R3 collector so a direct import reference
+# (loki-audit-viewer.js, imported by ui-components.test.js) is also matched
+# per-file, correctly kinded as node_test (never bash).
+out="$(sel 'dashboard-ui/components/loki-audit-viewer.js')"
+expect_contains "repro3: dashboard-ui area rule (node_test)" "$out" "$(printf 'R5\tnode_test\tdashboard-ui/tests/ui-components.test.js')"
+expect_contains "repro3: dashboard-ui per-file import match" "$out" "$(printf 'R3\tnode_test\tdashboard-ui/tests/ui-components.test.js')"
+expect_not_contains "repro3: never bash-kinded" "$out" "$(printf 'shell_test\tdashboard-ui/tests/ui-components.test.js')"
+
+# Guard: for a fixed, deterministic sample of 10 real .py files under
+# autonomy/lib and dashboard, every test file that actually imports the
+# module (an "import x" / "from x import" / "from pkg import x" line,
+# independently found on disk here, not by calling into the selector's own
+# matcher) must appear in the selector's output for that file.
+SAMPLE_PY_FILES="$(
+    { find "$REPO_ROOT/autonomy/lib" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
+      find "$REPO_ROOT/dashboard" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
+    } | sed "s#^$REPO_ROOT/##"
+)"
+
+guard_pass=0
+guard_fail=0
+while IFS= read -r pyfile; do
+    [ -n "$pyfile" ] || continue
+    stem="$(basename "$pyfile" .py)"
+    # Ground truth: any .py file under tests/ whose import line names this
+    # module ("import stem", "from stem import", "from pkg import stem",
+    # "pkg.stem"), found independently of scripts/select-tests.sh.
+    mapfile -t py_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
+    truth="$(grep -lE "^[[:space:]]*(import|from)[[:space:]].*(^|[^A-Za-z0-9_.])${stem}([^A-Za-z0-9_]|$)" \
+        "${py_test_files[@]}" 2>/dev/null | sed "s#^$REPO_ROOT/##")"
+    [ -z "$truth" ] && continue
+    selected="$(sel "$pyfile")"
+    while IFS= read -r truth_file; do
+        [ -n "$truth_file" ] || continue
+        if printf '%s' "$selected" | grep -qF -- "$truth_file"; then
+            guard_pass=$((guard_pass + 1))
+        else
+            guard_fail=$((guard_fail + 1))
+            echo "FAIL: guard -- $pyfile is imported by $truth_file but not selected"
+        fi
+    done <<<"$truth"
+done <<<"$SAMPLE_PY_FILES"
+if [ "$guard_fail" -eq 0 ] && [ "$guard_pass" -gt 0 ]; then
+    PASS=$((PASS + 1))
+    echo "PASS: guard -- $guard_pass real import(s) across the 10-file sample all selected"
+elif [ "$guard_pass" -eq 0 ]; then
+    FAIL=$((FAIL + 1))
+    echo "FAIL: guard -- the 10-file sample found zero real imports to check (sample or grep is broken)"
+else
+    FAIL=$((FAIL + guard_fail))
+fi
+
+# Mutation control: the OLD matcher (basename WITH ".py", the exact defect
+# the round-2 review found) must NOT find what the NEW word-based matcher
+# finds, on the same real file pair -- proof this guard can go red, not just
+# green by construction.
+old_matcher_finds() {
+    grep -lF -- "$(basename "$1")" "$2" 2>/dev/null
+}
+if old_matcher_finds "autonomy/lib/fast_verify.py" "$REPO_ROOT/tests/moat/p2-honest-verdict.sh" >/dev/null; then
+    FAIL=$((FAIL + 1))
+    echo "FAIL: mutation control -- the old basename+.py matcher should NOT find this (it's the bug being fixed)"
+else
+    PASS=$((PASS + 1))
+    echo "PASS: mutation control -- old basename+.py matcher misses it (confirms this guard can detect the regression)"
+fi
+
 echo ""
 echo "select-tests fixtures: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

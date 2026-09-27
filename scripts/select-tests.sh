@@ -120,7 +120,7 @@ done
 # here means the selector genuinely does not know what kind of thing changed.
 is_recognized_shape() {
     case "$1" in
-        tests/* | loki-ts/* | dashboard/* | web-app/* | skills/* | autonomy/* \
+        tests/* | loki-ts/* | dashboard/* | dashboard-ui/* | web-app/* | skills/* | autonomy/* \
             | providers/* | memory/* | mcp/* | events/* | docs/* | scripts/* \
             | references/* | templates/* | benchmarks/* | wiki/* | plugins/* \
             | vscode-extension/* | SKILL.md | CLAUDE.md | README.md | CHANGELOG.md)
@@ -173,9 +173,61 @@ fi
 TEST_FILES_CACHE=""
 all_test_files() {
     if [ -z "$TEST_FILES_CACHE" ]; then
-        TEST_FILES_CACHE="$(find tests -type f \( -name '*.sh' -o -name '*.py' \) 2>/dev/null)"
+        TEST_FILES_CACHE="$(find tests -type f \( -name '*.sh' -o -name '*.py' \) 2>/dev/null
+            find dashboard-ui/tests -type f \( -name '*.js' -o -name '*.mjs' \) 2>/dev/null)"
     fi
     printf '%s\n' "$TEST_FILES_CACHE"
+}
+
+# Extra needles for a changed .py source file: python tests here import the
+# bare module name (sys.path-appended, e.g. "from workspace_diff import x" or
+# "import fast_verify"), never the file path or the ".py" suffix, and
+# sometimes the dotted package form ("import pkg.mod" / "from pkg.mod import
+# x" / "from pkg import mod"). The stem alone already covers all of the
+# observed forms including "from pkg import mod"; the dotted form is added
+# for the "pkg.mod" spelling. Matched with a word boundary (grep -w), not a
+# bare substring: an unqualified module name like "state" or "auth" is a
+# common English/code word and would false-positive almost everywhere as a
+# plain substring search.
+py_module_needles() {
+    local f="$1"
+    local rel="$f" stem dotted
+    rel="${rel%.py}"
+    stem="${rel##*/}"
+    dotted="${rel//\//.}"
+    # __init__/__main__ etc: a dunder stem is not a name anyone imports by --
+    # "from pkg import x" never spells the package's own __init__ -- and as a
+    # grep needle it is pathologically unspecific (every class in the
+    # language defines one), fanning out to match nearly the whole test tree
+    # and turning a sub-second selection into a multi-minute one. Verified
+    # directly: dashboard/__init__.py alone made the full run exceed a 150s
+    # timeout before this exclusion.
+    case "$stem" in
+        __*__) return 0 ;;
+    esac
+    printf '%s\n' "$stem"
+    [ "$dotted" != "$stem" ] && printf '%s\n' "$dotted"
+}
+
+grep_word_and_emit() {
+    local rule="$1" kind="$2" needle="$3" candidates="$4"
+    [ -n "$needle" ] || return 0
+    local match emit_kind
+    # Boundary excludes letters/digits only, NOT underscore: this repo's own
+    # naming convention wraps a referenced module/function in a snake_case
+    # prefix or suffix (moat's "case_fast_verify" for fast_verify.py, "test_"
+    # for a bare module). A strict \b (underscore counts as a word char)
+    # would reject exactly that, real-commit-verified against
+    # tests/moat/p2-honest-verdict.sh's "case_fast_verify". This still blocks
+    # a generic stem like "state" from matching inside "statement" (still
+    # alnum-adjacent) while matching it inside "auth_state" or "state_test".
+    while IFS= read -r match; do
+        [ -n "$match" ] || continue
+        emit_kind="$(match_kind "$kind" "$match")"
+        already_seen "$emit_kind:$match" && continue
+        mark_seen "$emit_kind:$match"
+        emit "$rule" "$emit_kind" "$match"
+    done < <(printf '%s\n' "$candidates" | xargs -I{} grep -lE -- "(^|[^A-Za-z0-9])${needle}($|[^A-Za-z0-9])" {} 2>/dev/null)
 }
 
 # Function names touched by a diff's changed hunks, for autonomy/run.sh and
@@ -241,20 +293,28 @@ already_seen() {
 }
 mark_seen() { SEEN="${SEEN}|$1|"; }
 
+# A "shell_test" kind (the default the callers below pass) is corrected
+# per-match to how the matched file is actually run: py_test for a .py match
+# (tests/**/*.py mixes both), node_test for a .js/.mjs match (dashboard-ui's
+# collector mixes those in too) -- never invoked with `bash`.
+match_kind() {
+    local kind="$1" match="$2"
+    case "$match" in
+        *.py) [ "$kind" = "shell_test" ] && kind="py_test" ;;
+        *.js | *.mjs) [ "$kind" = "shell_test" ] && kind="node_test" ;;
+    esac
+    printf '%s\n' "$kind"
+}
+
 # grep a set of candidate files for a literal needle (path or basename or
-# function name), emitting each match once under the given rule/kind. A
-# "shell_test" kind is downgraded to "py_test" per-match when the matched
-# file is itself a .py test (tests/**/*.py mixes both).
+# function name), emitting each match once under the given rule/kind.
 grep_and_emit() {
     local rule="$1" kind="$2" needle="$3" candidates="$4"
     [ -n "$needle" ] || return 0
     local match emit_kind
     while IFS= read -r match; do
         [ -n "$match" ] || continue
-        emit_kind="$kind"
-        case "$match" in
-            *.py) [ "$kind" = "shell_test" ] && emit_kind="py_test" ;;
-        esac
+        emit_kind="$(match_kind "$kind" "$match")"
         already_seen "$emit_kind:$match" && continue
         mark_seen "$emit_kind:$match"
         emit "$rule" "$emit_kind" "$match"
@@ -339,6 +399,21 @@ for f in "${CHANGED[@]}"; do
                 emit R5 node_lint "web-app"
             fi
             ;;
+        dashboard-ui/*)
+            # Mirror run-all-tests.sh exactly: it registers only 4 of the ~20
+            # files under dashboard-ui/tests/ as real `node --test` suites
+            # (the rest are Playwright e2e specs or unregistered/orphaned --
+            # a pre-existing gap outside this slice). Extract the registered
+            # set from run-all-tests.sh itself so this stays in sync rather
+            # than hardcoding a list that drifts.
+            if ! already_seen "r5area:dashboard-ui" && command -v node >/dev/null 2>&1; then
+                mark_seen "r5area:dashboard-ui"
+                while IFS= read -r uitest; do
+                    [ -n "$uitest" ] || continue
+                    emit R5 node_test "$uitest"
+                done < <(grep -oE 'dashboard-ui/tests/[A-Za-z0-9_.-]+\.(js|mjs)' tests/run-all-tests.sh | sort -u)
+            fi
+            ;;
     esac
 
     # R3: changed source file -> every test that references it. run.sh and
@@ -371,6 +446,17 @@ for f in "${CHANGED[@]}"; do
             # R6 (second half): changed code a moat property covers.
             grep_and_emit R6 moat "$f" "$(find tests/moat -maxdepth 1 -name 'p*.sh')"
             grep_and_emit R6 moat "$base" "$(find tests/moat -maxdepth 1 -name 'p*.sh')"
+            # A .py source's tests/scripts reference it by bare module name or
+            # dotted import, never the path or the ".py" suffix -- see
+            # py_module_needles.
+            case "$f" in
+                *.py)
+                    while IFS= read -r needle; do
+                        grep_word_and_emit R3 shell_test "$needle" "$(all_test_files)"
+                        grep_word_and_emit R6 moat "$needle" "$(find tests/moat -maxdepth 1 -name 'p*.sh')"
+                    done < <(py_module_needles "$f")
+                    ;;
+            esac
             ;;
     esac
 done
@@ -445,6 +531,7 @@ while IFS=$'\t' read -r rule kind target; do
         *:bun_typecheck) run_one "bun typecheck" bash -c "cd loki-ts && bun run typecheck" ;;
         *:pytest) run_one "pytest $target" python3 -m pytest -q "$target" ;;
         *:node_lint) run_one "npm run lint ($target)" bash -c "cd '$target' && npm run lint" ;;
+        *:node_test) run_one "node --test $target" node --test "$target" ;;
     esac
 done <<<"$SELECTION"
 
