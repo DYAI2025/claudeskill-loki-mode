@@ -17,6 +17,21 @@
 # is NOT enough. Every agent step must explicitly blank all four token vars
 # run.sh withholds, and must not interpolate a token expression anywhere.
 #
+# REWORK (S-54 round 2): a reviewer reproduced two gaps in the first cut.
+# (1) Actions to scan were listed by hand, so a new .github/actions/<x>/
+#     action.yml (e.g. review/action.yml) shipped unchecked. Fixed by
+#     globbing .github/actions/*/action.yml plus root action.yml.
+# (2) Detection required the literal command word `loki`/`npx loki-mode`
+#     immediately followed by one of a hardcoded subcommand list
+#     (start|run|heal), so it missed: a pinned `npx loki-mode@<ver>`, an
+#     absolute-path call, a call through a variable holding the binary name,
+#     any other subcommand (review/fix/test/...), and a repo script that
+#     might itself call loki. Fixed below: detection no longer requires a
+#     specific subcommand, and adds path/npx/version, variable, and
+#     script-call forms. tests/fixtures/action-agent-step-forms/*.yml proves
+#     each of those five forms is now caught (and that a properly-blanked
+#     step in each form still passes).
+#
 # Usage: test-action-agent-step-no-token.sh [root]   (root defaults to repo)
 set -uo pipefail
 
@@ -24,56 +39,139 @@ ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 echo "test-action-agent-step-no-token (root: $ROOT)"
 python3 - "$ROOT" <<'PY'
-import os, re, sys
+import glob, os, re, sys
 import yaml
 
 root = sys.argv[1]
-# Vacuity guard: every agent step we know ships must be found by name. A
-# detector that finds nothing would otherwise report clean.
+TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+TOKEN_EXPR_RE = re.compile(r"\$\{\{[^}]*(github\.token|github_token|GITHUB_TOKEN|GH_TOKEN)[^}]*\}\}")
+
+# A command-position anchor: start of the run text, a new shell statement
+# (after ; && || a backtick or a $( ), never bare whitespace. Bare whitespace
+# would also match mid-argument, e.g. `--provider "$LOKI_PROVIDER"`, or a
+# plain assignment value like `OUT="$RUNNER_TEMP/loki-out"` -- neither of
+# those runs anything.
+_SEP = r'(?:\A|\n|;|&&|\|\||\$\(|`)\s*'
+
+# Any direct invocation of the loki / loki-mode binary: bare word, an
+# absolute or ./relative path in front of it, npx with or without a pinned
+# @version, and no subcommand restriction -- review/fix/test/heal/a future
+# one all run the same agent-capable CLI.
+AGENT_RE = re.compile(
+    _SEP + r'(?:npx\s+)?(?:(?:/|\./|\.\./)\S*/)?loki(?:-mode)?(?:@\S+)?\b'
+)
+# A variable plainly naming the loki binary, invoked as the command word
+# (quoted or not): `LOKI_BIN=...; "$LOKI_BIN" start`.
+VAR_CALL_RE = re.compile(_SEP + r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?(?=\s|\Z)')
+# A repo script run directly. We can't see inside it, so treat it the same
+# as an agent step rather than assume it's safe.
+SCRIPT_RE = re.compile(_SEP + r'(?:bash\s+scripts/|sh\s+scripts/|\./)\S+')
+
+
+def clean_run(step):
+    # Drop shell comment lines: prose like "the loki run this job owns" is
+    # not an invocation.
+    return "\n".join(l for l in str(step.get("run", "")).splitlines()
+                      if not l.lstrip().startswith("#"))
+
+
+def is_agent_run(run):
+    if AGENT_RE.search(run) or SCRIPT_RE.search(run):
+        return True
+    return any("loki" in m.group(1).lower() for m in VAR_CALL_RE.finditer(run))
+
+
+def agent_steps(path):
+    """Yield (name, step_dict) for every agent step in one action.yml."""
+    doc = yaml.safe_load(open(path))
+    steps = doc["runs"]["steps"]
+    for i, st in enumerate(steps):
+        if is_agent_run(clean_run(st)):
+            yield st.get("name", f"step {i}"), st
+
+
+def check_step(rel, name, st, out):
+    env = st.get("env") or {}
+    for v in TOKEN_VARS:
+        if v not in env:
+            out.append(f"{rel} [{name}]: {v} not explicitly blanked (inherits caller env)")
+        elif str(env[v]) != "":
+            out.append(f"{rel} [{name}]: agent step holds {v}={env[v]!r}")
+    blob = yaml.safe_dump({k: st[k] for k in st if k != "name"})
+    m = TOKEN_EXPR_RE.search(blob)
+    if m:
+        out.append(f"{rel} [{name}]: agent step interpolates a token: {m.group(0)}")
+
+
+fails = []
+
+# --- Phase 1: every shipped action, discovered by glob, not hand-listed. ---
+# EXPECTED is a vacuity guard only (a detector that finds nothing reports
+# clean): every agent step known to ship must be found by name.
 EXPECTED = {
     ".github/actions/issue-to-pr/action.yml": ["Resolve the issue to a patch"],
     "action.yml": ["Run loki review", "Run loki fix", "Run loki test"],
 }
-TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
-AGENT_RE = re.compile(r"(^|[\s;&|(`])(loki|npx\s+loki-mode)\s+(start|run|heal)\b", re.M)
-TOKEN_EXPR_RE = re.compile(r"\$\{\{[^}]*(github\.token|github_token|GITHUB_TOKEN|GH_TOKEN)[^}]*\}\}")
+action_files = set(EXPECTED)
+for p in glob.glob(os.path.join(root, ".github/actions/*/action.yml")):
+    action_files.add(os.path.relpath(p, root))
+if os.path.exists(os.path.join(root, "action.yml")):
+    action_files.add("action.yml")
 
-fails, passes = [], 0
-for rel, expected in EXPECTED.items():
+shipped_passes = 0
+for rel in sorted(action_files):
     path = os.path.join(root, rel)
     try:
-        doc = yaml.safe_load(open(path))
-        steps = doc["runs"]["steps"]
+        steps = list(agent_steps(path))
     except Exception as e:
         fails.append(f"{rel}: cannot read steps ({e})")
         continue
-    agent_names = []
-    for i, st in enumerate(steps):
-        # Drop shell comment lines: prose like "the loki run this job owns" is
-        # not an invocation.
-        run = "\n".join(l for l in str(st.get("run", "")).splitlines()
-                        if not l.lstrip().startswith("#"))
-        if not AGENT_RE.search(run):
-            continue
-        name = st.get("name", f"step {i}")
-        agent_names.append(name)
-        env = st.get("env") or {}
-        for v in TOKEN_VARS:
-            if v not in env:
-                fails.append(f"{rel} [{name}]: {v} not explicitly blanked (inherits caller env)")
-            elif str(env[v]) != "":
-                fails.append(f"{rel} [{name}]: agent step holds {v}={env[v]!r}")
-        blob = yaml.safe_dump({k: st[k] for k in st if k != "name"})
-        m = TOKEN_EXPR_RE.search(blob)
-        if m:
-            fails.append(f"{rel} [{name}]: agent step interpolates a token: {m.group(0)}")
-        passes += 1
-    for want in expected:
-        if not any(n.startswith(want) for n in agent_names):
-            fails.append(f"{rel}: expected agent step '{want}' not detected (found {agent_names})")
+    names = [n for n, _ in steps]
+    for name, st in steps:
+        check_step(rel, name, st, fails)
+        shipped_passes += 1
+    for want in EXPECTED.get(rel, []):
+        if not any(n.startswith(want) for n in names):
+            fails.append(f"{rel}: expected agent step '{want}' not detected (found {names})")
+
+print(f"  phase 1 (shipped actions, {len(action_files)} file(s) via glob): "
+      f"checked {shipped_passes} agent steps")
+
+# --- Phase 2: fixtures proving each previously-missed form is now caught. ---
+# Each fixture has an "Unblanked ..." step (must be flagged) and a
+# "Blanked ..." step in the SAME invocation form (must not be flagged, so the
+# detector isn't just failing every step in a file it touches).
+fixdir = os.path.join(root, "tests/fixtures/action-agent-step-forms")
+fixture_files = sorted(glob.glob(os.path.join(fixdir, "*.yml")))
+if not fixture_files:
+    fails.append(f"no fixtures found under {fixdir} (vacuous phase 2)")
+
+fixture_checks = 0
+for path in fixture_files:
+    rel = os.path.relpath(path, root)
+    steps = list(agent_steps(path))
+    names = [n for n, _ in steps]
+    if not any(n.lower().startswith("unblanked") for n in names):
+        fails.append(f"{rel}: detector did not recognize the unblanked form as an agent step (regression)")
+        continue
+    if not any(n.lower().startswith("blanked") for n in names):
+        fails.append(f"{rel}: detector did not recognize the blanked form as an agent step")
+        continue
+    for name, st in steps:
+        step_fails = []
+        check_step(rel, name, st, step_fails)
+        fixture_checks += 1
+        if name.lower().startswith("unblanked") and not step_fails:
+            fails.append(f"{rel} [{name}]: expected a token-holding failure but none was reported")
+        elif name.lower().startswith("blanked") and step_fails:
+            fails.extend(f"{rel} [{name}]: unexpected: {m}" for m in step_fails)
+
+print(f"  phase 2 (missed-form fixtures, {len(fixture_files)} file(s)): "
+      f"checked {fixture_checks} steps")
 
 for f in fails:
     print("  FAIL: " + f)
-print(f"  checked {passes} agent steps, {len(fails)} failures")
-sys.exit(1 if fails or passes == 0 else 0)
+total_checks = shipped_passes + fixture_checks
+print(f"  checked {total_checks} steps total, {len(fails)} failures")
+sys.exit(1 if fails or total_checks == 0 else 0)
 PY
