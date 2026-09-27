@@ -558,7 +558,9 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 #      appears anywhere in a catch body (`catch {`, `.catch(() => {...})`), or
 #      is an operand of `||`/`??`, or is either branch of a ternary whose OTHER
 #      branch is not also a literal, or is the right-hand side of `this._x =`
-#      or of a local that later flows into a setter/useState/`this.y =`, or is
+#      or of a local that later flows into a setter/useState/`this.y =` (at
+#      declaration, `const/let/var x = [rows]`, OR a later bare reassignment
+#      `x = [rows]` after x was already declared), or is
 #      the argument of Array.of() or the first argument of Array.from(). A row
 #      is literal when every value is a string, number, boolean, null, a
 #      `new Date(...)`/`Date.now()` expression, `as const`, or a nested literal
@@ -770,6 +772,15 @@ def ternary_colon_of(s, q):
 #     on): a named module-level table (DEFAULT_PROVIDERS, DEFAULT_PERMISSIONS,
 #     COLUMNS, GALLERY, TABS) is a negative control even when it seeds
 #     useState, matching how the reviewer scoped this arm to "a local".
+#   REASSIGN_ARR (BACKLOG 125 B-1): a bare `x = [rows]` occurring AFTER x's own
+#     declaration, not only at `const/let/var x = [rows]` (DECL_ARR's site).
+#     `let rows = data; if (!rows.length) rows = [invented rows]; setRows(rows);`
+#     reassigns rows to a fabricated fallback inside a guard, with no `const/
+#     let/var` at that point, so DECL_ARR never fires. Reuses the identical
+#     FLOWS_TO_STATE_TMPL flow check DECL_ARR uses, so the sink-detection is not
+#     reimplemented, only the "where can the array literal appear" site is
+#     widened. Excludes `this.x =`/`obj.x =` (own lookbehind; THIS_ARR already
+#     owns `this.`), `==`/`===`/`=>`, and the declaration site itself.
 #   ponytail: three structural gaps this arm cannot see, all pre-existing at
 #   HEAD: a render-local literal list fed straight to .map() with no setter in
 #   between (TABS/filters/severities-style UI config has the same shape); an
@@ -788,6 +799,13 @@ ARRAY_OF = re.compile(r'\bArray\.(of|from)\s*\(')
 MODULE_DECL = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:const|let|var)\s', re.M)
 DECL_ARR = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
 THIS_ARR = re.compile(r'\bthis\.([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
+# BACKLOG 125 B-1: a bare REASSIGNMENT after declaration (`let rows = data;`
+# ... later ... `rows = [...]`), which DECL_ARR cannot see because there is no
+# `const/let/var` at that point. `(?<![\w$.])` excludes `obj.rows =`/`this.rows
+# =` (THIS_ARR already owns the `this.` case) and a compound assignment
+# (`+=`); `=(?![=>])` excludes `==`, `===` and `=>` the same as DECL_ARR.
+REASSIGN_ARR = re.compile(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*\[')
+DECL_KEYWORD = re.compile(r'\b(?:const|let|var)\s*$')
 FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?'
                        r'{name}\s*[,)]|\bthis\.\w+\s*=\s*{name}\b')
 DEMO_NAME = re.compile(r'(?:\b(?:const|let|var)\s+|\bthis\.)([A-Za-z_$][\w$]*)\s*(?::[^=;]*?)?=(?![=>])\s*([\[{])')
@@ -899,6 +917,12 @@ def whole_file_findings(s):
             add_rows(m.end() - 1, 'literal sample rows assigned to ' + name)
     for m in THIS_ARR.finditer(s):
         add_rows(m.end() - 1, 'literal sample rows assigned to this.' + m.group(1))
+    for m in REASSIGN_ARR.finditer(s):
+        name = m.group(1)
+        if DECL_KEYWORD.search(s, 0, m.start(1)):
+            continue  # a declaration site: DECL_ARR already owns `const/let/var x = [`
+        if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(name)), s):
+            add_rows(m.end() - 1, 'literal sample rows reassigned to ' + name)
     for m in SETTER.finditer(s):
         i = m.end()
         if i < len(s) and s[i] == '<':
@@ -1253,6 +1277,33 @@ export function DL() {
   return null;
 }
 TSX
+    # BACKLOG 125 B-1: a bare reassignment AFTER declaration, not at `const/let/
+    # var x = [`. DECL_ARR only ever matches the declaration site, so
+    # `let rows = data;` followed by a later `rows = [...]` inside a guard was
+    # invisible to every existing arm. The name flows to setRows() the same way
+    # DECL_ARR's own fixtures prove flow, so REASSIGN_ARR reuses that same
+    # FLOWS_TO_STATE_TMPL check rather than re-deriving "flows to a sink".
+    cat > "$d/src/components/ReassignFallback.tsx" <<'TSX'
+export function RF({ data }) {
+  let rows = data;
+  if (!rows.length) rows = [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  setRows(rows);
+  return null;
+}
+TSX
+    # Negative control for the same shape: the reassignment builds an object
+    # row from a real API response (a variable value, not a typed-in literal),
+    # so REASSIGN_ARR's regex fires but literal_rows() must reject it because
+    # `id: res.id` is not a literal value. Proves the arm gates on content, not
+    # merely on the `name = [` shape.
+    cat > "$d/src/components/ReassignHonest.tsx" <<'TSX'
+export function RH({ data, res }) {
+  let rows = data;
+  if (!rows.length) rows = [{ id: res.id, action: res.action }];
+  setRows(rows);
+  return null;
+}
+TSX
     # Negative controls for the rule 6 extension: a ternary between two
     # literals (advisorOpts, real shape at loki-session-control.js:471), a
     # render-local literal list mapped straight into markup with no setter, a
@@ -1364,6 +1415,7 @@ ArrayFromOnly.js:3|literal sample rows via Array.from()
 DeclPlainSetter.tsx:2|literal sample rows assigned to rows
 ThisFlowOnly.js:3|literal sample rows assigned to rows
 DeclLazyUseState.tsx:2|literal sample rows assigned to items
+ReassignFallback.tsx:3|literal sample rows reassigned to rows
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -1372,6 +1424,7 @@ EOF
         TernaryQBranch.tsx:1 DeclFlowsToState.tsx:1 DeclGenericUseState.tsx:1 \
         ThisArrOnly.js:1 SetterSpanOnly.tsx:1 ArrayFromOnly.js:1 DeclPlainSetter.tsx:1 \
         ThisFlowOnly.js:1 DeclLazyUseState.tsx:1 \
+        ReassignFallback.tsx:1 ReassignHonest.tsx:0 \
         AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
         ModuleTablesHonest.tsx:0 TimerHonest.tsx:0; do
         f="${want%%:*}"
