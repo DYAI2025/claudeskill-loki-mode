@@ -1343,7 +1343,8 @@ fi
 # status catch) completely untested; deleting any of those must still pass 48
 # tests without this one). An unresolvable tool (no sha256sum/shasum anywhere)
 # is a DIFFERENT, harmless case verified separately: it falls back to the
-# python3 -I path, which still computes a real digest. Before this rework,
+# python3 -I -S path (BACKLOG 131(b)), which still computes a real digest.
+# Before this rework,
 # sealing "? ?" directly left _LOKI_SNAPSHOT_SEAL="? ?" and
 # _LOKI_SNAPSHOT_THIS_RUN=1: a later verify would recompute the same "? ?"
 # (same lying tool) and see a MATCH, never disarming the guard it should have
@@ -2776,6 +2777,261 @@ if [ "${mut_secret_out:-0}" -ge 1 ] 2>/dev/null; then
     pass "mutation detected: with the scan disabled, config.js IS committed (T-secret-abort is non-vacuous)"
 else
     fail "MUTATION NOT DETECTED: config.js not committed even with the scan disabled (T-secret-abort is vacuous!)" "grep_count=$mut_secret_out"
+fi
+
+# =============================================================================
+# Test T-snapshot-digest-pth-fallback (BACKLOG 131(b)): _loki_snapshot_digest's
+# python3 fallback (used only when neither sha256sum nor shasum resolves
+# anywhere on PATH) must route through _loki_snapshot_py_tool and run with
+# -I -S, not a bare `python3 -I`. A reviewer reproduced, on a sibling function
+# in this same tamper-detection system, that a .pth file planted in a
+# same-UID-writable site-packages directory still fires under `python3 -I`
+# alone: -I implies -s (skip USER site-packages) but does not skip the
+# resolved interpreter's OWN site-packages directory, which on a
+# Homebrew-installed python3 is itself user-writable. Only -I -S (also skip
+# ALL site-packages, including the interpreter's own) closes it.
+#
+# Fixture: a throwaway venv created under WORKROOT (never a shared/system
+# site-packages -- this environment runs many concurrent agents sharing some
+# system Python locations, and a leaked .pth there would affect every one of
+# them). Under -I, site.py still adds a venv's OWN site-packages (only user
+# site is skipped); -S removes it too, same shape as the real Homebrew gap.
+# A .pth "import module" planted in the venv's site-packages overrides
+# builtins.print to always emit a fixed, well-formed, STALE two-field digest.
+# Forging the digest (not silencing it) matches the real attack shape already
+# proven for the awk bypass earlier in this file: an empty/failed digest only
+# fails the seal closed (a DoS), but a forged, well-formed, CONSISTENT stale
+# digest seals cleanly and then matches itself again after a real edit,
+# hiding the tamper. The fallback's python output is never hex-validated by
+# the caller (that validation lives only on the sha256sum/shasum path above),
+# so a well-formed-looking forged string is trusted as-is.
+#
+# Non-vacuity: a positive control proves the plant fires under -I alone and
+# is inert under -I -S on THIS interpreter before any PASS/FAIL is trusted. A
+# RED run against a sed'd copy of _loki_snapshot_digest (restored to bare
+# `python3 -I`) must reproduce the bypass. A second mutation that removes only
+# the -S flag (keeping the _loki_snapshot_py_tool routing) must ALSO
+# reproduce the bypass, proving -S specifically -- not just the routing -- is
+# load-bearing. The fixed code must resist both.
+# =============================================================================
+echo "Test T-snapshot-digest-pth-fallback (BACKLOG 131(b)): python3 fallback closes the .pth hijack via _loki_snapshot_py_tool (-I -S)"
+
+PTHVENV="$WORKROOT/pthvenv"
+_pth_venv_ok=1
+python3 -m venv --without-pip "$PTHVENV" >/dev/null 2>&1 || _pth_venv_ok=0
+PTHVENV_PY="$PTHVENV/bin/python3"
+[ "$_pth_venv_ok" = 1 ] && [ -x "$PTHVENV_PY" ] || _pth_venv_ok=0
+
+if [ "$_pth_venv_ok" != 1 ]; then
+    fail "SKIP: could not create a throwaway venv (python3 -m venv unavailable) -- T-snapshot-digest-pth-fallback did not run"
+else
+    PTH_SITE_PKGS="$("$PTHVENV_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null)"
+    if [ -z "$PTH_SITE_PKGS" ] || [ ! -d "$PTH_SITE_PKGS" ]; then
+        fail "SKIP: could not resolve the throwaway venv's site-packages dir -- T-snapshot-digest-pth-fallback did not run"
+    else
+        PTH_FILE="$PTH_SITE_PKGS/zzz_loki_s34.pth"
+        PTH_MOD="$PTH_SITE_PKGS/zzz_loki_s34.py"
+        STALE_DIGEST="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        printf 'import zzz_loki_s34\n' > "$PTH_FILE"
+        {
+            printf 'import builtins\n'
+            printf '_real_print = builtins.print\n'
+            printf 'def _forged_print(*a, **k):\n'
+            printf '    _real_print(%s)\n' "'$STALE_DIGEST'"
+            printf 'builtins.print = _forged_print\n'
+        } > "$PTH_MOD"
+
+        # Positive controls, run BEFORE trusting any result below.
+        ctrl_i_only="$("$PTHVENV_PY" -I -c 'print("real")' 2>/dev/null)"
+        ctrl_i_s="$("$PTHVENV_PY" -I -S -c 'print("real")' 2>/dev/null)"
+
+        # Drives _loki_snapshot_digest through the venv python with both hash
+        # tools forced unavailable. Args: <label> <digest-lib-to-source>
+        # Prints CALLED=<yes/no> MATCH=<yes/no>: CALLED proves
+        # _loki_snapshot_py_tool was actually invoked (so a fix using a bare,
+        # unresolved python3 -I -S would not get credit); MATCH=yes means the
+        # digest computed before a real file edit equals the digest computed
+        # after it -- the tamper went undetected (the bypass signature).
+        #
+        # A RED/mutation lib drops the _loki_snapshot_py_tool routing and
+        # falls back to a bare, unresolved `python3`, which trusts whatever is
+        # first on PATH -- the same PATH-hijack shape already proven for the
+        # fake-awk-on-PATH test above. The second arg, when non-empty, is
+        # prepended to PATH so that bare `python3` resolves to the poisoned
+        # venv interpreter instead of the real system one, reproducing that
+        # exact attacker positioning; the GREEN (fixed) case never needs this,
+        # since it calls the stubbed _loki_snapshot_py_tool directly and
+        # ignores PATH entirely.
+        _run_pth_case() {
+            local lib="$1" path_prefix="${2:-}" repo
+            repo="$WORKROOT/tpth-$(basename "$lib" .sh)"
+            mkdir -p "$repo"
+            (
+                cd "$repo" || exit 1
+                log_info()  { :; }
+                log_warn()  { :; }
+                log_error() { :; }
+                audit_log() { return 0; }
+                audit_agent_action() { return 0; }
+                # shellcheck disable=SC1090
+                source "$ADVISORY_LIB"
+                # shellcheck disable=SC1090
+                source "$lib"
+                SCRIPT_DIR="$PROJECT_DIR/autonomy"
+                _loki_snapshot_hash_tool() { return 1; }
+                called_marker="$repo/.pytool-called"
+                rm -f "$called_marker"
+                _loki_snapshot_py_tool() { : > "$called_marker"; printf '%s\n' "$PTHVENV_PY"; }
+                [ -n "$path_prefix" ] && PATH="$path_prefix:$PATH"
+                mkdir -p .loki/state
+                printf 'pre-existing\n' > .loki/state/preexisting-untracked.z
+                printf 'pre-existing-sha\n' > .loki/state/preexisting-untracked.sha.z
+                sealed="$(_loki_snapshot_digest)"
+                called="$( [ -f "$called_marker" ] && echo yes || echo no )"
+                printf 'agent edit\n' >> .loki/state/preexisting-untracked.z
+                live="$(_loki_snapshot_digest)"
+                match="$( [ "$live" = "$sealed" ] && echo yes || echo no )"
+                printf 'CALLED=%s MATCH=%s' "$called" "$match"
+            )
+        }
+
+        if [ "$ctrl_i_only" != "$STALE_DIGEST" ] || [ "$ctrl_i_s" != "real" ]; then
+            fail "SKIP: fixture did not reproduce the .pth gap on this interpreter (ctrl_i_only=$ctrl_i_only ctrl_i_s=$ctrl_i_s) -- cannot trust the cases below"
+        else
+            # GREEN: current (fixed) BRANCH_LIB. -I -S means the .pth never
+            # fires, so both seal and live compute the REAL sha256 of the file
+            # at that moment -- they legitimately differ after the edit.
+            green_out="$(_run_pth_case "$BRANCH_LIB")"
+            if [ "$green_out" = "CALLED=yes MATCH=no" ]; then
+                pass "fixed fallback: routes through _loki_snapshot_py_tool (confirmed called) and -I -S keeps the .pth inert, so a real post-seal edit is correctly detected as a mismatch"
+            else
+                fail "fixed fallback did not behave as expected" "got: $green_out"
+            fi
+
+            # RED: restore the pre-fix shape (bare python3 -I, no resolver) by
+            # replacing, in a copy of BRANCH_LIB, ONLY the two exact lines the
+            # real fix touched: the resolve line becomes a no-op assignment
+            # (pytool unused by the bare invocation below it, but kept defined
+            # so `local pytool=""` above it is unaffected) and the invocation
+            # line drops "$pytool" -I -S for a bare python3 -I. This mutates
+            # the SAME two lines the fix introduced, so it cannot also match
+            # inside _loki_untracked_merge / _loki_covered_paths, which never
+            # contain "|| return 1" on their pytool line.
+            RED_PTH_LIB="$WORKROOT/red-pth-lib.sh"
+            sed -e 's/pytool="\$(_loki_snapshot_py_tool)" || return 1/pytool=""/' \
+                -e 's/"\$pytool" -I -S -c/python3 -I -c/' \
+                "$BRANCH_LIB" > "$RED_PTH_LIB"
+            red_digest_range="$(awk '/^_loki_snapshot_digest\(\) \{/{p=1} p{print} p&&/^}/{exit}' "$RED_PTH_LIB")"
+            red_bare_present="$(printf '%s\n' "$red_digest_range" | grep -c 'python3 -I -c')"
+            red_pytool_gone="$(printf '%s\n' "$red_digest_range" | grep -c '_loki_snapshot_py_tool)" || return 1')"
+            if [ "$red_bare_present" -ge 1 ] && [ "$red_pytool_gone" = 0 ]; then
+                red_out="$(_run_pth_case "$RED_PTH_LIB" "$PTHVENV/bin")"
+                if [ "$red_out" = "CALLED=no MATCH=yes" ]; then
+                    pass "RED confirmed: reverting to a bare python3 -I fallback lets the .pth hijack forge a stable stale digest, so a real post-seal edit is NOT detected (non-vacuous)"
+                else
+                    fail "RED reproduction did not show the pre-fix .pth-bypass behavior" "got: $red_out"
+                fi
+            else
+                fail "RED fixture setup failed (sed/awk pattern drift): could not produce a bare-python3-I copy of _loki_snapshot_digest" \
+                    "bare_present=$red_bare_present pytool_gone=$red_pytool_gone"
+            fi
+
+            # Mutation: keep the _loki_snapshot_py_tool routing, drop ONLY the
+            # -S flag. Must ALSO reproduce the bypass -- proves -S specifically
+            # (not just the routing) is the load-bearing fix for BACKLOG 131(b).
+            MUT_NOS_LIB="$WORKROOT/mut-nos-lib.sh"
+            sed 's/"\$pytool" -I -S -c/"$pytool" -I -c/' "$BRANCH_LIB" > "$MUT_NOS_LIB"
+            mut_nos_range="$(awk '/^_loki_snapshot_digest\(\) \{/{p=1} p{print} p&&/^}/{exit}' "$MUT_NOS_LIB")"
+            mut_nos_present="$(printf '%s\n' "$mut_nos_range" | grep -c '"\$pytool" -I -c')"
+            mut_nos_still_routes="$(printf '%s\n' "$mut_nos_range" | grep -c '_loki_snapshot_py_tool')"
+            if [ "$mut_nos_present" -ge 1 ] && [ "$mut_nos_still_routes" -ge 1 ]; then
+                mut_nos_out="$(_run_pth_case "$MUT_NOS_LIB")"
+                if [ "$mut_nos_out" = "CALLED=yes MATCH=yes" ]; then
+                    pass "mutation detected: dropping only -S (keeping the resolver routing) reopens the .pth hijack -- -S is the load-bearing flag, not just the routing (non-vacuous)"
+                else
+                    fail "MUTATION NOT DETECTED: dropping -S alone did not reopen the bypass" "got: $mut_nos_out"
+                fi
+            else
+                fail "mutation fixture setup failed (sed pattern drift): could not produce a -S-dropped copy of _loki_snapshot_digest" \
+                    "present=$mut_nos_present still_routes=$mut_nos_still_routes"
+            fi
+
+            # Legitimate case (no attacker): both hash tools genuinely
+            # unavailable, no .pth planted anywhere, the REAL system python3
+            # used (not the venv). The fixed fallback's digest must be
+            # byte-identical to (a) what the unfixed code would have produced
+            # in this same non-adversarial case, and (b) an independent oracle
+            # (sha256sum/shasum computed outside the function under test),
+            # including the "-" absent-file sentinel.
+            LEGIT_REPO="$WORKROOT/tpth-legit"
+            mkdir -p "$LEGIT_REPO"
+            printf 'pre-existing\n' > "$LEGIT_REPO/a.z"
+            oracle_tool=""
+            for c in sha256sum shasum; do
+                command -v "$c" >/dev/null 2>&1 && { oracle_tool="$c"; break; }
+            done
+            if [ -n "$oracle_tool" ]; then
+                if [ "$oracle_tool" = "shasum" ]; then
+                    oracle_hash="$(shasum -a 256 -- "$LEGIT_REPO/a.z" | awk '{print $1}')"
+                else
+                    oracle_hash="$(sha256sum -- "$LEGIT_REPO/a.z" | awk '{print $1}')"
+                fi
+            else
+                oracle_hash=""
+            fi
+            legit_out="$(
+                cd "$LEGIT_REPO" || exit 1
+                log_info()  { :; }
+                log_warn()  { :; }
+                log_error() { :; }
+                audit_log() { return 0; }
+                audit_agent_action() { return 0; }
+                # shellcheck disable=SC1090
+                source "$ADVISORY_LIB"
+                # shellcheck disable=SC1090
+                source "$BRANCH_LIB"
+                SCRIPT_DIR="$PROJECT_DIR/autonomy"
+                _loki_snapshot_hash_tool() { return 1; }
+                mkdir -p .loki/state
+                cp a.z .loki/state/preexisting-untracked.z
+                _loki_snapshot_digest
+            )"
+            legit_out_unfixed="$(
+                cd "$LEGIT_REPO" || exit 1
+                log_info()  { :; }
+                log_warn()  { :; }
+                log_error() { :; }
+                audit_log() { return 0; }
+                audit_agent_action() { return 0; }
+                # shellcheck disable=SC1090
+                source "$ADVISORY_LIB"
+                # shellcheck disable=SC1090
+                source "$RED_PTH_LIB"
+                SCRIPT_DIR="$PROJECT_DIR/autonomy"
+                _loki_snapshot_hash_tool() { return 1; }
+                mkdir -p .loki/state
+                cp a.z .loki/state/preexisting-untracked.z
+                _loki_snapshot_digest
+            )"
+            legit_expected="$oracle_hash -"
+            if [ -z "$oracle_tool" ]; then
+                fail "SKIP: no sha256sum/shasum available on this host to build an independent oracle -- legitimate-case parity not checked"
+            elif [ "$legit_out" = "$legit_expected" ] && [ "$legit_out" = "$legit_out_unfixed" ]; then
+                pass "legitimate case (no attacker, both hash tools genuinely unavailable): fixed fallback's digest matches an independent sha256 oracle AND is byte-identical to the pre-fix fallback's output"
+            else
+                fail "legitimate-case digest mismatch" "fixed=$legit_out unfixed=$legit_out_unfixed oracle_expected=$legit_expected"
+            fi
+        fi
+
+        rm -f "$PTH_FILE" "$PTH_MOD"
+        _pth_leftover=""
+        for _f in "$PTH_SITE_PKGS"/zzz_loki_s34*; do
+            [ -e "$_f" ] && _pth_leftover="$_pth_leftover $_f"
+        done
+        if [ -n "$_pth_leftover" ]; then
+            fail "leftover .pth/module found in the throwaway venv's site-packages after cleanup" "$_pth_leftover"
+        fi
+    fi
 fi
 
 # =============================================================================

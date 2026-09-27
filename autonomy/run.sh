@@ -9421,11 +9421,15 @@ _loki_snapshot_hash_tool() {
 # which a user-writable directory ahead of the system dirs (e.g. Homebrew's
 # prefix on macOS) can shadow -- not fully closed, only narrowed to hosts
 # lacking the standard tool paths; the python3 fallback below, kept only for
-# the extremely rare host with neither tool anywhere, is not proof against the
-# .pth class this function exists to close -- that path additionally hardens
-# with -I (isolated mode: also disables user site-packages, stronger than -E)
-# but remains narrower than the shasum/sha256sum path on a host where
-# Homebrew's system site-packages is itself user-writable.
+# the extremely rare host with neither tool anywhere, is resolved via
+# _loki_snapshot_py_tool and run with -I -S (BACKLOG 131(b) -- see the comment
+# at that fallback for why -S, not just -I, is required to close the .pth
+# class), so it carries the same fixed-root-path-first resolution and
+# site-packages exclusion as the other hardened call sites in this file. It
+# still inherits _loki_snapshot_py_tool's own accepted gaps (documented at
+# that function): replacing the interpreter AT ONE OF ITS FIXED PATHS requires
+# root, and its own PATH-walk fallback still trusts whatever sits first on an
+# absolute PATH entry on a host lacking those fixed paths.
 _loki_snapshot_digest() {
     local tool
     tool="$(_loki_snapshot_hash_tool)" || tool=""
@@ -9464,10 +9468,17 @@ _loki_snapshot_digest() {
         return 0
     fi
     # Fallback: neither sha256sum nor shasum found anywhere checked above
-    # (extremely rare on macOS/Linux). -I is isolated mode: stronger than -E,
-    # also disables user site-packages, but this remains narrower than the
-    # tool-based path above on a host whose Python ships a hijackable system
-    # site-packages outside the user's control (see comment above). Additional
+    # (extremely rare on macOS/Linux). Resolved via _loki_snapshot_py_tool
+    # (fixed root-owned path first) and run with -I -S, the same BACKLOG 129
+    # pattern used at _loki_untracked_merge / _loki_covered_paths: -I alone is
+    # NOT enough -- a reviewer reproduced, on a sibling function in this same
+    # tamper-detection system, that a .pth file planted in Homebrew python3's
+    # own (user-writable) site-packages directory still fires under `python3
+    # -I` alone, since -I implies -s (skip user site-packages) but does not
+    # skip the resolved interpreter's OWN site-packages. Only -S (skip ALL
+    # site-packages, including the interpreter's own) closes that. A resolve
+    # failure degrades this fallback to printing nothing, same as any other
+    # failure path here (caller treats empty as "could not seal"). Additional
     # accepted gap specific to this fallback (not present on the tool-based
     # path above, which distinguishes "-" from "?"): OSError covers BOTH
     # "file does not exist" and "file exists but is unreadable" here, so an
@@ -9478,7 +9489,9 @@ _loki_snapshot_digest() {
     # for present-but-unreadable) is straightforward but left undone here: this
     # fallback only runs on a host with neither sha256sum nor shasum anywhere,
     # already the rare case this whole function treats as a residual gap.
-    python3 -I -c 'import sys, hashlib, os
+    local pytool=""
+    pytool="$(_loki_snapshot_py_tool)" || return 1
+    "$pytool" -I -S -c 'import sys, hashlib
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 out = []
 for path in sys.argv[1:]:
