@@ -32,7 +32,11 @@ describe("withholdGithubTokens", () => {
     const warned: string[] = [];
     const removed = withholdGithubTokens(env, (l) => warned.push(l));
     expect(removed).toEqual(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]);
-    expect(env).toEqual({ KEEP: "x" });
+    expect(env["GH_TOKEN"]).toBeUndefined();
+    expect(env["GITHUB_TOKEN"]).toBeUndefined();
+    expect(env["GH_ENTERPRISE_TOKEN"]).toBeUndefined();
+    expect(env["GITHUB_ENTERPRISE_TOKEN"]).toBeUndefined();
+    expect(env["KEEP"]).toBe("x");
     expect(warned).toEqual([]);
   });
 
@@ -61,6 +65,33 @@ describe("withholdGithubTokens", () => {
     const warned: string[] = [];
     expect(withholdGithubTokens({ LOKI_ALLOW_AGENT_GITHUB_TOKEN: "1" }, (l) => warned.push(l))).toEqual([]);
     expect(warned).toEqual([]);
+  });
+
+  // BACKLOG 149: a hosts.yml-authenticated user (`gh auth login`, no
+  // GH_TOKEN/GITHUB_TOKEN set at all) is the case the 4-var withhold above
+  // cannot see. GH_CONFIG_DIR must still be scoped to a fresh, empty,
+  // non-default-looking directory so gh cannot resolve the real hosts.yml.
+  it("scopes GH_CONFIG_DIR to a fresh empty dir even with no token present", () => {
+    const env: NodeJS.ProcessEnv = { KEEP: "x" };
+    const removed = withholdGithubTokens(env);
+    expect(removed).toEqual([]);
+    const scoped = env["GH_CONFIG_DIR"];
+    expect(scoped).toBeTruthy();
+    expect(scoped).not.toBe("");
+    expect(env["KEEP"]).toBe("x");
+  });
+
+  it("does not scope GH_CONFIG_DIR under the opt-out", () => {
+    const env: NodeJS.ProcessEnv = { LOKI_ALLOW_AGENT_GITHUB_TOKEN: "1" };
+    withholdGithubTokens(env);
+    expect(env["GH_CONFIG_DIR"]).toBeUndefined();
+  });
+
+  it("scopes GH_CONFIG_DIR alongside removing tokens in the default case", () => {
+    const env: NodeJS.ProcessEnv = { GH_TOKEN: GH, GITHUB_TOKEN: GHA };
+    withholdGithubTokens(env);
+    expect(env["GH_TOKEN"]).toBeUndefined();
+    expect(env["GH_CONFIG_DIR"]).toBeTruthy();
   });
 });
 

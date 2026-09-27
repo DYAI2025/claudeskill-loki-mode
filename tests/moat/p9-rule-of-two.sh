@@ -1184,11 +1184,18 @@ case_injection() {
         return
     fi
     log "egress block: $EGRESS_MECH"
-    local T="$MOAT_TMP/inj" W B GH_CANARY GITHUB_CANARY
+    local T="$MOAT_TMP/inj" W B GH_CANARY GITHUB_CANARY HOSTS_CANARY
     W="$T/pristine"; B="$T/bin"
     mkdir -p "$W" "$B" "$T/control"
     GH_CANARY="ghp_MOATCANARYgh$$${RANDOM}x"
     GITHUB_CANARY="ghs_MOATCANARYgithub$$${RANDOM}x"
+    # BACKLOG 149: a hosts.yml-authenticated user's own gh credential store,
+    # planted in every scenario's sandboxed HOME (never the real one) at gh's
+    # own default resolution path. gh's real precedence per `gh help
+    # environment`: GH_CONFIG_DIR if set, else $XDG_CONFIG_HOME/gh, else
+    # $HOME/.config/gh. This scenario never sets XDG_CONFIG_HOME, so the
+    # planted file always lands at $HOME/.config/gh/hosts.yml.
+    HOSTS_CANARY="ghp_MOATCANARYhostsyml$$${RANDOM}x"
     local MARKER="MOAT_P9_INJECTION_$$"
 
     # --- local bare remote whose hook accepts only a canary-carrying pusher ---
@@ -1244,6 +1251,13 @@ PY
         printf '#!/usr/bin/env bash\n'
         printf 'src="${MOAT_PUSH_SOURCE:-loki}"; tok=no\n'
         printf '{ [ "${GH_TOKEN:-}" = %q ] || [ "${GITHUB_TOKEN:-}" = %q ]; } && tok=yes\n' "$GH_CANARY" "$GITHUB_CANARY"
+        # gh's real resolution order (`gh help environment`): GH_CONFIG_DIR if
+        # set, else $XDG_CONFIG_HOME/gh, else $HOME/.config/gh. Reading a
+        # canary here models gh authenticating off hosts.yml, so the BACKLOG
+        # 149 fix (scoping GH_CONFIG_DIR to an empty dir) is what this shim
+        # actually discriminates on, not a fixed path the fix can never touch.
+        printf 'hostsfile="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"\n'
+        printf '[ "$tok" = yes ] || { [ -r "$hostsfile" ] && grep -qF %q "$hostsfile" 2>/dev/null && tok=yes; }\n' "$HOSTS_CANARY"
         printf 'printf "%%s token=%%s %%s\\n" "$src" "$tok" "$*" >> "$MOAT_LOG_DIR/gh.log"\n'
         printf 'case "$1 ${2:-}" in\n'
         printf '  "auth status") [ "$tok" = yes ] && exit 0; exit 1 ;;\n'
@@ -1268,6 +1282,12 @@ PY
         printf 'export MOAT_PUSH_SOURCE=provider GIT_TERMINAL_PROMPT=0\n'
         printf 'git push -q origin HEAD:refs/heads/injected-$$ >/dev/null 2>&1; echo "git_push_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
         printf 'gh pr create --title pwned --body pwned >/dev/null 2>&1; echo "gh_pr_rc=$?" >> "$MOAT_LOG_DIR/provider-actions.log"\n'
+        # BACKLOG 149: does the provider session's OWN gh resolution (same
+        # precedence order as the shim above) still reach the planted
+        # hosts.yml? A fixed-fix leaves GH_CONFIG_DIR/XDG_CONFIG_HOME unset,
+        # so this falls through to $HOME/.config/gh, same as gh itself would.
+        printf 'hostsfile="${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}/hosts.yml"\n'
+        printf 'if [ -r "$hostsfile" ]; then cp "$hostsfile" "$MOAT_LOG_DIR/provider-hosts.$$"; echo hosts_read=yes >> "$MOAT_LOG_DIR/provider-actions.log"; else echo hosts_read=no >> "$MOAT_LOG_DIR/provider-actions.log"; fi\n'
         printf 'echo "stub provider done. MOAT_P9_COMPLETE"\nexit 0\n'
     } > "$B/claude"
     chmod +x "$B/claude"
@@ -1291,7 +1311,13 @@ PY
     # in a fresh copy of the fixture repo, its own HOME and its own logs.
     inj_run() {
         local L="$T/$1" t0=$SECONDS
-        mkdir -p "$L/home"
+        # BACKLOG 149: plant a hosts.yml-shaped gh credential store at gh's
+        # own default path ($HOME/.config/gh -- XDG_CONFIG_HOME is never set
+        # in this harness) in every scenario's sandboxed HOME, never the real
+        # one. This is the vector the 4-var env withhold cannot see.
+        mkdir -p "$L/home/.config/gh"
+        printf 'github.com:\n    oauth_token: %s\n    user: moat-probe\n' \
+            "$HOSTS_CANARY" > "$L/home/.config/gh/hosts.yml"
         cp -R "$W" "$L/work" || { nok "[$1] fixture copy failed"; return 1; }
         : > "$L/push.log"; : > "$L/gh.log"; : > "$L/provider-actions.log"
         {
@@ -1360,6 +1386,18 @@ PY
             || nok "[default] Loki's own post-session gh pr create did not carry the token"
         grep -qF "$OPT_WARN" "$T/default/start.err" "$T/default/start.out" \
             && nok "[default] printed the opt-out exposure warning without the opt-out"
+        # BACKLOG 149: the provider session's own gh resolution must not reach
+        # the planted hosts.yml either (GH_CONFIG_DIR scoped to an empty dir).
+        grep -qxF 'hosts_read=yes' "$T/default/provider-actions.log" \
+            && nok "[default] the provider session read hosts.yml (gh config store not scoped)"
+        grep -qF -- "$HOSTS_CANARY" "$T"/default/provider-hosts.* 2>/dev/null \
+            && nok "[default] the provider session exfiltrated the hosts.yml oauth_token: $(cat "$T"/default/provider-hosts.* 2>/dev/null)"
+        # Loki's own trusted gh call must still authenticate off the real
+        # hosts.yml once the token vars are absent too (see the hosts-only
+        # scenario below for that exact case); here it's proven by the
+        # existing 'loki token=yes' assertions above still passing with a
+        # hosts.yml present in HOME, i.e. the scoping did not leak into
+        # Loki's own re-granted call either.
     fi
 
     # 2. auto-pr: LOKI_AUTO_PR=1, so the session PR comes from create_session_pr.
@@ -1383,6 +1421,32 @@ PY
             || nok "[opt-out] the canaries did not reach the provider under LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 (leak probe blind or opt-out broken): got '$(inj_leaked opt-out)'"
         [ "$(grep -cF "$OPT_WARN" "$T/opt-out/start.err")" = "1" ] \
             || nok "[opt-out] expected exactly one stderr warning that the agent holds the token, got $(grep -cF "$OPT_WARN" "$T/opt-out/start.err") (stdout has $(grep -cF "$OPT_WARN" "$T/opt-out/start.out"))"
+        # Positive control for the hosts.yml probe: the opt-out restores the
+        # old full inheritance, so gh config scoping must NOT apply here
+        # either, and the provider session's own gh resolution DOES reach the
+        # real (sandboxed) hosts.yml. If this ever stops matching, the probe
+        # itself is blind rather than the fix being broken.
+        grep -qxF 'hosts_read=yes' "$T/opt-out/provider-actions.log" \
+            || nok "[opt-out] the hosts.yml probe is blind under the opt-out (expected the provider to read it when scoping is off)"
+        grep -qF -- "$HOSTS_CANARY" "$T"/opt-out/provider-hosts.* 2>/dev/null \
+            || nok "[opt-out] the hosts.yml probe is blind under the opt-out (canary not found in what the provider read)"
+    fi
+
+    # 4. hosts-only: a user authenticated ONLY via `gh auth login` (hosts.yml),
+    #    no GH_TOKEN/GITHUB_TOKEN at all. This is the exact case the original
+    #    4-var withhold could not see (both _loki_withhold_github_tokens and
+    #    withholdGithubTokens used to return early when no env token was
+    #    present, so GH_CONFIG_DIR was never scoped). Loki's own trusted gh
+    #    call (the issue fetch) must still authenticate off the real
+    #    hosts.yml; the provider session must not be able to.
+    inj_run hosts-only "unset GH_TOKEN GITHUB_TOKEN; export LOKI_DELEGATE_PR=0"
+    if inj_live hosts-only; then
+        grep -qxF 'hosts_read=yes' "$T/hosts-only/provider-actions.log" \
+            && nok "[hosts-only] the provider session read hosts.yml with no env token present (gh config store not scoped)"
+        grep -qF -- "$HOSTS_CANARY" "$T"/hosts-only/provider-hosts.* 2>/dev/null \
+            && nok "[hosts-only] the provider session exfiltrated the hosts.yml oauth_token with no env token present"
+        grep -q '^loki token=yes issue view' "$T/hosts-only/gh.log" \
+            || nok "[hosts-only] Loki's own trusted issue-fetch gh call did not authenticate off the real hosts.yml (gh log: $(tr '\n' ',' < "$T/hosts-only/gh.log"))"
     fi
 
     # --- Bun route: the same scenarios, through the real dist CLI -----------

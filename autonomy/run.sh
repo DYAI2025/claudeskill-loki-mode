@@ -5350,26 +5350,58 @@ except Exception:
 #   - _loki_with_github_tokens <cmd...>, for the post-session push/PR paths.
 # LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 (exact value) restores the old inheritance
 # and prints one stderr warning that the agent holds the token.
+#
+# BACKLOG 149: the 4-var withhold above does not cover a user who is
+# authenticated to gh via its own credential store (~/.config/gh/hosts.yml,
+# `gh auth login`) rather than via GH_TOKEN/GITHUB_TOKEN. The provider's real
+# $HOME stays live by design (F49, see the build-time-sandbox comment above),
+# so an agent session's own `gh` invocation would still resolve that file and
+# push/open a PR with the user's real credentials -- no env var involved. Fix:
+# scope GH_CONFIG_DIR (gh's own documented override, `gh help environment`) to
+# a fresh empty directory for the duration of the session, whether or not any
+# GH_TOKEN-family var was present, unless the operator opted out. GH_CONFIG_DIR
+# takes precedence over $XDG_CONFIG_HOME/gh and $HOME/.config/gh (in that
+# order) once it is set to any non-empty value, so nothing else needs to move.
+# $HOME itself is untouched, so Claude's own OAuth (F49) keeps working.
+# Loki's own trusted calls (gh() below, _loki_with_github_tokens) restore the
+# real GH_CONFIG_DIR (or its absence) around the one command, exactly like the
+# token re-grant.
 # This is hygiene against a naive injection, not an isolation boundary: code
 # running as the same user can still read the parent's environment block
-# (/proc/<pid>/environ on Linux, sudo on a hosted runner). The boundary is a
-# CI job that holds no write token while the agent runs (see
+# (/proc/<pid>/environ on Linux, sudo on a hosted runner) or the hosts.yml
+# file directly off disk (F49 keeps $HOME live). The boundary is a CI job that
+# holds no write token while the agent runs (see
 # .github/workflows/loki-issue-to-pr.yml).
 #===============================================================================
 _LOKI_WITHHELD_TOKENS=""
+_LOKI_GH_CONFIG_SCOPED=""
+_LOKI_GH_CONFIG_DIR_HAD=""
+_LOKI_GH_CONFIG_DIR_OLD=""
 
 _loki_with_github_tokens() {
     local _v _rc=0
     for _v in $_LOKI_WITHHELD_TOKENS; do export "${_v?}"; done
+    if [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
+        if [ -n "$_LOKI_GH_CONFIG_DIR_HAD" ]; then
+            export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_DIR_OLD"
+        else
+            unset GH_CONFIG_DIR
+        fi
+    fi
     "$@" || _rc=$?
     for _v in $_LOKI_WITHHELD_TOKENS; do export -n "${_v?}"; done
+    if [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
+        export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_SCOPED"
+    fi
     return "$_rc"
 }
 
 _loki_withhold_github_tokens() {
     local _v _held=""
     # Operator opt-out (exact value 1): keep the earlier behavior, where the
-    # agent inherits the token. That is a Rule of Two exposure, so say so.
+    # agent inherits the token and the real gh config. That is a Rule of Two
+    # exposure, so say so. No GH_CONFIG_DIR scoping under the opt-out either --
+    # the point of this knob is the old, fully-inherited behavior.
     if [ "${LOKI_ALLOW_AGENT_GITHUB_TOKEN:-}" = "1" ]; then
         for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
             [ -n "${!_v:-}" ] && _held="${_held:+$_held }$_v"
@@ -5385,13 +5417,32 @@ _loki_withhold_github_tokens() {
             *) _LOKI_WITHHELD_TOKENS="${_LOKI_WITHHELD_TOKENS:+$_LOKI_WITHHELD_TOKENS }$_v" ;;
         esac
     done
-    [ -n "$_LOKI_WITHHELD_TOKENS" ] || return 0
-    # Only when the binary exists, so `command -v gh` keeps meaning "gh is
-    # installed" for every caller that checks it.
-    if command -v gh >/dev/null 2>&1; then
+    # Scope gh's own credential store unconditionally (not gated on any
+    # GH_TOKEN-family var being present): a user authenticated only via
+    # `gh auth login` (hosts.yml) has none of those vars set, and is exactly
+    # the case BACKLOG 149 covers. Idempotent: only scope once per process.
+    if [ -z "$_LOKI_GH_CONFIG_SCOPED" ]; then
+        local _empty_cfg
+        _empty_cfg="$(mktemp -d "${TMPDIR:-/tmp}/loki-gh-config.XXXXXX" 2>/dev/null)" || _empty_cfg=""
+        if [ -n "$_empty_cfg" ]; then
+            if [ -n "${GH_CONFIG_DIR+x}" ]; then
+                _LOKI_GH_CONFIG_DIR_HAD=1
+                _LOKI_GH_CONFIG_DIR_OLD="$GH_CONFIG_DIR"
+            fi
+            _LOKI_GH_CONFIG_SCOPED="$_empty_cfg"
+            export GH_CONFIG_DIR="$_empty_cfg"
+        fi
+    fi
+    # Define the gh() wrapper whenever either withhold is active (tokens,
+    # config scoping, or both), so a hosts.yml-only user's trusted `gh` calls
+    # still resolve their real config even when no env token was ever present.
+    if { [ -n "$_LOKI_WITHHELD_TOKENS" ] || [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; } \
+        && command -v gh >/dev/null 2>&1; then
         gh() { _loki_with_github_tokens command gh "$@"; }
     fi
-    log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS. Loki's own push and PR steps still use it."
+    if [ -n "$_LOKI_WITHHELD_TOKENS" ] || [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
+        log_info "Withheld from agent sessions (Rule of Two): ${_LOKI_WITHHELD_TOKENS:-no env tokens present}${_LOKI_GH_CONFIG_SCOPED:+, gh config store}. Loki's own push and PR steps still use it."
+    fi
 }
 
 #===============================================================================
@@ -27498,6 +27549,15 @@ _loki_session_exit_cleanup() {
     # completion-path reap for the rest of the run.
     _loki_remove_pgid_file
     _loki_remove_temp_self_copy
+    # BACKLOG 149: remove the per-run empty GH_CONFIG_DIR scoped by
+    # _loki_withhold_github_tokens. Same subshell guard as
+    # _loki_remove_pgid_file -- a subshell's EXIT trap must not delete the
+    # live parent's directory ($$ is stable across subshells, BASHPID is not).
+    if [ -n "${_LOKI_GH_CONFIG_SCOPED:-}" ] && [ "${BASHPID:-$$}" = "$$" ]; then
+        case "$_LOKI_GH_CONFIG_SCOPED" in
+            "${TMPDIR:-/tmp}"/loki-gh-config.*) rm -rf "$_LOKI_GH_CONFIG_SCOPED" 2>/dev/null || true ;;
+        esac
+    fi
     return "$exit_code"
 }
 
