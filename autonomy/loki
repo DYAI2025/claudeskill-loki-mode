@@ -36974,18 +36974,28 @@ print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
                 echo -e "${YELLOW}NOT CHECKED${NC}: python3 is not on PATH, so the verifier could not run (exit 2)." >&2
                 exit 2
             fi
-            local _pv_rc=0
+            local _pv_rc=0 _pv_out="" _pv_base_rc=0
+            # Captured, not printed directly, so that --jwks (below) can patch
+            # it: BACKLOG 49 -- when --jwks later downgrades _pv_rc to 1
+            # (ABSENT) or 2 (NOT CHECKED), this output's own "ok: true"/
+            # VERIFIED header from the base hash/drift check must not still be
+            # the last word on stdout. Unflagged (no --jwks), this is printed
+            # byte-for-byte as the base verifier produced it, same as the Bun
+            # route (proof.ts verifyProof) -- ok already agrees with the exit
+            # code there, so there is nothing to patch.
             if [ "$_pv_human" -eq 1 ]; then
-                python3 -E "$verifier" --human "$pj" "${TARGET_DIR:-.}" || _pv_rc=$?
+                _pv_out="$(python3 -E "$verifier" --human "$pj" "${TARGET_DIR:-.}")" || _pv_rc=$?
             else
-                python3 -E "$verifier" "$pj" "${TARGET_DIR:-.}" || _pv_rc=$?
+                _pv_out="$(python3 -E "$verifier" "$pj" "${TARGET_DIR:-.}")" || _pv_rc=$?
             fi
+            _pv_base_rc="$_pv_rc"
 
             # The attestation check runs AFTER, and can only make the verdict
             # worse, never better. A valid attestation does not excuse a failed
             # integrity hash: the signature proves who produced the bytes, not
             # that the bytes are internally consistent. Folding the two together
             # would let a signed-but-tampered receipt exit 0.
+            local _pv_attestation_field="n/a"
             if [ -n "$_pv_jwks" ]; then
                 local _pv_att
                 _pv_att="$(loki_proof_attestation_check "$pj" "$_pv_jwks")"
@@ -36994,12 +37004,14 @@ print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
                         echo "attestation: VERIFIED against ${_pv_jwks}" >&2
                         echo "  Proven: these bytes were signed by the holder of a key in that set." >&2
                         echo "  NOT proven: that the code is correct. A receipt records which checks ran." >&2
+                        _pv_attestation_field="VERIFIED"
                         ;;
                     bad)
                         echo -e "${RED}attestation: FAILED -- the token does not cover these bytes.${NC}" >&2
                         echo "  Either the receipt was altered after signing, or the attestation" >&2
                         echo "  belongs to a different run. Do not trust this receipt." >&2
                         _pv_rc=1
+                        _pv_attestation_field="FAILED"
                         ;;
                     none)
                         # Exit 1: the caller supplied a key set and asked who
@@ -37011,6 +37023,7 @@ print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
                         echo "  gpg-signed; this says only that it has no JWKS attestation." >&2
                         echo "  Not verified: a key set was supplied, but the receipt is unsigned (exit 1)." >&2
                         _pv_rc=1
+                        _pv_attestation_field="ABSENT"
                         ;;
                     *)
                         # Unreachable key set, unreadable file, missing python
@@ -37021,8 +37034,125 @@ print(json.dumps(json.load(open(os.environ['LOKI_PROOF_JSON'])), indent=2))
                         echo -e "${YELLOW}attestation: NOT CHECKED -- could not check against ${_pv_jwks} (key set unreadable, or verifier dependency missing).${NC}" >&2
                         echo "  This is not a failure of the receipt. Nothing was proven either way (exit 2)." >&2
                         if [ "$_pv_rc" -eq 0 ]; then _pv_rc=2; fi
+                        _pv_attestation_field="NOT CHECKED"
                         ;;
                 esac
+            fi
+            # Only patch when --jwks put a THIRD input (the attestation) into
+            # the verdict. With no --jwks, ok/the header already agree with the
+            # exit code (both come straight from the base verifier), and
+            # output is printed byte-for-byte: unflagged output is identical
+            # to before this change, on both the bash and Bun routes.
+            if [ -n "$_pv_jwks" ]; then
+                # Rewrite the base verifier's output so ok/verdict (JSON) or
+                # the header line (--human) always agree with $_pv_rc, the
+                # exit code this command actually returns. verdict reads
+                # doc["hash_ok"] (the parsed JSON) AND the attestation field
+                # together: hash_ok False is TAMPERED, and a bad signature
+                # against otherwise-good bytes is ALSO TAMPERED (the token
+                # proves the bytes came from an untrusted source, which is the
+                # same class of finding as a rewritten hash); diff_drift True
+                # (or unverifiable, e.g. wrong TARGET_DIR) is drift, NOT
+                # tampering -- loki_remote_verify_receipt draws the same line
+                # -- so drift with an otherwise-valid or absent attestation
+                # must stay FAILED, never TAMPERED.
+                # -E plus the explicit sys.path strip BEFORE importing
+                # json/os: PYTHONPATH and a committed sitecustomize.py must
+                # not run here, same guard as the attestation check above
+                # (loki_proof_attestation_check). The strip runs first so a
+                # shadow json.py planted in the invocation cwd cannot
+                # intercept this import either.
+                _V_BASE_RC="$_pv_base_rc" _V_RC="$_pv_rc" _V_ATTESTATION="$_pv_attestation_field" _V_HUMAN="$_pv_human" python3 -E -c '
+import sys; sys.path[:] = [p for p in sys.path if p not in ("", ".")]
+import json, os
+
+raw = sys.stdin.read()
+base_rc = int(os.environ["_V_BASE_RC"])
+rc = int(os.environ["_V_RC"])
+attestation = os.environ["_V_ATTESTATION"]
+human = os.environ["_V_HUMAN"] == "1"
+
+# --human never gets the JSON report (render_reasons only prints a header
+# plus prose), so doc stays None there and hash_ok cannot be consulted; the
+# JSON branch below parses raw first so it CAN consult doc.get("hash_ok").
+doc = None
+if not human:
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        doc = None
+
+if rc == 0:
+    verdict = "VERIFIED"
+elif rc == 2:
+    # Exit 2 is always "could not check" (missing verifier, malformed
+    # proof.json, or --jwks NOT CHECKED) -- never an accusation.
+    verdict = "NOT CHECKED"
+elif base_rc != 0:
+    # The base check itself found something: a real tamper/drift finding, or
+    # it could not run at all (malformed proof.json, doc is None). A definite
+    # hash mismatch is TAMPERED. So is a bad signature against otherwise-good
+    # bytes (attestation FAILED): the token proves these bytes were not
+    # produced by a trusted signer, which is the same accusation a rewritten
+    # hash makes, just caught by a different mechanism -- a drifted tree
+    # checked against the WRONG key still means "do not trust this receipt,"
+    # not merely "could not confirm it." Anything else here (drift, drift-
+    # unverifiable, cost/headline incoherence, or a base verifier error) is
+    # FAILED, the same word "loki proof verify --human" already uses for a
+    # non-tamper finding, rather than an accusation the data does not
+    # support. --human never sees doc (it is prose, not JSON), so it relies
+    # on the attestation field alone here; the JSON branch below can also
+    # consult hash_ok.
+    verdict = "TAMPERED" if (attestation == "FAILED" or (doc is not None and doc.get("hash_ok") is False)) else "FAILED"
+else:
+    # Base check passed (rc would have been 0 otherwise); --jwks is what
+    # pushed the final rc to 1. Only two attestation outcomes do that: a bad
+    # signature (a tamper finding, once the base bytes are known good) or no
+    # signature at all (ABSENT, a fact about the receipt, not an accusation).
+    verdict = "TAMPERED" if attestation == "FAILED" else "ABSENT"
+
+if human:
+    # The --human vocabulary (render_reasons) is only three words: VERIFIED /
+    # COULD NOT CHECK / FAILED. verdict (five words, shared with the JSON
+    # branch) maps onto it rather than being printed raw, so a TAMPERED or
+    # ABSENT finding still reads as the header word this flag readers
+    # already parse for a failure. --human has no fifth word of its own for
+    # TAMPERED; a real integrity/attestation failure and a non-tamper finding
+    # both print "FAILED" to a human reader, same as before this fix -- only
+    # the JSON verdict field distinguishes the two.
+    header = {
+        "VERIFIED": "VERIFIED",
+        "NOT CHECKED": "COULD NOT CHECK",
+    }.get(verdict, "FAILED")
+    # Only the header line can disagree with rc (it reflects the base check
+    # alone, computed before --jwks); replace just that line so the
+    # per-reason "  - ..." detail from the base verifier survives untouched.
+    lines = raw.split("\n")
+    if lines and lines[0].strip() in ("VERIFIED", "COULD NOT CHECK", "FAILED"):
+        lines[0] = header
+    sys.stdout.write("\n".join(lines))
+    sys.exit(0)
+
+if doc is None:
+    # Base verifier printed something unparseable (should not happen; the
+    # base verifier always emits JSON, even on its own internal error). Pass
+    # it through unchanged rather than fabricate a report over data we cannot
+    # read.
+    sys.stdout.write(raw)
+    sys.exit(0)
+
+doc["verdict"] = verdict
+doc["attestation"] = attestation
+# ok is superseded by verdict, which cannot silently drift from the exit
+# code the way a second boolean could. Kept for existing readers, but forced
+# to agree with rc instead of repeating the base verifier own possibly-
+# passing opinion, so a stdout-only consumer reading "ok" is never told the
+# opposite of what this process just exited with.
+doc["ok"] = (rc == 0)
+print(json.dumps(doc, indent=2))
+' <<<"$_pv_out" || printf '%s\n' "$_pv_out"
+            else
+                printf '%s\n' "$_pv_out"
             fi
             exit "$_pv_rc"
             ;;
