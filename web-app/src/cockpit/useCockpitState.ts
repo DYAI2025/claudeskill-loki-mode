@@ -20,6 +20,7 @@ export type ViewState =
   | 'recovering'
   | 'failed'
   | 'completed'
+  | 'unknown'
   | 'disconnected';
 
 /** Fields the server returns but types/api.ts historically did not declare. */
@@ -60,6 +61,42 @@ export interface CockpitState {
 }
 
 const NO_PHASE = mapPhase(null);
+
+/**
+ * /api/session/checklist has no per-session scoping -- it always reads the
+ * globally running project. Showing it for a historical (non-live) session
+ * would attribute another run's checklist to this one, so only surface it
+ * while this session IS the live one.
+ */
+export function scopeChecklistToLive<T>(checklist: T | null, isLive: boolean): T | null {
+  return isLive ? checklist : null;
+}
+
+/**
+ * View state for a session that is NOT the live one (isLive === false).
+ * Pure so it is directly testable without rendering the hook: see
+ * useCockpitState.derive-view.test.ts.
+ */
+export function deriveHistoricalView(detail: {
+  status?: string | null;
+  prd?: string | null;
+  files?: unknown[] | null;
+} | null, hasChanges: boolean): ViewState {
+  const s = (detail?.status ?? '').toLowerCase();
+  if (s === 'failed') return 'failed';
+  if (s === 'paused') return 'paused';
+  if (s === 'completed') return 'completed';
+  if (s === 'unknown') return 'unknown';
+  // "Empty" is a real state: a session directory with no spec and no changes
+  // has genuinely nothing to review.
+  const hasPrd = Boolean(detail?.prd?.trim());
+  const hasFiles = (detail?.files?.length ?? 0) > 0;
+  if (!hasPrd && !hasChanges && !hasFiles) return 'empty';
+  // The server could not determine a definitive status (e.g. an
+  // unrecognized or missing status string) -- report that honestly rather
+  // than assuming the run completed.
+  return 'unknown';
+}
 
 export function useCockpitState(sessionId: string | undefined): CockpitState {
   const [detail, setDetail] = useState<SessionDetail | null>(null);
@@ -206,16 +243,7 @@ export function useCockpitState(sessionId: string | undefined): CockpitState {
       if (!connected) return 'disconnected';
       return 'running';
     }
-    const s = (detail?.status ?? '').toLowerCase();
-    if (s === 'failed') return 'failed';
-    if (s === 'completed') return 'completed';
-    // "Empty" is a real state: a session directory with no spec and no changes
-    // has genuinely nothing to review.
-    const hasPrd = Boolean(detail?.prd?.trim());
-    const hasChanges = (git?.files?.length ?? 0) > 0;
-    const hasFiles = (detail?.files?.length ?? 0) > 0;
-    if (!hasPrd && !hasChanges && !hasFiles) return 'empty';
-    return 'completed';
+    return deriveHistoricalView(detail, (git?.files?.length ?? 0) > 0);
   }, [loading, isLive, connected, status, detail, git]);
 
   const elapsedSeconds = useMemo(() => {
@@ -238,7 +266,7 @@ export function useCockpitState(sessionId: string | undefined): CockpitState {
     status,
     isLive,
     phase: phase ?? NO_PHASE,
-    checklist,
+    checklist: scopeChecklistToLive(checklist, isLive),
     changedFiles,
     git,
     checkpoints,
