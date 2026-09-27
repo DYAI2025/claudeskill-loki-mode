@@ -944,8 +944,10 @@ def ternary_colon_of(s, q):
 #     FLOWS_TO_STATE_TMPL) only recognizes a plain or `await`ed direct call as
 #     the local's initializer, not a chained/wrapped call
 #     (`const rows = getRows(d).slice(); setRows(rows);`);
-#   - useMemo is deliberately out of scope (documented at HELPER_HEAD above),
-#     and a class-method helper is BACKLOG 144, not this arm.
+#   - a class-method helper is BACKLOG 144, not this arm. (useMemo is covered
+#     by the separate DECL_USEMEMO arm below, not by this arm: a useMemo-bound
+#     name is a VALUE, never itself called later as name(args), so it cannot
+#     use this arm's call-site-registration machinery; see DECL_USEMEMO.)
 #   Can in principle over-flag (not false-negative only):
 #   - both the sink-span search and the two-hop local-variable hop
 #     (`const rows = getRows(d); setRows(rows)`) search the WHOLE FILE by
@@ -1018,11 +1020,21 @@ FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\
 # MODULE_DECL column-0 skip (a *data* exemption for a named config table),
 # there is no equivalent "this let/var is honest config" signal for a
 # *helper*, so `let`/`var` heads are covered identically to `const`.
-# useMemo is deliberately NOT covered: it computes its value eagerly at render
-# time and is never itself called later as `name(args)` the way this bug's
-# `setRows(getRows(d))` call-back-in shape requires; a useMemo whose factory
-# returns literal rows is already the ordinary DECL_ARR/rule-5 shape at the
-# point the memoized value is consumed, not a new one this arm needs to add.
+# useMemo is deliberately NOT one of this arm's alternatives: a useMemo-bound
+# name is a VALUE (the memoized result itself), never itself called later as
+# `name(args)` the way this arm's call-site registration
+# (HELPER_CALL_SINK_HEAD / HELPER_LOCAL_DECL_TMPL, both of which search for
+# `name(`) requires. `const rows = useMemo(() => [...], deps); setRows(rows);`
+# is a DIFFERENT shape from this arm's `function getRows(d){...}
+# setRows(getRows(d))`: rows is a plain local flowing to a sink, the same
+# shape DECL_ARR's own FLOWS_TO_STATE_TMPL check already handles for `const
+# rows = [...]` -- so a useMemo factory returning literal rows is handled by
+# the separate DECL_USEMEMO arm below, which feeds that check directly,
+# never by registering `useMemo` itself as a fabricator name here. (An
+# earlier version of this comment claimed the useMemo case was "already the
+# ordinary DECL_ARR/rule-5 shape" without an arm making that true; it was not
+# caught by any rule until DECL_USEMEMO was added -- see BACKLOG 125 B-7
+# rework.)
 HELPER_HEAD = re.compile(r'\b(?:export\s+(?:default\s+)?)?(?:async\s+)?'
                           r'(?:function\s+([A-Za-z_$][\w$]*)\s*\('
                           r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function\s*\('
@@ -1095,6 +1107,26 @@ HELPER_BARE_REF_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*[,)]'
 # at the local's declaration). `(?:await\s+)?` covers `const rows = await
 # getRows();`.
 HELPER_LOCAL_DECL_TMPL = r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{{}}]*)?=(?![=>])\s*(?:await\s+)?{name}\s*\('
+# useMemo extension (BACKLOG 125 B-7 rework, mainstream React idiom): `const
+# rows = useMemo(() => [...fabricated rows...], deps); setRows(rows);` is
+# caught by NO rule without this arm. It is NOT the HELPER_HEAD shape: `rows`
+# here is a VALUE (the memoized result), never itself called later as
+# `rows(args)` the way a useCallback-wrapped function is, so it cannot use
+# HELPER_HEAD's call-site-registration machinery (HELPER_CALL_SINK_HEAD /
+# HELPER_LOCAL_DECL_TMPL both search for `name(`, which a useMemo binding
+# never satisfies). Instead `rows` is a plain local flowing to a sink -- the
+# exact shape DECL_ARR already handles for `const rows = [...]` -- so this arm
+# only locates the useMemo factory's own literal-rows body (reusing
+# literal_return_span, the same helper-body literal check HELPER_HEAD uses)
+# and then, on a hit, re-checks MODULE_DECL/FLOWS_TO_STATE_TMPL on `rows`
+# exactly the way DECL_ARR's own loop does, rather than treating `useMemo`
+# itself as a fabricator name. Matches `const/let/var NAME = useMemo(` or
+# `React.useMemo(`; the factory (useMemo's first argument) is then located the
+# same way HELPER_HEAD locates a bare `(...) =>`/bare-param arrow body:
+# concise (`=> [...]`) and block (`=> { ... return [...]; }`) forms are both
+# handled via literal_return_span, which already covers both shapes.
+DECL_USEMEMO = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*'
+                           r'(?:React\.)?useMemo\s*(?:<[^()]*?>)?\s*\(')
 DEMO_NAME = re.compile(r'(?:\b(?:const|let|var)\s+|\bthis\.)([A-Za-z_$][\w$]*)\s*(?::[^=;]*?)?=(?![=>])\s*([\[{])')
 BARE = re.compile(r'^_*(?:sample|mock|demo|fake|dummy|placeholder)s?$|^_*placeholder(?=[A-Z_\d])|^_*PLACEHOLDER_', re.I)
 STAT_KEY = re.compile(r'^["\']?(?:uses|usage|rating|ratings|stars|forks|downloads|installs|views|users|builds|runs|count|total|score|percent|tokens|cost|spend|revenue|reviews|likes|confidence|coverage)["\']?$', re.I)
@@ -1891,29 +1923,32 @@ def whole_file_findings(s):
         spans.append((idx, end))
         out.append((line_of(s, idx), 'fabricated static fields via Array.from() generator callback'))
     fabricators = {}
-    def check_body_for_literal_return(name, decl_at, body_start):
-        """body_start points at the helper's own body: '[' for a concise arrow
-        (`=> [...]`) or '{' for a block body. Marks `name` a fabricator in
-        fabricators (keyed so first-declaration wins, matching add_rows'
-        dedupe-by-span convention elsewhere in this function) when the body's
-        own top-level return (or the concise-arrow expression itself) is a
-        literal-rows array. A nested function/arrow's own return is excluded
-        via NESTED_FN_HEAD so a real helper with an inner callback that merely
-        happens to return literal rows (config passed to a nested consumer,
-        never reaching THIS helper's own caller) is not wrongly credited."""
+    def literal_return_span(body_start):
+        """body_start points at a factory's own body: '[' for a concise arrow
+        (`=> [...]`) or '{' for a block body. Returns the (i, j) span of the
+        literal-rows array (the concise-arrow expression itself, or the
+        block's own top-level `return [...]`) when one exists, else None. A
+        nested function/arrow's own return is excluded via NESTED_FN_HEAD so a
+        real factory with an inner callback that merely happens to return
+        literal rows (config passed to a nested consumer, never reaching THIS
+        factory's own caller/consumer) is not wrongly credited. Shared by the
+        HELPER_HEAD arm (a factory later CALLED as name(args)) and the
+        DECL_USEMEMO arm (a useMemo factory whose RESULT, never itself called
+        again, is bound directly to a local) -- same literal-body shape, two
+        different ways the factory's result reaches a sink."""
         body_start += len(s[body_start:]) - len(s[body_start:].lstrip())
         if body_start >= len(s):
-            return
+            return None
         if s[body_start] == '[':
             body_end = close_of(s, body_start)
             if body_end > 0 and literal_rows(s[body_start:body_end + 1]):
-                fabricators.setdefault(name, decl_at)
-            return
+                return (body_start, body_end)
+            return None
         if s[body_start] != '{':
-            return
+            return None
         body_end = close_of(s, body_start)
         if body_end < 0:
-            return
+            return None
         body = s[body_start:body_end + 1]
         nested = []
         for nm in NESTED_FN_HEAD.finditer(body):
@@ -1922,11 +1957,57 @@ def whole_file_findings(s):
                 nested.append((nm.end() - 1, nb))
         for rm in RETURN_ARR.finditer(body):
             if any(a <= rm.start() <= b for a, b in nested):
-                continue  # a nested function/arrow's own return; not this helper's
+                continue  # a nested function/arrow's own return; not this factory's
             arr_end = close_of(body, rm.end() - 1)
             if arr_end > 0 and literal_rows(body[rm.end() - 1:arr_end + 1]):
-                fabricators.setdefault(name, decl_at)
-                break
+                return (body_start + rm.end() - 1, body_start + arr_end)
+        return None
+    def check_body_for_literal_return(name, decl_at, body_start):
+        """Marks `name` a fabricator in fabricators (keyed so first-declaration
+        wins, matching add_rows' dedupe-by-span convention elsewhere in this
+        function) when literal_return_span finds a literal-rows return."""
+        if literal_return_span(body_start) is not None:
+            fabricators.setdefault(name, decl_at)
+    for m in DECL_USEMEMO.finditer(s):
+        # Locate the useMemo factory's own head, the same way HELPER_HEAD
+        # locates a bare `(...) =>` / bare-param arrow: a parenthesized
+        # (possibly zero-param) arrow, or a bare single-param arrow with no
+        # parens. A `function(...) {}` factory is not attempted: useMemo's
+        # factory is conventionally an arrow, and literal_return_span's
+        # concise/block handling is keyed off the body start regardless of
+        # which head form supplied it, so adding a function-expression head
+        # here would be strictly additive if a real instance ever needs it.
+        name = m.group(1)
+        factory_start = m.end()
+        paren_head = re.match(r'\s*\(', s[factory_start:])
+        if paren_head:
+            params = factory_start + paren_head.end() - 1
+            params_end = close_of(s, params)
+            if params_end < 0:
+                continue
+            arrow = HELPER_ARROW_TAIL.match(s, params_end + 1)
+            if not arrow:
+                continue
+            body_start = arrow.end()
+        else:
+            bp = BARE_PARAM.match(s, factory_start)
+            if not bp:
+                continue
+            body_start = bp.end()
+        span = literal_return_span(body_start)
+        if span is None:
+            continue
+        # From here on, `name` is treated exactly like a DECL_ARR hit: same
+        # MODULE_DECL column-0 exemption, same FLOWS_TO_STATE_TMPL flow check,
+        # same add_rows call on the literal array's own span (never on the
+        # useMemo(...) call span) -- a useMemo-fabricated local is the same
+        # "local flowing to a sink" shape as `const rows = [...]`, not a new
+        # sink-registration shape of its own.
+        line_start = s.rfind('\n', 0, m.start()) + 1
+        if MODULE_DECL.match(s, line_start):
+            continue  # named module-level table, a negative control (matches DECL_ARR)
+        if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(name)), s):
+            add_rows(span[0], 'literal sample rows returned by a useMemo factory assigned to ' + name)
     for m in HELPER_HEAD.finditer(s):
         name = m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(5)
         if not name:
@@ -2897,6 +2978,40 @@ export function HRU({ records }) {
   return null;
 }
 TSX
+    # DECL_USEMEMO arm (BACKLOG 125 B-7 rework): a mainstream React idiom no
+    # rule above can see, since `rows` here is a VALUE bound once at the
+    # useMemo call, never itself called later as `rows(args)` the way every
+    # HELPER_HEAD fixture above requires. Concise-arrow-body form.
+    cat > "$d/src/components/UseMemoConciseFabricated.tsx" <<'TSX'
+export function UMC({ deps }) {
+  const rows = useMemo(() => [{ id: 1, name: 'Sample User', action: 'Deployed' }], [deps]);
+  setRows(rows);
+  return null;
+}
+TSX
+    # Block-body form (`useMemo(() => { ... return [...]; }, deps)`), reusing
+    # the same literal_return_span block-body path HELPER_HEAD's block-body
+    # heads already use (RETURN_ARR + NESTED_FN_HEAD exclusion).
+    cat > "$d/src/components/UseMemoBlockFabricated.tsx" <<'TSX'
+export function UMB({ d, deps }) {
+  const rows = useMemo(() => {
+    if (!d) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return d;
+  }, [deps]);
+  setRows(rows);
+  return null;
+}
+TSX
+    # Honest look-alike: a useMemo computing a REAL derived value (a .filter()
+    # call, not a literal-returning factory) must stay green -- confirms this
+    # arm keys on literal_return_span, not merely on the presence of useMemo.
+    cat > "$d/src/components/UseMemoDerivedHonest.tsx" <<'TSX'
+export function UMD({ data, deps }) {
+  const rows = useMemo(() => data.filter((x) => x.active), [deps]);
+  setRows(rows);
+  return null;
+}
+TSX
     # Honest look-alikes for the same arm: an empty-array fallback (a genuine
     # "nothing yet" default), a real config/enum object return, a helper whose
     # fabricated return never reaches a sink (render-only .map() - this is
@@ -3462,6 +3577,8 @@ HelperReturnLetVar.tsx:2|'buildRowsZ' returns fabricated literal rows reaching a
 HelperReturnUseCallback.tsx:2|'buildRowsW' returns fabricated literal rows reaching a data sink
 HelperReturnUseCallbackBareParam.tsx:2|'buildRowsV' returns fabricated literal rows reaching a data sink
 HelperReturnReactUseCallback.tsx:2|'buildRowsU' returns fabricated literal rows reaching a data sink
+UseMemoConciseFabricated.tsx:2|literal sample rows returned by a useMemo factory assigned to rows
+UseMemoBlockFabricated.tsx:3|literal sample rows returned by a useMemo factory assigned to rows
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -3494,6 +3611,7 @@ EOF
         HelperReturnSinkSpread.tsx:1 HelperReturnSinkNestedCall.tsx:1 HelperReturnSinkTrailingCall.tsx:1 \
         HelperReturnBareParamArrow.tsx:1 HelperReturnLetVar.tsx:1 HelperReturnUseCallback.tsx:1 \
         HelperReturnUseCallbackBareParam.tsx:1 HelperReturnReactUseCallback.tsx:1 \
+        UseMemoConciseFabricated.tsx:1 UseMemoBlockFabricated.tsx:1 UseMemoDerivedHonest.tsx:0 \
         HelperReturnEmptyHonest.tsx:0 HelperReturnRenderOnlyHonest.tsx:0 HelperReturnNestedCallbackHonest.tsx:0 \
         HelperReturnSinkSpreadHonest.tsx:0 HelperReturnSinkNestedCallHonest.tsx:0 \
         HelperReturnSinkTrailingCallHonest.tsx:0 HelperReturnUseCallbackHonest.tsx:0 \
