@@ -4688,8 +4688,19 @@ council_should_stop() {
         # v6.83.0 Phase 1: shadow-write the final council verdict to the
         # managed memory store. Backgrounded + silent; flags gate the work
         # inside the Python module so no-op when off.
+        #
+        # D7: never fall back to the cwd. Identical threat model to
+        # council_augment_from_managed_memory (BACKLOG 63) but more severe:
+        # this call EXECUTES memory.managed_memory.shadow_write as a module,
+        # not just imports one for reading, so `cd "${PROJECT_DIR:-$(pwd)}"`
+        # with PROJECT_DIR unset runs the agent's own repo's shadow_write.py
+        # (if it ships one) with the council's privileges -- arbitrary code
+        # execution, not just data poisoning. PROJECT_DIR must be explicit;
+        # unset -> skip the shadow-write entirely (silent no-op, same as the
+        # flags-off path above; STOP still returns 0 unchanged).
         if [ "${LOKI_MANAGED_AGENTS:-false}" = "true" ] && \
-           [ "${LOKI_MANAGED_MEMORY:-false}" = "true" ]; then
+           [ "${LOKI_MANAGED_MEMORY:-false}" = "true" ] && \
+           [ -n "${PROJECT_DIR:-}" ]; then
             local _verdict_file="$loki_dir/council/verdicts/iteration-$ITERATION_COUNT.json"
             if [ ! -f "$_verdict_file" ]; then
                 # Fall back to the round vote file as the verdict payload.
@@ -4697,9 +4708,9 @@ council_should_stop() {
             fi
             if [ -f "$_verdict_file" ]; then
                 (
-                    cd "${PROJECT_DIR:-$(pwd)}" 2>/dev/null && \
+                    cd "$PROJECT_DIR" 2>/dev/null && \
                     LOKI_TARGET_DIR="$loki_dir/.." \
-                    timeout 15 python3 -m memory.managed_memory.shadow_write \
+                    timeout 15 python3 -E -m memory.managed_memory.shadow_write \
                         --verdict "$_verdict_file" >/dev/null 2>&1 || true
                 ) &
                 disown 2>/dev/null || true
