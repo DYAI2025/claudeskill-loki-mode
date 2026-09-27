@@ -304,3 +304,39 @@ judgment D12 exists to not leave to the person making the change. Speed
 under CONTROL.md's priority order is real but ranks below moat and
 delivered accuracy -- a quorum skip trades a process guarantee for time
 saved, which is backwards per the stated priority order.
+
+### Self-caught: rapid single-line pushes were starving CI (2026-09-27)
+
+After v9.55.0 shipped, I pushed roughly 20 single-line BOARD.md status
+updates in quick succession over about 75 minutes, one per review
+result as it landed. `gh run list --workflow Tests` showed the obvious
+consequence: every one of those pushes cancelled the previous push's
+in-flight Tests run, so main had NO green CI verdict the entire time --
+the exact same "pushing during a release cancels its Tests" failure
+mode already recorded as a standing lesson, just recurring post-release
+instead of mid-release. Caught by an advisor consultation, not by
+noticing it myself; the pulse's own `Main CI: PENDING` line had been
+printing unchanged for over an hour and I had not connected that to my
+own push cadence.
+
+Also caught in the same pass: the pulse's "106 commits since v9.54.2"
+reading, 90 minutes after v9.55.0 shipped, was not a pulse bug -- it
+was a stale local `git fetch --tags`. Fixed by fetching; filed BACKLOG
+136 so the pulse itself can detect this class of staleness going
+forward. And BOARD.md had 5 rows (S-02, S-14, S-16, S-18, S-20) stuck
+at a phantom `building@01:33Z` status with no live agent or
+identifiable worktree behind them -- an artifact of the earlier bulk
+timestamp normalization pass, never individually re-verified since.
+Reset to `ready` (or `blocked` where a real dependency exists). S-37
+turned out to duplicate GF-3 (same BACKLOG item, same files) and was
+parked rather than run in parallel. GF-3's own note cited a "Captain
+step 6" validation-PR process that does not exist anywhere in the
+actual docs -- corrected, and D22 recorded under the founder-unavailable
+clause: release.yml changes ship alone, watched to green, until a real
+process for this is written down.
+
+Lesson: a batch of small, individually-justified pushes is still a
+push-storm from CI's point of view. From here: one batched commit per
+turn for hot-file status updates, and no second push to main until
+the previous push's Tests run has actually finished (checked directly,
+not assumed).
