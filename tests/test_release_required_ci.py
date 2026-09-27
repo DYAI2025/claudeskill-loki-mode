@@ -21,6 +21,7 @@ TWO FAILURE MODES ARE ASSERTED HERE, and the second is the subtle one:
      REQUIRED list have to change together, so this test pins both.
 """
 
+import os
 import pathlib
 import re
 import sys
@@ -41,30 +42,19 @@ def _required_names():
     return re.findall(r'"([^"]+)"', m.group(1))
 
 
-def _evaluate(runs, required):
-    """The decision rules from the required-ci step, in Python.
-
-    runs: list of (name, status, conclusion). Mirrors the shell loop exactly:
-    empty -> vacuity guard, any non-success conclusion -> FAIL, anything not
-    completed or not yet reported -> PENDING.
-    """
-    if not runs:
-        return "PENDING_EMPTY"
-    pending = False
-    failed = False
-    for want in required:
-        line = next((r for r in runs if r[0] == want), None)
-        if line is None:
-            pending = True
-            continue
-        _, status, concl = line
-        if status != "completed":
-            pending = True
-        elif concl != "success":
-            failed = True
-    if failed:
-        return "FAIL"
-    return "PENDING" if pending else "PASS"
+# NOTE (round 4): there used to be an `_evaluate()` here, a hand-maintained
+# Python reimplementation of the shell's decision rules, plus a test class
+# built on it. It was DELETED. Two independent HIGH reviewers showed it
+# tested nothing real: `_evaluate` treated cancelled/timed_out/skipped as
+# FAIL, but the actual shell (has_conclusion()-based, see
+# PollLoopPriorityIsExercisedForReal below) returns PENDING for those -- so
+# three of its tests asserted the WRONG behavior and passed anyway, because
+# they were exercising a fiction instead of the real script. Worse, the
+# reviewers reproduced that neither reordering the poll loop's branches (which
+# reintroduces the masked-failure bug this file's docstring is about) nor
+# swapping its success/failure checks broke a single test in this file, since
+# nothing here ever ran the real loop. Every claim about the poll loop's
+# behavior below is now backed by actually running the extracted script.
 
 
 class TheRequiredListCoversTheRealGates(unittest.TestCase):
@@ -114,55 +104,6 @@ class TheRequiredListCoversTheRealGates(unittest.TestCase):
                 "%r is required by the release gate but has no push trigger, "
                 "so it never runs at a release SHA and the gate would wait "
                 "until its deadline and then fail every release" % want)
-
-
-class NothingButAnExplicitSuccessCounts(unittest.TestCase):
-
-    def setUp(self):
-        self.required = ["Tests", "Bun Parity", "Security Audit"]
-
-    def _runs(self, **overrides):
-        base = {n: ("completed", "success") for n in self.required}
-        base.update(overrides)
-        return [(n, s, c) for n, (s, c) in base.items()]
-
-    def test_all_success_passes(self):
-        self.assertEqual(_evaluate(self._runs(), self.required), "PASS")
-
-    def test_audit_failure_blocks(self):
-        runs = self._runs(**{"Security Audit": ("completed", "failure")})
-        self.assertEqual(_evaluate(runs, self.required), "FAIL")
-
-    def test_audit_cancelled_blocks(self):
-        """The case that actually happened: superseded by a newer push."""
-        runs = self._runs(**{"Security Audit": ("completed", "cancelled")})
-        self.assertEqual(
-            _evaluate(runs, self.required), "FAIL",
-            "a cancelled run was treated as a pass; a conclusion check that "
-            "only tests for 'failure' lets a superseded run publish")
-
-    def test_audit_timed_out_blocks(self):
-        runs = self._runs(**{"Security Audit": ("completed", "timed_out")})
-        self.assertEqual(_evaluate(runs, self.required), "FAIL")
-
-    def test_audit_skipped_blocks(self):
-        runs = self._runs(**{"Security Audit": ("completed", "skipped")})
-        self.assertEqual(_evaluate(runs, self.required), "FAIL")
-
-    def test_audit_absent_does_not_pass(self):
-        runs = [r for r in self._runs() if r[0] != "Security Audit"]
-        self.assertNotEqual(
-            _evaluate(runs, self.required), "PASS",
-            "a missing Security Audit run was treated as a pass; an absent "
-            "measurement is not evidence of health")
-
-    def test_audit_still_running_does_not_pass(self):
-        runs = self._runs(**{"Security Audit": ("in_progress", None)})
-        self.assertEqual(_evaluate(runs, self.required), "PENDING")
-
-    def test_an_empty_api_result_is_not_a_pass(self):
-        """Vacuity guard: 'no failing runs' over zero runs is not success."""
-        self.assertEqual(_evaluate([], self.required), "PENDING_EMPTY")
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +377,249 @@ class ReleaseShaPriorityOrderIsCorrected(unittest.TestCase):
         runs = "Tests\tcompleted\tsuccess"
         self.assertEqual(self._has_conclusion(runs, "Tests", "success"), "YES")
         self.assertEqual(self._has_conclusion(runs, "Tests", "failure"), "NO")
+
+
+# ---------------------------------------------------------------------------
+# Round 4 (BLOCKING, two independent HIGH reviews of round 3): the suite
+# above exercises has_conclusion() in isolation, which cannot catch a bug in
+# the ORDER the poll loop calls it in. Reviewers reproduced that moving the
+# reuse branch above the release-SHA-failure branch (reintroducing the
+# masked-failure bug), and separately swapping the success/failure checks,
+# both kept every test in this file green. This class runs the REAL extracted
+# required-ci run: block (STEP 1 eligibility + STEP 2 poll together) end to
+# end against constructed git histories, with `gh` and `sleep` stubbed on
+# PATH -- the stub `sleep` exits 99 immediately, so a run that would
+# otherwise poll forever instead aborts (`set -e`) with rc=99, which these
+# tests treat as PENDING.
+# ---------------------------------------------------------------------------
+
+def _required_ci_full_script():
+    """The entire required-ci step's `run: |` block (both STEP 1 and STEP 2),
+    extracted from the raw YAML text without a YAML parser -- same reasoning
+    as _has_conclusion_fn() above. Scoped to the required-ci job specifically
+    (not gate, which has its own `run: |` blocks at the same indentation)."""
+    src = _RELEASE.read_text(encoding="utf-8", errors="replace")
+    job_m = re.search(r"\n  required-ci:\n", src)
+    if not job_m:
+        return None
+    next_job_m = re.search(r"\n  \w[\w-]*:\n", src[job_m.end():])
+    job_end = job_m.end() + (next_job_m.start() if next_job_m else len(src) - job_m.end())
+    job_text = src[job_m.start():job_end]
+    run_m = re.search(r"\n( +)run: \|\n", job_text)
+    if not run_m:
+        return None
+    indent = len(run_m.group(1))
+    body = []
+    for line in job_text[run_m.end():].splitlines():
+        if line.strip() == "":
+            body.append("")
+            continue
+        cur = len(line) - len(line.lstrip(" "))
+        if cur <= indent:
+            break
+        body.append(line)
+    indents = [len(l) - len(l.lstrip(" ")) for l in body if l.strip()]
+    strip = min(indents) if indents else 0
+    return "\n".join(l[strip:] if len(l) >= strip else l for l in body)
+
+
+def _make_stub_bin(tmp_dir, fixtures):
+    """fixtures: {sha: [(name, status, conclusion), ...]}. The stub `gh`
+    ignores the real --jq filter and just prints the pre-filtered TSV rows
+    fetch_runs() expects (round 3 already covers the real jq event filter);
+    the stub `sleep` exits 99 immediately instead of actually sleeping."""
+    binp = pathlib.Path(tmp_dir, "bin")
+    binp.mkdir()
+    fixdir = pathlib.Path(tmp_dir, "fixtures")
+    fixdir.mkdir()
+    for sha, runs in fixtures.items():
+        rows = "\n".join(f"{n}\t{s}\t{c}" for n, s, c in runs)
+        (fixdir / f"{sha}.tsv").write_text(rows + ("\n" if rows else ""))
+    gh = binp / "gh"
+    gh.write_text(
+        "#!/bin/bash\n"
+        'url="$2"\n'
+        'sha="${url#*head_sha=}"; sha="${sha%%&*}"\n'
+        f'f="{fixdir}/$sha.tsv"\n'
+        '[ -f "$f" ] && cat "$f" || true\n'
+    )
+    gh.chmod(0o755)
+    sleep = binp / "sleep"
+    sleep.write_text("#!/bin/bash\necho STUB-SLEEP-PENDING >&2\nexit 99\n")
+    sleep.chmod(0o755)
+    return str(binp)
+
+
+@unittest.skipIf(subprocess.run(["bash", "--version"], capture_output=True).returncode != 0,
+                  "bash not available")
+class PollLoopPriorityIsExercisedForReal(unittest.TestCase):
+    """Runs the ACTUAL required-ci script (STEP 1 + STEP 2 together), not a
+    reimplementation and not has_conclusion() in isolation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="s84-poll-")
+        self.repo = str(pathlib.Path(self.tmp, "repo"))
+        pathlib.Path(self.repo).mkdir()
+        _git(self.repo, "init", "-q", "-b", "main", ".")
+        _write(self.repo, "VERSION", "9.55.0\n")
+        _write(self.repo, "package.json", '{"version": "9.55.0"}\n')
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        self.parent = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                                      capture_output=True, text=True).stdout.strip()
+        _write(self.repo, "VERSION", "9.56.0\n")
+        _write(self.repo, "package.json", '{"version": "9.56.0"}\n')
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "release")
+        self.sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True).stdout.strip()
+
+    def _run(self, fixtures, timeout=15):
+        script = _required_ci_full_script()
+        self.assertIsNotNone(script, "could not extract the required-ci run script")
+        bindir = _make_stub_bin(self.tmp, fixtures)
+        env = dict(os.environ)
+        env.update({"SHA": self.sha, "REPO": "o/r", "EVENT_NAME": "push", "GH_TOKEN": "x",
+                    "PATH": bindir + ":" + env.get("PATH", "/usr/bin:/bin")})
+        r = subprocess.run(["bash", "-c", script], cwd=self.repo, env=env,
+                            capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_s2_failure_plus_in_progress_at_release_sha_fails(self):
+        rc, out = self._run({
+            self.parent: [("Tests", "completed", "success"), ("Bun Parity", "completed", "success")],
+            self.sha: [("Tests", "completed", "failure"), ("Tests", "in_progress", "null"),
+                       ("Bun Parity", "completed", "success"), ("Security Audit", "completed", "success")],
+        })
+        self.assertEqual(rc, 1, out)
+
+    def test_s3_failure_then_success_passes(self):
+        rc, out = self._run({
+            self.parent: [("Tests", "completed", "success"), ("Bun Parity", "completed", "success")],
+            self.sha: [("Tests", "completed", "failure"), ("Tests", "completed", "success"),
+                       ("Bun Parity", "completed", "success"), ("Security Audit", "completed", "success")],
+        })
+        self.assertEqual(rc, 0, out)
+
+    def test_s1_cancelled_at_release_sha_passes_by_reuse(self):
+        rc, out = self._run({
+            self.parent: [("Tests", "completed", "success"), ("Bun Parity", "completed", "success")],
+            self.sha: [("Tests", "completed", "cancelled"), ("Bun Parity", "completed", "success"),
+                       ("Security Audit", "completed", "success")],
+        })
+        self.assertEqual(rc, 0, out)
+        self.assertIn("(reused)", out, "Tests did not reuse the parent's verdict")
+
+    def test_cancelled_security_audit_stays_pending(self):
+        """Security Audit is never reused, so a cancelled run there with no
+        success or failure yet must poll (PENDING), not pass or fail."""
+        rc, out = self._run({
+            self.parent: [],
+            self.sha: [("Tests", "completed", "success"), ("Bun Parity", "completed", "success"),
+                       ("Security Audit", "completed", "cancelled")],
+        })
+        self.assertEqual(rc, 99, out)
+
+    def test_bun_parity_failure_at_release_sha_fails(self):
+        rc, out = self._run({
+            self.parent: [],
+            self.sha: [("Tests", "completed", "success"), ("Bun Parity", "completed", "failure"),
+                       ("Security Audit", "completed", "success")],
+        })
+        self.assertEqual(rc, 1, out)
+
+    def test_all_success_at_release_sha_passes(self):
+        """A plain, no-failure-anywhere green run must pass. This is the case
+        a success/failure branch swap breaks: every success would flip to
+        failed and the job would wrongly fail closed."""
+        rc, out = self._run({
+            self.parent: [],
+            self.sha: [("Tests", "completed", "success"), ("Bun Parity", "completed", "success"),
+                       ("Security Audit", "completed", "success")],
+        })
+        self.assertEqual(rc, 0, out)
+
+
+class OneEachOfTheRemainingRound3Checks(unittest.TestCase):
+    """One test per remaining round-3 mechanism not yet covered above: the
+    loki.js.map JSON-aware compare, the --raw same-mode requirement, the
+    semver shape check, the NUL-collision guard, and debugId-trailer
+    anchoring on loki.js."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="s84-checks-")
+        _git(self.repo, "init", "-q", "-b", "main", ".")
+
+    def _base(self, extra=None):
+        _write(self.repo, "VERSION", "9.55.0\n")
+        _write(self.repo, "package.json", '{"version": "9.55.0"}\n')
+        if extra:
+            extra()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        return subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+
+    def _release(self, extra):
+        _write(self.repo, "VERSION", "9.56.0\n")
+        _write(self.repo, "package.json", '{"version": "9.56.0"}\n')
+        extra()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "release")
+        return subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                               capture_output=True, text=True).stdout.strip()
+
+    def test_map_json_compare_allows_debugid_only_and_blocks_content_drift(self):
+        base_map = b'{"version":3,"sources":["a.ts"],"sourcesContent":["x"],"debugId":"AAAA"}'
+        parent = self._base(lambda: _write(self.repo, "loki-ts/dist/loki.js.map", base_map))
+        sha_ok = self._release(lambda: _write(
+            self.repo, "loki-ts/dist/loki.js.map",
+            b'{"version":3,"sources":["a.ts"],"sourcesContent":["x"],"debugId":"BBBB"}'))
+        rc, err = _run_eligibility(self.repo, parent, sha_ok)
+        self.assertEqual(rc, 0, err)
+
+        sha_bad = self._release(lambda: _write(
+            self.repo, "loki-ts/dist/loki.js.map",
+            b'{"version":3,"sources":["a.ts"],"sourcesContent":["EVIL"],"debugId":"CCCC"}'))
+        rc, err = _run_eligibility(self.repo, parent, sha_bad)
+        self.assertNotEqual(rc, 0, "sourcesContent drift was not caught")
+
+    def test_mode_change_disqualifies_reuse(self):
+        parent = self._base()
+        sha = self._release(lambda: None)
+        _git(self.repo, "update-index", "--chmod=+x", "package.json")
+        _git(self.repo, "commit", "-q", "--amend", "--no-edit")
+        sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0, "a mode-only change (chmod +x) was accepted")
+
+    def test_leading_zero_version_is_rejected(self):
+        parent = self._base()
+        sha = self._release(lambda: _write(self.repo, "VERSION", "09.56.0\n"))
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0, "a leading-zero VERSION component was accepted")
+
+    def test_embedded_nul_disqualifies_reuse(self):
+        parent = self._base()
+        sha = self._release(lambda: _write(self.repo, "package.json", b'{"v":"9.56.0\x00"}'))
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(rc, 0, "a file with an embedded NUL was accepted")
+
+    def test_debugid_trailer_only_stripped_at_the_true_end(self):
+        """A debugId-shaped comment that is NOT the file's last line must not
+        be stripped -- only the exact trailing trailer is exempt."""
+        parent = self._base(lambda: _write(
+            self.repo, "loki-ts/dist/loki.js",
+            b'console.log("9.55.0");\n//# debugId=AAAA\nconsole.log("tail");\n'))
+        sha = self._release(lambda: _write(
+            self.repo, "loki-ts/dist/loki.js",
+            b'console.log("9.56.0");\n//# debugId=BBBB\nconsole.log("tail");\n'))
+        rc, err = _run_eligibility(self.repo, parent, sha)
+        self.assertNotEqual(
+            rc, 0,
+            "a debugId-shaped line in the middle of the file was stripped as "
+            "if it were the trailing trailer")
 
 
 if __name__ == "__main__":

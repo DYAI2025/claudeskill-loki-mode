@@ -250,7 +250,7 @@ jobs:
               "wiki/API-Reference.md",
           }
           REGULAR_MODES = {"100644", "100755"}
-          VERSION_RE = re.compile(rb"^\d+\.\d+\.\d+$")
+          VERSION_RE = re.compile(rb"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
           # Anchored at the true end of the byte string ONLY (no MULTILINE):
           # this can match at most once, at the last line, so it can never be
           # used to splice a hidden line in anywhere else in the file.
