@@ -106,6 +106,9 @@
 #   PULSE_DOCKER_PS     overrides the docker container listing for
 #                       STRAY_CONTAINER (see that check's own docstring for
 #                       the tab-separated row shape).
+#   PULSE_WORKTREE_LIST overrides `git worktree list --porcelain` for
+#                       WORKTREE_COUNT (a raw porcelain listing, same shape
+#                       as PULSE_WORKTREE_CMD's default output).
 #   PULSE_RELEASE_TESTS overrides the gh-run-list JSON RELEASE_ON_RED reads
 #                       for the newest VERSION-bump commit's Tests conclusion
 #                       (default: read from S-104's gh_ci cache).
@@ -397,8 +400,8 @@ VIOLATION_PRIORITY = [
     "CI_RED", "CI_CANCELLED_STREAK", "RELEASE_ON_RED", "HIGH_LOAD",
     "MOAT_REGRESSION", "UNRELEASED_MERGE", "TRAIN_LATE", "REVIEW_STALE",
     "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM", "ORPHAN_TEST", "STRAY_CONTAINER",
-    "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME",
-    "CONTROL_OVERSIZE",
+    "WORKTREE_COUNT", "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE",
+    "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
 ]
 
 violations = []          # list of (code, text)
@@ -1922,6 +1925,56 @@ else:
         )
 
 
+# --- 12b. WORKTREE_COUNT: too many worktrees under .claude/worktrees (S-94)
+_WORKTREE_COUNT_MAX = 15
+
+
+def check_worktree_count():
+    """Counts `git worktree list --porcelain` entries whose path is under
+    .claude/worktrees (the swarm's per-agent worktree directory) -- unbounded
+    growth there is a disk/inode risk, independent of the live-builder-
+    activity worktree check above (metric 6, which counts ALL worktrees
+    regardless of location, for IDLE_BUILDERS). PULSE_WORKTREE_LIST overrides
+    with a raw porcelain listing (same text shape as PULSE_WORKTREE_CMD's
+    default output), so tests never depend on this host's real worktree
+    count. Returns None only on a real listing failure -- an empty/absent
+    override still runs the real command below."""
+    override = os.environ.get("PULSE_WORKTREE_LIST")
+    if override is not None:
+        text = override
+    else:
+        rc, out, _ = run_capped(
+            ["git", "worktree", "list", "--porcelain"], cwd=REPO_ROOT, env=_clean_env()
+        )
+        if rc != 0:
+            return None
+        text = out
+    count = 0
+    for line in text.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+            if "/.claude/worktrees/" in path:
+                count += 1
+    return count
+
+
+worktree_count = safe(check_worktree_count)
+if worktree_count is None:
+    mark_unknown("worktree_count")
+    emit("Worktrees under .claude/worktrees: UNKNOWN (git worktree list failed)")
+else:
+    emit(
+        "Worktrees under .claude/worktrees: %d (max %d)"
+        % (worktree_count, _WORKTREE_COUNT_MAX)
+    )
+    if worktree_count > _WORKTREE_COUNT_MAX:
+        add_violation(
+            "WORKTREE_COUNT",
+            "%d worktrees under .claude/worktrees exceeds the %d max"
+            % (worktree_count, _WORKTREE_COUNT_MAX),
+        )
+
+
 # --- 13. RELEASE_ON_RED: the newest VERSION bump on main has red Tests -----
 # (D28 rule 2 / S-108's own release-time guard; this is the pulse-side
 # early-warning companion.) Reuses S-104's gh_ci cache -- keyed by the SHA
@@ -2015,6 +2068,7 @@ _NEXT_ACTION_TEXT = {
     "UNEVIDENCED_CLAIM": "add a command/output citation to the named line(s) or retract the claim (D26 guard 4)",
     "ORPHAN_TEST": "investigate the named orphaned/long-running test process; stop by exact PID only if confirmed stale, never by name or pattern",
     "STRAY_CONTAINER": "remove or fix the named swarm container: capped resources, restart policy 'no', removed when done (D28)",
+    "WORKTREE_COUNT": "prune stale worktrees under .claude/worktrees (git worktree remove), it is over the 15 max",
     "IDLE_BUILDERS": "dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md",
     "LOW_READY": "the Product Owner should cut the named number of additional slices onto the ready queue",
     "NO_RECENT_RELEASE": "cut a release now, none has shipped in over 90 minutes",
