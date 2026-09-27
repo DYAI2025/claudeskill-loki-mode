@@ -1387,6 +1387,7 @@ run_test "v10 slice-card template (fields, budget, dispatch rule)" "$SCRIPT_DIR/
 # indistinguishable from no test at all. See test-registration-coverage.sh.
 run_test "Add-dir reaches provider" "$SCRIPT_DIR/test-add-dir-reaches-provider.sh"
 run_test "Auto-PR default on" "$SCRIPT_DIR/test-auto-pr-default-on.sh"
+run_test "Delegate PR refuses the repo default branch" "$SCRIPT_DIR/test-delegate-default-branch.sh"
 run_test "Dashboard port ownership" "$SCRIPT_DIR/test-dashboard-port-ownership.sh"
 run_test "Doctor --json skills section" "$SCRIPT_DIR/test-doctor-json-skills.sh"
 run_test "Emit hang forensics" "$SCRIPT_DIR/test-emit-hang-forensics.sh"

@@ -6070,6 +6070,24 @@ on_run_complete() {
     case "$branch" in
         ""|main|master|HEAD) return 0 ;;
     esac
+    # S-100: also never push the repository's ACTUAL default branch (develop,
+    # trunk, ...). Resolved for the pinned origin (the only one the push
+    # accepts), OWNER/REPO read as data, gh run from / with an explicit repo.
+    # Unresolvable means refuse: fail closed.
+    local _def_url="$remote_url" _def_repo _def_branch=""
+    [ -z "$_LOKI_ORIGIN_PINNED" ] || _def_url="$_LOKI_PINNED_ORIGIN"
+    _def_repo="$(_loki_github_repo_from_url "$_def_url" 2>/dev/null || true)"
+    if [ -n "$_def_repo" ]; then
+        _def_branch="$(_loki_net gh repo view "$_def_repo" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
+    fi
+    if [ -z "$_def_branch" ]; then
+        log_warn "LOKI_DELEGATE_PR=1: not pushing branch '$branch': could not resolve the repository's default branch, and Loki never risks a direct push to it."
+        return 0
+    fi
+    if [ "$branch" = "$_def_branch" ]; then
+        log_warn "LOKI_DELEGATE_PR=1: not pushing branch '$branch': it is the default branch of $_def_repo, and Loki never pushes directly to the default branch."
+        return 0
+    fi
     log_info "LOKI_DELEGATE_PR=1: opening a local pull request for branch '$branch'..."
     # Push, then create. Non-interactive (no tty in --bg). Best-effort, each
     # network call bounded by the timeout guard above.

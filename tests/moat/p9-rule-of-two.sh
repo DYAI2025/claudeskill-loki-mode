@@ -1388,6 +1388,8 @@ PY
         printf '  "auth status") [ "$tok" = yes ] && exit 0; exit 1 ;;\n'
         printf '  "issue view") [ "$tok" = yes ] || { echo "gh: not authenticated" >&2; exit 4; }; cat %q; exit 0 ;;\n' "$T/issue.json"
         printf '  "pr create") [ "$tok" = yes ] && { echo "https://github.com/octocat/hello/pull/7"; exit 0; }; exit 1 ;;\n'
+        # S-100: on_run_complete resolves the default branch before pushing.
+        printf '  "repo view") [ "$tok" = yes ] && { echo main; exit 0; }; exit 1 ;;\n'
         # `gh auth token`: echoes back whatever GH_TOKEN/GITHUB_TOKEN currently
         # holds when present (env tier, matching real gh -- an env value, even
         # a sentinel/garbage one, is returned as-is rather than validated), or
