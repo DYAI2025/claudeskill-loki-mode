@@ -1197,3 +1197,14 @@ sample.
 - Near-miss, false green: the train 2 background push "completed (exit code 0)", but `git ls-remote origin refs/heads/main` still returned b651b98d. `timeout 600 git push ... | tail -5` reported tail's status, not the push's. The first attempt had already been killed by a 120s timeout during the pre-push hook's serial pytest. Correction: after every push, compare `git ls-remote` with `git rev-parse HEAD`; never trust a piped exit code. GUARDS.md candidate (S-76 follow-up): a push helper in scripts/v10-ops.sh that asserts remote == local.
 - The local-ci fast tier took more than 10 min under swarm load (90 of 173 checks at 600s, EXIT=124). Its one real failure (CLAUDE.md tool count after S-78) was fixed in 6f1e68eb. This conflicts with the 10-min command cap; S-91 (Tier A) is the planned replacement. Until then, release on GitHub CI plus the packaging checks run by hand (npm pack contents: 938 entries, 9/9 required).
 - Standing drift check: slices finished inside workflows leave BOARD rows at building until the orchestrator reads the result, which fed 5 false AGENT_OVER_BUDGET hits at 15:15. Read workflow results the same turn they complete.
+
+## Trains 2 and 3 under D27 (2026-09-27)
+| Time (UTC) | Event | Evidence |
+|---|---|---|
+| 15:36 | Train 2 assembled (12 slices); third push attempt still in the pre-push serial pytest | push-train2 log |
+| 15:47 | Loki directive D27 received; background push stopped (TaskStop bw1fgezxd) | |
+| 15:48:18-21 | Train 2 pushed: PRE_PUSH_SKIP=1 git push origin main, rc=0 | HEAD = ls-remote = 89e350bd641a4b659faa405587a9db5bb7bcc201 |
+| 15:50:09-12 | Train 2 release commit v9.57.0 pushed, rc=0 | HEAD = ls-remote = 5332bfc35ccf801bdf8c67bff9fc07537ac4240f |
+| 15:50 | S-80 verified on a real push: Tests on 89e350bd stayed in_progress after 5332bfc3 landed | gh run list |
+| 15:53:23-26 | Train 3 (S-79, S-81, S-82, S-83, S-85) plus release commit v9.58.0 pushed, rc=0 | HEAD = ls-remote = c2eccb21c1273b27a385aa785fedee3269c4f605 |
+- Next: each train counts as released when its publish-npm job succeeds. Train 4 opens now: S-84 (Part C items 3 and 5) once approved, plus S-97 and S-98 (D27 hook and cadence guard). Target push by 16:13 (20-minute cadence).
