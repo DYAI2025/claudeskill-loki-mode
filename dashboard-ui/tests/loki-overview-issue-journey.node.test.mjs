@@ -38,6 +38,9 @@ before(async () => ({ LokiOverview } = await import('../components/loki-overview
 function mounted() {
   const el = new LokiOverview();
   el.attachShadow({ mode: 'open' });
+  // render() shows _renderDisconnected() unless _data.connected is true; the
+  // journey markup under test only exists in the connected branch.
+  el._data.connected = true;
   return el;
 }
 
