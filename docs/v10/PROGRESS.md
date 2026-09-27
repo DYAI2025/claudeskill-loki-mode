@@ -525,3 +525,17 @@ happened, when it hadn't. Fix going forward: after writing a `review@`
 status, verify the dispatch actually happened (check ListAgents or the
 tool result) in the SAME turn, not just write the intended status and
 move on.
+
+**Third occurrence, same session, escalating this to a standing rule:**
+GF-4 was cherry-picked and merged to main (0f214c3f) but its BOARD row
+was left at `review@` -- caught again only by REVIEW_STALE, this time
+48 minutes stale. Three instances of "BOARD.md's status word says one
+thing, the actual git/agent state says another" in a single session is
+a pattern, not a fluke -- the pulse is correctly catching each one, but
+catching it after the fact means the pulse is doing verification work
+that should happen at write time. **Standing rule going forward**:
+every BOARD.md status-word edit (`review@`, `merged@`, etc.) must be
+the SAME tool-call turn as the action it describes -- write `review@`
+only in the turn that dispatches the reviewer, write `merged@` only in
+the turn that performs the cherry-pick/merge. Never pre-write an
+intended status for an action queued later in a longer turn.
