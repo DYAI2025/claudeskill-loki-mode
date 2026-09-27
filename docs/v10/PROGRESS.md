@@ -283,9 +283,13 @@ retroactively, against the already-merged commit, with instructions to
 give a real verdict as if reviewing before merge -- including
 independently re-deriving the root-cause claim, searching for any missed
 23rd instance of the same bug class, and treating a blocking finding as
-real regardless of it already being on main. Result pending; if either
-reviewer finds something blocking, a fix will be dispatched and this
-entry updated.
+real regardless of it already being on main. Result: both APPROVE, no
+blocking findings (full detail in BACKLOG 126). Gap closed. This
+process was worth the cost: a quorum run genuinely AFTER merge still
+caught a real, independent improvement to confidence -- Opus proved the
+sleep-plus-mtime guard is load-bearing on real bash 3.2, not cosmetic,
+and Sonnet strengthened the root-cause claim itself. Neither result
+would exist if the shortcut had gone unquestioned.
 
 Also caught by the same advisor consultation: BOARD.md's normalization
 pass had conflated "merged to main" with "released" for most slices
