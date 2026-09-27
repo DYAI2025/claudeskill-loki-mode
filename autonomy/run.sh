@@ -10334,7 +10334,9 @@ _loki_untrack_agent_committed_user_files() {
     fi
     rm -f "$rec.added"
     if [ ! -s "$rec.new" ]; then
-        rm -f "$rec.new"
+        # BACKLOG 102: zero hits this session -- clear a stale record left by
+        # an earlier session, or it persists forever with nothing to read it.
+        rm -f "$rec.new" "$rec"
         return 0
     fi
     mv -f "$rec.new" "$rec"

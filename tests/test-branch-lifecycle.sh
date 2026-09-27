@@ -1949,6 +1949,41 @@ else
 fi
 
 # =============================================================================
+# Test T102-later-session-no-hits (BACKLOG 102): agent-committed-user-files.z
+# has no reader outside this lifecycle test and was never cleared by a later
+# _loki_untrack_agent_committed_user_files call that finds ZERO covered hits.
+# A prior session's self-commit writes the record (BACKLOG 74 disclosure); a
+# later commit_session_changes call whose own added-files diff turns up no
+# hits must clear the now-stale record, not leave it to persist forever.
+# =============================================================================
+echo "Test T102-later-session-no-hits (BACKLOG 102): a stale agent-committed-user-files.z is cleared by a later no-hit session"
+R102="$(make_repo t102staleclear)"
+out102="$(
+    cd "$R102" || exit 1
+    source "$PREAMBLE"
+    printf 'my notes\n' > usernotes.txt
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'print(1)\n' > work.py
+    git add -A && git commit -qm "agent checkpoint"
+    commit_session_changes >/dev/null 2>&1
+    rec1="$(tr '\000' ' ' 2>/dev/null < .loki/state/agent-committed-user-files.z)"
+    # A later session: the agent commits only its own new tracked file, no
+    # further self-commit of a pre-existing user file. Zero hits this round.
+    printf 'more work\n' > work2.py
+    git add work2.py && git commit -qm "second checkpoint"
+    commit_session_changes >/dev/null 2>&1
+    exists2="$( [ -e .loki/state/agent-committed-user-files.z ] && echo yes || echo no )"
+    printf 'REC1=[%s] EXISTS2=%s' "$rec1" "$exists2"
+)"
+if [ "$out102" = "REC1=[usernotes.txt ] EXISTS2=no" ]; then
+    pass "a later no-hit session clears the stale agent-committed-user-files.z record"
+else
+    fail "BACKLOG 102: agent-committed-user-files.z persisted across a later session with no hits" "got: $out102"
+fi
+
+# =============================================================================
 # Test T-agent-self-commit-secret-abort (BACKLOG 74): the agent self-commits
 # the user's untracked .env, then leaves a new secret-bearing config.js. The
 # secret scan aborts the session commit; the user's .env must still come off
