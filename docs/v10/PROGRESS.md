@@ -759,3 +759,45 @@ a hung shard fail slower but not block releases indefinitely) so a
 release can ship while S-44's fuller per-suite fix continues in the
 background. Do not let "S-44 will fix this properly" become an
 indefinite excuse to keep NO_RECENT_RELEASE unresolved.
+
+## Drift audit, turn 102
+
+**Matched CONTROL.md:** the LOW_READY violation was addressed directly
+(cut S-45 through S-54, 10 new slices total after replacing S-48 which
+turned out to be a stale duplicate). Two low-risk builders (S-48, S-51)
+were dispatched in parallel with the still-running S-29 merge-pass,
+S-18/BACKLOG 149 security rework, S-36 rework, S-44 review, and two
+other in-flight reviewers, without editing any file those agents own --
+file-set overlap was checked against BOARD.md's own file-set columns
+before cutting each new slice.
+
+**Drifted, self-caught this turn:** two consecutive docs-only pushes to
+main (65e1e8f0, then 01d849e2 less than 90 seconds later) each
+cancelled the PRECEDING in-progress Tests run via the workflow's
+`cancel-in-progress` concurrency group -- the exact mechanism S-44's
+build just finished diagnosing as the root cause of this session's
+repeated "shard 2 hangs." This is the first time this session's own
+Product-Owner/status-update cadence (not a builder's commit) has been
+caught doing this to itself. S-44's fix is not yet merged, so nothing
+downstream broke, but this confirms the pattern is not limited to
+builder pushes -- routine BOARD.md bookkeeping commits are just as
+capable of cancelling a healthy run if pushed back-to-back.
+
+**Correction:** batch BOARD.md status edits (dispatch, ready-cut, merge
+notes) into ONE commit per turn wherever the timeline allows, rather
+than pushing after each individual edit. Confirm no Tests run is
+mid-flight (or if one is, that it's either very fresh or about to
+finish) before pushing a docs-only commit that isn't urgent. This
+applies retroactively as a standing discipline, not just for this
+turn.
+
+**NO_RECENT_RELEASE status:** now over 7 hours since the last release
+(v9.55.0). Turn-96's audit already flagged this as needing an interim
+mitigation if S-44 didn't land soon; S-44 has since built and entered
+review (reviewer dispatched, not yet reported). Highest-priority path
+to a release remains: land S-18/BACKLOG 149's security rework (a live,
+confirmed vulnerability -- must ship regardless of release timing
+pressure), resolve S-29's merge, get one fully green (uncancelled)
+Tests run on main, then cut the release. If S-44's review comes back
+clean before the next audit, merge it immediately -- it directly
+reduces the self-cancellation risk this audit just caught.
