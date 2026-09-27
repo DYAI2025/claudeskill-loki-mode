@@ -878,6 +878,24 @@ def ternary_colon_of(s, q):
 #   today (moat run confirms P7 clean on this arm); upgrade the sibling
 #   allowlist or add a config-table carve-out only if review finds a real
 #   instance, matching the standing rule above.
+#   ponytail: one more named ceiling from round 6 (BACKLOG 125 B-5), found
+#   while probing for the same class and confirmed PRE-EXISTING (reproduces
+#   unchanged on the round-5 commit too, not introduced by round 6): the
+#   ||/?? finder's TERMINATOR check accepts a bare closing `)` as a valid
+#   operand boundary without checking what ENCLOSES that paren. `(x ||
+#   TABLE) && other`, `(x || TABLE) ? a : b`, and `(rows ?? TABLE).length`
+#   all wrongly FLAG, because the `)` that closes the outer grouping paren
+#   (opened before the operand even starts) satisfies TERMINATOR the same
+#   way a `)` that closes the table's OWN wrapping paren would -- but here
+#   the group is then used as a condition (`&&`/`?`) or read as a scalar
+#   (`.length`), so TABLE's data never reaches the sink in any of the three,
+#   confirmed via `node -e`. Closing this needs a quote-safe closer-to-opener
+#   map plus a call-vs-grouping-paren distinction plus keyword handling
+#   (`return (x || T) && other` groups, `if (x || T) something` conditions) --
+#   AST territory, not a regex patch; a regex fix here is exactly how round 7
+#   would start. Upgrade only alongside the TS-AST rewrite already flagged
+#   below (`# Upgrade to the TS AST if a multi-line fallback is ever found by
+#   review`), not as another regex patch on top of six rounds of them.
 FALLBACK_ARR = re.compile(r'(?:\|\||\?\?)\s*\[')
 TIMER_LIKE = re.compile(r'^(?:setTimeout|setInterval|setImmediate|setAttribute|setItem|setProperty)$')
 ARRAY_OF = re.compile(r'\bArray\.(of|from)\s*\(')
@@ -991,18 +1009,57 @@ def whole_file_findings(s):
                 return -1
             i = j + 1
     # TERMINATOR: an operand ends at end-of-string, a closing
-    # bracket/brace/paren/comma/semicolon/colon, or another
-    # `||`/`??`/`&&`/`?` (ternary/logical continuation) -- an ALLOWLIST
-    # of terminators, not a blacklist of what must not follow. Defined
-    # here (before table_operand_end) because table_operand_end applies
-    # this SAME boundary test to the text INSIDE a leading paren group,
-    # not only to the top-level operand after it -- so `(BACKUP_ROWS ||
-    # other)` and `(BACKUP_ROWS ?? y)` resolve the inner `BACKUP_ROWS`
-    # exactly as the unparenthesized `rows || BACKUP_ROWS || other` form
-    # already does (hitting `||`/`??` is a valid boundary at any nesting
-    # depth, not just at the outermost one), while `(BACKUP_ROWS).length`
-    # and `(BACKUP_ROWS as Row[]).length` still do NOT resolve, because
-    # `.` is not in TERMINATOR and chain_end returns unchanged there.
+    # bracket/brace/paren/comma/semicolon/colon, or another `||`/`??`
+    # (logical-OR/nullish continuation) -- an ALLOWLIST of terminators, not a
+    # blacklist of what must not follow. Defined here (before
+    # table_operand_end) because table_operand_end applies this SAME boundary
+    # test to the text INSIDE a leading paren group, not only to the
+    # top-level operand after it -- so `(BACKUP_ROWS || other)` and
+    # `(BACKUP_ROWS ?? y)` resolve the inner `BACKUP_ROWS` exactly as the
+    # unparenthesized `rows || BACKUP_ROWS || other` form already does
+    # (hitting `||`/`??` is a valid boundary at any nesting depth, not just
+    # at the outermost one), while `(BACKUP_ROWS).length` and `(BACKUP_ROWS
+    # as Row[]).length` still do NOT resolve, because `.` is not in
+    # TERMINATOR and chain_end returns unchanged there.
+    #
+    # `&&` and a bare `?` (ternary-condition continuation) are DELIBERATELY
+    # NOT terminators here (round 6 fix, BACKLOG 125 B-5): `x || TABLE &&
+    # other` evaluates to `other` whenever TABLE is a non-empty array
+    # (always truthy) -- TABLE is used only as a boolean CONDITION and its
+    # own data never reaches the sink. Likewise `x || TABLE ? a : b`
+    # evaluates to `a`/`b`, never to TABLE. Confirmed against real JS
+    # operator precedence via `node -e`. Accepting `&&`/`?` as boundaries
+    # here (as an earlier round did) let this site wrongly resolve TABLE as
+    # "the fallback value" when it is only ever a condition -- a false
+    # positive on the bare (unparenthesized) form; `x || (TABLE && other)`
+    # already stayed clean because the paren wraps the whole condition
+    # expression and table_operand_end's paren branch never even reaches
+    # this regex for it. This is the ONLY call site that reads TERMINATOR
+    # (`table_operand_end`'s own paren branch uses the narrower INNER_TERM,
+    # defined below, precisely because `&&`/bare-`?`/`,` inside parens carry
+    # this same condition-not-value distinction), so narrowing it here does
+    # not affect the paren-peel path at all.
+    #
+    # CAST_SKIP: an optional ` as Type` consumed BEFORE the boundary check,
+    # not itself a terminator alternative -- round 6 fix, same finding as
+    # the `&&`/bare-`?` one above, reached through a different spelling.
+    # `\bas\b` used to sit directly in TERMINATOR's alternation, so `x ||
+    # TABLE as Row[] && other` (an inline cast in front of `&&`) matched
+    # `as` as if it were itself the boundary, right after TABLE, and never
+    # even looked at the `&&` that followed the cast -- the exact same
+    # condition-not-value false positive as the uncast form, and its FN
+    # twin (`live ? live : TABLE as Row[] || other`, which never reached a
+    # boundary at all under the old TERMINATOR because nothing there
+    # accepted `as ... ||`) both confirmed via `node -e`. Skipping the cast
+    # FIRST, then checking the real character after it, fixes both: `as
+    # Row[]` is consumed, landing on `&&`/`?` (correctly rejected, not a
+    # boundary) or `||`/`??`/end-of-string/`)`/etc (correctly accepted).
+    # Known ceiling: only a SINGLE level of `<...>` generic nesting is
+    # matched (`Record<string, X>` works; `Map<string, Record<string, X>>`
+    # does not, since `[^<>]*` cannot see past its own inner `<`/`>`) -- an
+    # actual nested generic falls back to not resolving as a cast at all,
+    # never to mis-resolving one, so this is a missed-detection ceiling, not
+    # a false-positive risk.
     # [ \t]*, not \s*: \s* also matches a NEWLINE, so it would swallow a
     # missing-semicolon line break and let `$` match nothing right after
     # it (there is no re.M flag here) -- `const data = rows || BACKUP_Q`
@@ -1012,7 +1069,21 @@ def whole_file_findings(s):
     # terminator ONLY when nothing that continues the chain follows it
     # (a bare newline ends the operand; `\n  .slice(0)` continues it, so
     # chain_end must get the chance to consume that line first).
-    TERMINATOR = re.compile(r'[ \t]*(?:[)\]},;:]|\|\||\?\?|&&|\?(?![.?])|\bas\b|\r?\n(?!\s*(?:\??\.|\[))|$)')
+    # CAST_SKIP's type shape is deliberately PRECISE (identifier, optional
+    # `[]` array-suffix repeats, optional single-level `<...>` generic), not
+    # a loose character class: an earlier draft used
+    # `[\w$.\[\]<>, ]*` (a bag of "characters a type might contain"), and its
+    # own greedy `]`/`)`/`,`/`:` characters overlap with the terminator
+    # alternation right after it -- on `TBL as Row[] && other`, the
+    # backtracking engine gave back one character at a time from the loose
+    # class until the terminator alternation's `[)\]},;:]` branch could
+    # match the CLOSING `]` OF THE TYPE ITSELF (`Row[]`'s own bracket), so
+    # the match ended right there and never even looked at `&&` -- silently
+    # re-introducing the exact FP this cast-skip exists to close. The
+    # precise shape has nothing left to give back that the terminator
+    # alternation could also match, so it cannot happen here.
+    CAST_SKIP = r'(?:\s+as\s+[\w$]+(?:\[\])*(?:<[^<>]*>)?)?'
+    TERMINATOR = re.compile(CAST_SKIP + r'[ \t]*(?:[)\]},;:]|\|\||\?\?|\r?\n(?!\s*(?:\??\.|\[))|$)')
     def table_operand_end(t, i):
         """t[i:] is the start of an operand that may name a table. Returns
         (name, end) when it resolves to a known table plus a trailing
@@ -1079,31 +1150,64 @@ def whole_file_findings(s):
     # Only `||`/`??` (or end-of-string) let the INNER content of a paren
     # group resolve to the table -- see table_operand_end's own docstring for
     # why this must NOT be the same, broader TERMINATOR used at the top-level
-    # operand position.
-    INNER_TERM = re.compile(r'\s*(?:\|\||\?\?|$)')
+    # operand position. CAST_SKIP (round 6 fix, shared with TERMINATOR) lets
+    # an inline ` as Type` sit BEFORE the `||`/`??`/end-of-string boundary
+    # here too: `(TABLE as Row[] || other)`'s inner text is `TABLE as Row[]
+    # || other`, and without CAST_SKIP the `as` would sit directly in front
+    # of `iend` with nothing to consume it, so INNER_TERM never matched and
+    # this whole paren form was invisible even though TABLE's data reaches
+    # the sink identically to the uncast `(TABLE || other)` -- confirmed via
+    # `node -e` (a TypeScript `as` cast is erased at runtime). The line 1104
+    # end-anchored `as` strip above still runs first and remains correct for
+    # the pure `(TABLE as Row[])` case (nothing follows the cast); it is now
+    # redundant with CAST_SKIP for that exact shape but not for this one,
+    # so both stay.
+    INNER_TERM = re.compile(CAST_SKIP + r'\s*(?:\|\||\?\?|$)')
     def resolves_to_table_read(text):
         """True when text is a known table name -- optionally wrapped in
         a balanced paren group at any nesting depth -- followed by a chain
-        of zero or more array-returning calls and NOTHING else (the resolved
-        end must land exactly at len(text), after stripping one trailing
-        `as <Type>` first) -- the broad "does this operand carry the
-        table's data" test used at the ||/?? and ternary match sites, and (as
-        of this rework) the spread-element check inside literal_rows_resolved
-        below too. The trailing `as Type` strip happens HERE, once, on the
-        WHOLE input text, rather than inside table_operand_end's paren
-        branch only: `live ? live : BACKUP_ROWS as Row[]` (no parens at all,
-        a bare cast) is valid TypeScript and must resolve the same way
-        `live ? live : (BACKUP_ROWS as Row[])` does -- stripping only inside
-        the paren branch would silently stop catching the unparenthesized
-        cast form, a real regression this rework's own restructuring
-        introduced and caught via matrix testing before it shipped. Returns
-        the matched name or None."""
+        of zero or more array-returning calls and then either NOTHING else or
+        a trailing `||`/`??` continuation (the resolved end must land at
+        len(text) or at an INNER_TERM boundary, after stripping one trailing
+        `as <Type>` first) -- the broad "does this operand carry the table's
+        data" test used at the ||/?? and ternary match sites, and (as of this
+        rework) the spread-element check inside literal_rows_resolved below
+        too. The trailing `as Type` strip happens HERE, once, on the WHOLE
+        input text, rather than inside table_operand_end's paren branch
+        only: `live ? live : BACKUP_ROWS as Row[]` (no parens at all, a bare
+        cast) is valid TypeScript and must resolve the same way `live ? live
+        : (BACKUP_ROWS as Row[])` does -- stripping only inside the paren
+        branch would silently stop catching the unparenthesized cast form, a
+        real regression this rework's own restructuring introduced and
+        caught via matrix testing before it shipped.
+
+        INNER_TERM (not TERMINATOR) is the right boundary here, matching
+        table_operand_end's own paren-branch reasoning (round 6 fix,
+        BACKLOG 125 B-5): `live ? live : TABLE || other` (a BARE table name,
+        no wrapping parens at all, as the whole colon branch) previously
+        required end == len(text) exactly, so it never resolved -- even
+        though `live ? live : (TABLE || other)` (the identical expression
+        wrapped in one extra pair of parens) already did, via
+        table_operand_end's own recursive paren-peel landing on this same
+        INNER_TERM. TABLE's data reaches the sink identically in both forms
+        (confirmed via `node -e` against real JS semantics: when `live` is
+        falsy, the result is TABLE's own array whenever TABLE is truthy, or
+        `other` otherwise -- either way TABLE CAN reach the sink), so both
+        forms must resolve the same way; the bare form was an undetected
+        paren/no-paren asymmetry, the same bug class as every earlier round
+        here. `&&` and a bare `?` deliberately stay OUT of the boundary
+        (TABLE used only as a condition never exposes its own data -- see
+        TERMINATOR's docstring for the twin false-positive this class
+        caused at the ||/?? finder site). Returns the matched name or
+        None."""
         text = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', text.strip()).strip()
         res = table_operand_end(text, 0)
         if not res:
             return None
         name, end = res
-        return name if end == len(text) else None
+        if end < 0:
+            return None
+        return name if end == len(text) or INNER_TERM.match(text, end) else None
 
     def table_is_fabricated_rows(name):
         opener, i, j = module_tables[name]
@@ -2436,6 +2540,99 @@ export function PA({ x, other }) {
   return <b>{data}</b>;
 }
 TSX
+    # BACKLOG 125 B-5 REWORK ROUND 6: round 5's INNER_TERM-vs-TERMINATOR
+    # distinction (fix 2 above) was applied ONLY inside table_operand_end's
+    # paren-peel branch, not to the bare (unparenthesized) top-level operand
+    # branch, an asymmetry with the paren case -- the same paren/bare
+    # boundary-symmetry bug class as every earlier round here.
+    #   1. False negative: `live ? live : TABLE || other` (bare, no wrapping
+    #      parens around `TABLE || other` at all) was NOT caught, even though
+    #      the identical expression wrapped in one extra pair of parens
+    #      (`live ? live : (TABLE || other)`, ParenNestedOrTernaryFallback
+    #      above) already was. Confirmed via `node -e`: when `live` is
+    #      falsy, the result is TABLE's own array whenever TABLE is truthy,
+    #      or `other` otherwise -- either way TABLE's data CAN reach the
+    #      sink, identically to the already-caught paren-wrapped twin.
+    cat > "$d/src/components/BareOrChainTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS14 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function BO({ live, other }) {
+  const data = live ? live : BACKUP_ROWS14 || other;
+  return <b>{data}</b>;
+}
+TSX
+    cat > "$d/src/components/BareNullishChainTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS15 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function BN({ live, other }) {
+  const data = live ? live : BACKUP_ROWS15 ?? other;
+  return <b>{data}</b>;
+}
+TSX
+    #   2. False positive, the mirror image: `x || TABLE && other` and
+    #      `x || TABLE ? a : b` were WRONGLY flagged at the ||/?? finder
+    #      site, which read TERMINATOR's `&&`/bare-`?` alternatives as valid
+    #      operand boundaries -- but TABLE is used only as a boolean
+    #      CONDITION here, and the expression evaluates to `other`/`a`/`b`,
+    #      never to TABLE. Confirmed via `node -e` against real JS operator
+    #      precedence. The paren-wrapped twin (ParenAndConditionHonest
+    #      above) already stayed clean; only the bare form over-flagged.
+    #      TERMINATOR no longer accepts `&&`/bare-`?` at all (round 6 fix).
+    cat > "$d/src/components/BareOrAndConditionHonest.tsx" <<'TSX'
+const PERMS5 = [
+  { id: 'p1', label: 'A' },
+];
+
+export function PB({ x, other }) {
+  const data = x || PERMS5 && other;
+  return <b>{data}</b>;
+}
+TSX
+    cat > "$d/src/components/BareOrTernaryConditionHonest.tsx" <<'TSX'
+const PERMS6 = [
+  { id: 'p1', label: 'A' },
+];
+
+export function PC({ x, a, b }) {
+  const data = x || PERMS6 ? a : b;
+  return <b>{data}</b>;
+}
+TSX
+    #   3. The SAME false-positive/false-negative pair, reached through an
+    #      inline `as Type` cast in front of the boundary: TERMINATOR used to
+    #      accept a bare `\bas\b` as itself a terminator, so `x || TABLE as
+    #      Row[] && other` matched "as" as the boundary and never even looked
+    #      at the `&&` that followed -- the identical condition-not-value FP
+    #      as fix 2, just spelled with a cast in the middle. CAST_SKIP
+    #      (round 6) consumes the cast first, then checks the REAL character
+    #      after it. Its own first draft used a loose character class that
+    #      let the terminator alternation match the closing `]` of `Row[]`
+    #      itself via backtracking; CAST_SKIP's final, precise type-shape
+    #      regex has nothing left to give back, closing that reopening too.
+    cat > "$d/src/components/BareOrCastAndConditionHonest.tsx" <<'TSX'
+const PERMS7 = [
+  { id: 'p1', label: 'A' },
+];
+
+export function PD({ x, other }) {
+  const data = x || PERMS7 as Row[] && other;
+  return <b>{data}</b>;
+}
+TSX
+    cat > "$d/src/components/BareOrChainCastTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS16 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function BC2({ live, other }) {
+  const data = live ? live : BACKUP_ROWS16 as Row[] || other;
+  return <b>{data}</b>;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -2493,6 +2690,9 @@ SpreadChainSliceTernaryFallback.tsx:6|literal sample rows in a ternary branch
 PrettyMultilineCastFallback.tsx:6|module-level table 'BACKUP_ROWS11' (fabricated rows) used as a fallback
 ParenNestedOrTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS12' (fabricated rows) used as a fallback
 BareCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS13' (fabricated rows) used as a fallback
+BareOrChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS14' (fabricated rows) used as a fallback
+BareNullishChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS15' (fabricated rows) used as a fallback
+BareOrChainCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS16' (fabricated rows) used as a fallback
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -2512,6 +2712,8 @@ EOF
         SpreadChainSliceFallback.tsx:1 SpreadChainSliceTernaryFallback.tsx:1 \
         PrettyMultilineCastFallback.tsx:1 ParenNestedOrTernaryFallback.tsx:1 \
         BareCastTernaryFallback.tsx:1 \
+        BareOrChainTernaryFallback.tsx:1 BareNullishChainTernaryFallback.tsx:1 \
+        BareOrChainCastTernaryFallback.tsx:1 \
         DefaultProvidersSpreadHonest.tsx:0 \
         ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
         BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
@@ -2519,7 +2721,9 @@ EOF
         ModuleTablesHonest.tsx:0 TimerHonest.tsx:0 \
         ModuleTableSelfDerivedHonest.tsx:0 ModuleTableDefaultOptsHonest.tsx:0 \
         ParenScalarLengthReadHonest.tsx:0 ParenBareIndexPickHonest.tsx:0 \
-        ParenAndConditionHonest.tsx:0; do
+        ParenAndConditionHonest.tsx:0 \
+        BareOrAndConditionHonest.tsx:0 BareOrTernaryConditionHonest.tsx:0 \
+        BareOrCastAndConditionHonest.tsx:0; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
