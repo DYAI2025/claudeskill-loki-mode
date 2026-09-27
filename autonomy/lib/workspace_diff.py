@@ -109,13 +109,16 @@ def _preexisting_untracked(repo_dir):
 
 
 def _covered(key, paths):
-    """True when ``key`` or one of its parent directories ("a/", "a/b/") is in
-    ``paths``: an ignored directory entry covers everything below it."""
+    """True when ``key`` or one of its parent directories is in ``paths``,
+    either as a directory entry ("a/", "a/b/") or a bare-path entry ("a",
+    "a/b"): an ignored directory, or a preexisting file later replaced by a
+    directory of the same name, covers everything below it."""
     if key in paths:
         return True
     cut = key.find("/")
     while cut != -1:
-        if key[:cut + 1] in paths:
+        parent = key[:cut]
+        if parent in paths or (parent + "/") in paths:
             return True
         cut = key.find("/", cut + 1)
     return False

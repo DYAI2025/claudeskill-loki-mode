@@ -422,6 +422,37 @@ class FinalWorkspaceDiffTests(unittest.TestCase):
             [item["path"] for item in proof["files_changed"]["files"]],
             ["new.txt", "node_modules_extra.txt"])
 
+    def test_preexisting_bare_file_replaced_by_directory_covers_children(self):
+        # BACKLOG 78: the snapshot recorded a bare-file entry "a" (no trailing
+        # slash). The agent then deletes "a" and creates a directory of the
+        # same name with a child "a/b". That child is a natural extension of
+        # "a" (the file's whole path is superseded, not the run's own work),
+        # so it must be covered the same way a directory entry "a/" already is.
+        base = self._baseline()
+        self.write("a", "mine\n")
+        self.write_snapshot("", ["a"])
+        os.unlink(os.path.join(self.proj, "a"))
+        self.write("a/b", "agent\n")
+        self.write("new.txt", "agent\n")
+
+        proof = self.generate(base)
+        self.assertEqual(
+            [item["path"] for item in proof["files_changed"]["files"]],
+            ["new.txt"])
+
+    def test_preexisting_bare_file_does_not_cover_unrelated_sibling_prefix(self):
+        # Regression: an "a" entry must not falsely cover "ab" (a genuinely
+        # unrelated file that merely shares a leading character), only paths
+        # actually nested under "a/".
+        base = self._baseline()
+        self.write("ab", "agent\n")
+        self.write_snapshot("", ["a"])
+
+        proof = self.generate(base)
+        self.assertEqual(
+            [item["path"] for item in proof["files_changed"]["files"]],
+            ["ab"])
+
     def test_preexisting_file_the_run_changed_is_listed_without_content(self):
         # BACKLOG 59: listed with its own status, no counts and no patch (the
         # user's bytes stay out of the receipt); an unchanged one stays unlisted.
