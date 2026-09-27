@@ -35,16 +35,29 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
 
       - name: Install Python test dependencies (for R5 dashboard/web-app pytest)
         run: python3 -m pip install -r requirements-test.txt
 
+      # oven-sh/setup-bun caches the bun install directory by default (no
+      # no-cache: true set here), so bun installs are already cached; this
+      # job holds no write permissions or secrets (P9 cache-channel rule),
+      # so that default cache is safe to keep.
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
       - name: Install loki-ts dependencies (for R4 bun test / typecheck)
         working-directory: loki-ts
         run: bun install
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-app/package-lock.json
 
       - name: Install web-app dependencies (for R5 node_lint / pytest)
         working-directory: web-app
@@ -54,6 +67,11 @@ jobs:
         run: |
           bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}"
 
+      # R0 (broad-blast-radius or unrecognized-path diff) runs the full
+      # tests/run-all-tests.sh suite here instead of the capped per-suite
+      # selection; give that path its own explicit budget rather than
+      # relying only on the job-level timeout.
       - name: Run selected suites
+        timeout-minutes: 20
         run: |
           bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}" --run

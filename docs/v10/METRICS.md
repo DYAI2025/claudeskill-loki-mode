@@ -156,3 +156,53 @@ rather than something job-setup variance or GitHub's own queueing missed, and
 that `test-ci-json-argmax.sh` actually lands near 60s once its BACKLOG 25
 fixture fix ships (until then this table's 60s row is an assumption, not a
 measurement, as stated in `tests/shard-durations.tsv`'s own header).
+
+## Tier A selector: last 10 non-docs commits (S-96, S-91 remainder)
+
+`scripts/select-tests.sh --base <SHA>^ --head <SHA>` (selection only, no
+`--run`), against the last 10 non-merge commits on main whose diff touches
+something outside `docs/v10` (`git log --no-merges -- . ':!docs/v10'`).
+Selector time is real wall clock (`/usr/bin/time -p`) for the selection step
+alone, measured in this worktree, one commit at a time. "Selected tests" for
+an R0 row is the whole `tests/run-all-tests.sh` suite (R0 means "run
+everything"), not a count of individual suites.
+
+| SHA | Rule(s) fired | Selected tests | Selector time |
+|---|---|---|---|
+| cc105687 | R1, R3 | 7 | 6.62s |
+| a4eb09d7 | R1, R3 | 7 | 6.24s |
+| a1ca3c7b | R0 | ALL (full suite, matched VERSION) | 0.04s |
+| 8009b193 | R3 | 2 | 6.98s |
+| 878f79e7 | R1, R3, R6 | 25 | 14.34s |
+| a537bb22 | R1, R3 | 7 | 7.24s |
+| 298f027e | R1, R6 | 3 | 0.04s |
+| 11c302bf | R0 | ALL (full suite, matched loki-ts/dist/loki.js) | 0.05s |
+| 03d5b515 | R0 | ALL (full suite, matched loki-ts/package.json) | 0.04s |
+| ea8ecf1c | R3 | 2 | 7.02s |
+
+All 10 land under 120s (the 3 R0 rows are the declared exception to the
+2-minute Tier A target and are labeled ALL rather than timed against it, per
+the green criterion in BOARD.md S-96).
+
+### tier-a.yml install caches (S-96)
+
+Added `pip` (setup-python `cache: pip`) and `npm` (new `setup-node@v4`,
+`cache: npm`) install caches to the `select-and-run` job; `oven-sh/setup-bun`
+was already caching bun installs by default (no `no-cache: true` set).
+`tests/moat/p9-rule-of-two.sh`'s cache-channel rule
+(P9.issue-workflows-separate-untrusted-from-push) bans an Actions cache only
+on a unit holding write permissions or secrets; `select-and-run` holds
+neither (`permissions: contents: read` at the workflow level, no
+job-level override, no `secrets.*` reference), so this is a negative-control
+case, verified both ways:
+
+| Check | Result |
+|---|---|
+| P9 green before the change | `bash tests/moat/p9-rule-of-two.sh` -> all 4 cases PASS, exit 0 |
+| P9 green after adding the 3 caches | `bash tests/moat/p9-rule-of-two.sh` -> all 4 cases PASS, exit 0; `SITE tier-a.yml:select-and-run ... verdict=ok` |
+| Mutation (`contents: read` -> `contents: write`) | `bash tests/moat/p9-rule-of-two.sh` -> `CASE P9.issue-workflows-separate-untrusted-from-push FAIL ... holds write permissions and restores actions/setup-python cache: pip, oven-sh/setup-bun ..., actions/setup-node cache: npm` (the guard names exactly the 3 caches added here) |
+| Mutation reverted | `bash tests/moat/p9-rule-of-two.sh` -> all 4 cases PASS, exit 0 again |
+
+Also added an explicit `timeout-minutes: 20` on the "Run selected suites"
+step (where the R0 full-suite path executes), so R0 has its own budget
+instead of only the job-level 25.
