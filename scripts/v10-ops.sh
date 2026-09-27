@@ -78,6 +78,18 @@ Subcommands:
       that refuses new files (a read-only board) is reported as a clean
       error, not a traceback. Default board-md-path: docs/v10/BOARD.md.
 
+  push-main
+      Pushes HEAD's REPO_ROOT (this script's own repo) to origin main with
+      no pipe, then verifies the push actually landed: compares `git
+      ls-remote origin refs/heads/main` against `git rev-parse HEAD`. Prints
+      both SHAs. Succeeds (exit 0) only if the push itself exited 0 AND the
+      two SHAs match; any other outcome (a rejected/failed push, or a
+      mismatched remote) is exit 1, with both SHAs still printed as evidence.
+      PRE_PUSH_SKIP is passed straight through: it is read from this
+      process's own environment (however the caller set it) and inherited by
+      `git push`'s pre-push hook like any other subprocess call, no extra
+      wiring needed.
+
   version-check
       Prints VERSION file contents and, if network/gh access works, the
       latest published npm version of loki-mode for comparison.
@@ -401,6 +413,36 @@ print("board-row-status: " + slice_id + " -> " + new_token + "@" + timestamp)
 ' "$board" "$slice_id" "$new_token" "$V10_OPS_BOARD_TOKENS"
 }
 
+cmd_push_main() {
+    # PRE_PUSH_SKIP passthrough: any env var already present in this
+    # process's environment is inherited by every subprocess it spawns
+    # (including `git push`'s own pre-push hook) with no extra code needed.
+    # The re-export below only guards the edge case where PRE_PUSH_SKIP
+    # arrived as a plain, unexported shell variable rather than a real env
+    # var -- it is a no-op for the normal `PRE_PUSH_SKIP=1 bash ...` case.
+    export PRE_PUSH_SKIP="${PRE_PUSH_SKIP:-}"
+
+    local push_rc local_sha remote_sha
+    # No pipe: the exit code captured below is git push's own, never a
+    # pipeline's (a `| tee` or `| cat` here would launder a real push
+    # failure through pipefail's last-command-wins semantics).
+    git -C "$REPO_ROOT" push origin main
+    push_rc=$?
+
+    local_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    remote_sha="$(git -C "$REPO_ROOT" ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')"
+
+    echo "local HEAD:  $local_sha"
+    echo "origin/main: ${remote_sha:-<none>}"
+
+    if [ "$push_rc" -eq 0 ] && [ -n "$remote_sha" ] && [ "$remote_sha" = "$local_sha" ]; then
+        echo "push-main: OK (push exited 0, ls-remote matches HEAD)"
+        return 0
+    fi
+    echo "push-main: FAILED (push rc=$push_rc, HEAD=$local_sha, origin/main=${remote_sha:-<none>})" >&2
+    return 1
+}
+
 cmd_version_check() {
     local v
     v="$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo MISSING)"
@@ -438,6 +480,7 @@ main() {
         clean-check)            cmd_clean_check "$@" ;;
         commit-msg-template)    cmd_commit_msg_template "$@" ;;
         board-row-status)       cmd_board_row_status "$@" ;;
+        push-main)              cmd_push_main "$@" ;;
         version-check)          cmd_version_check "$@" ;;
         ci-status)              cmd_ci_status "$@" ;;
         -h|--help|help|"")      usage ;;

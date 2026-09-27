@@ -667,6 +667,200 @@ else
     bad "the canonical real docs/v10/BOARD.md changed during the sweep: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
 fi
 
+# --- push-main: against a local bare remote ---------------------------------
+# Every case here uses a scratch git repo pushing to a scratch bare "remote"
+# (a directory, never a real network endpoint), and a copy of v10-ops.sh
+# placed inside that scratch repo's scripts/ dir so REPO_ROOT (self-derived
+# from BASH_SOURCE) resolves to the scratch repo, same pattern as clean-check
+# above.
+
+REAL_GIT="$(command -v git)"
+
+echo "== push-main: succeeds against a real local bare remote, ls-remote matches HEAD =="
+BARE_OK="$WORK/bare-ok.git"
+git init -q --bare "$BARE_OK"
+SCRATCH_PUSH_OK="$WORK/scratch-push-ok"
+mkdir -p "$SCRATCH_PUSH_OK/scripts"
+cp "$OPS_SH" "$SCRATCH_PUSH_OK/scripts/v10-ops.sh"
+(
+    cd "$SCRATCH_PUSH_OK" || exit 1
+    git init -q -b main .
+    git config user.name "test"
+    git config user.email "test@example.com"
+    git remote add origin "$BARE_OK"
+    echo "hello" > file.txt
+    git add file.txt scripts/v10-ops.sh
+    git commit -q -m "init"
+)
+LOCAL_SHA_OK="$(cd "$SCRATCH_PUSH_OK" && git rev-parse HEAD)"
+out="$(bash "$SCRATCH_PUSH_OK/scripts/v10-ops.sh" push-main 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] \
+    && printf '%s' "$out" | grep -qF "local HEAD:  $LOCAL_SHA_OK" \
+    && printf '%s' "$out" | grep -qF "origin/main: $LOCAL_SHA_OK" \
+    && printf '%s' "$out" | grep -qi "push-main: OK"; then
+    ok "push-main succeeds against a real bare remote and prints both matching SHAs"
+else
+    bad "push-main success case: rc=$rc out=$out"
+fi
+# The remote must actually hold the push, not just report success.
+REMOTE_HEAD_OK="$(git -C "$BARE_OK" rev-parse refs/heads/main)"
+if [ "$REMOTE_HEAD_OK" = "$LOCAL_SHA_OK" ]; then
+    ok "the bare remote's main really points at the pushed commit"
+else
+    bad "the bare remote was not actually updated: remote=$REMOTE_HEAD_OK local=$LOCAL_SHA_OK"
+fi
+
+echo "== push-main: PRE_PUSH_SKIP is passed through to a real pre-push hook =="
+BARE_HOOK="$WORK/bare-hook.git"
+git init -q --bare "$BARE_HOOK"
+SCRATCH_PUSH_HOOK="$WORK/scratch-push-hook"
+mkdir -p "$SCRATCH_PUSH_HOOK/scripts"
+cp "$OPS_SH" "$SCRATCH_PUSH_HOOK/scripts/v10-ops.sh"
+(
+    cd "$SCRATCH_PUSH_HOOK" || exit 1
+    git init -q -b main .
+    git config user.name "test"
+    git config user.email "test@example.com"
+    git remote add origin "$BARE_HOOK"
+    # A real pre-push hook that fails the push unless PRE_PUSH_SKIP is set --
+    # exactly the shape a caller's own repo hook takes.
+    cat > .git/hooks/pre-push <<'HOOK'
+#!/bin/sh
+if [ "${PRE_PUSH_SKIP:-}" = "1" ]; then
+    exit 0
+fi
+echo "pre-push: blocked, PRE_PUSH_SKIP not set" >&2
+exit 1
+HOOK
+    chmod +x .git/hooks/pre-push
+    echo "hello" > file.txt
+    git add file.txt scripts/v10-ops.sh
+    git commit -q -m "init"
+)
+out="$(env -u PRE_PUSH_SKIP bash "$SCRATCH_PUSH_HOOK/scripts/v10-ops.sh" push-main 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "push-main: FAILED"; then
+    ok "push-main fails when the pre-push hook blocks it (PRE_PUSH_SKIP unset)"
+else
+    bad "push-main hook-blocked case: rc=$rc out=$out"
+fi
+out="$(PRE_PUSH_SKIP=1 bash "$SCRATCH_PUSH_HOOK/scripts/v10-ops.sh" push-main 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "push-main: OK"; then
+    ok "push-main succeeds once PRE_PUSH_SKIP=1 is set, proving it reaches the pre-push hook"
+else
+    bad "push-main PRE_PUSH_SKIP-passthrough case: rc=$rc out=$out"
+fi
+
+echo "== push-main: a rejected (non-fast-forward) push reports failure, exit 1 =="
+BARE_REJECT="$WORK/bare-reject.git"
+git init -q --bare "$BARE_REJECT"
+# Populate the remote's main via a throwaway pusher, then advance it again so
+# the remote is ahead of what the real scratch repo below will hold.
+OTHER_PUSHER="$WORK/other-pusher"
+mkdir -p "$OTHER_PUSHER"
+(
+    cd "$OTHER_PUSHER" || exit 1
+    git init -q -b main .
+    git config user.name "test"
+    git config user.email "test@example.com"
+    git remote add origin "$BARE_REJECT"
+    echo "one" > f.txt
+    git add f.txt
+    git commit -q -m "first"
+    git push -q origin main
+    echo "two" > f.txt
+    git add f.txt
+    git commit -q -m "second, diverges from what the scratch repo below will push"
+    git push -q origin main
+)
+SCRATCH_PUSH_REJECT="$WORK/scratch-push-reject"
+mkdir -p "$SCRATCH_PUSH_REJECT/scripts"
+cp "$OPS_SH" "$SCRATCH_PUSH_REJECT/scripts/v10-ops.sh"
+(
+    cd "$SCRATCH_PUSH_REJECT" || exit 1
+    git init -q -b main .
+    git config user.name "test"
+    git config user.email "test@example.com"
+    git remote add origin "$BARE_REJECT"
+    echo "one" > f.txt
+    git add f.txt scripts/v10-ops.sh
+    # Independently-authored "first" commit: different tree (carries
+    # scripts/v10-ops.sh too) so it has a different SHA, and has no common
+    # history with the remote's current tip -- a plain (non-force) push is
+    # rejected as non-fast-forward.
+    git commit -q -m "first, independently authored"
+)
+LOCAL_SHA_REJECT="$(cd "$SCRATCH_PUSH_REJECT" && git rev-parse HEAD)"
+REMOTE_SHA_REJECT_BEFORE="$(git -C "$BARE_REJECT" rev-parse refs/heads/main)"
+out="$(bash "$SCRATCH_PUSH_REJECT/scripts/v10-ops.sh" push-main 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] \
+    && printf '%s' "$out" | grep -qF "local HEAD:  $LOCAL_SHA_REJECT" \
+    && printf '%s' "$out" | grep -qF "origin/main: $REMOTE_SHA_REJECT_BEFORE" \
+    && printf '%s' "$out" | grep -q "push-main: FAILED"; then
+    ok "push-main reports failure (exit 1) on a rejected non-fast-forward push, both SHAs shown"
+else
+    bad "push-main rejected-push case: rc=$rc out=$out"
+fi
+REMOTE_SHA_REJECT_AFTER="$(git -C "$BARE_REJECT" rev-parse refs/heads/main)"
+if [ "$REMOTE_SHA_REJECT_AFTER" = "$REMOTE_SHA_REJECT_BEFORE" ]; then
+    ok "the remote was genuinely untouched by the rejected push"
+else
+    bad "the remote changed despite the push being reported as rejected"
+fi
+
+echo "== push-main: push succeeds but ls-remote disagrees with HEAD -- reports failure, exit 1 =="
+# A fake `git` shim ahead of PATH: forwards every real subcommand (including
+# push and rev-parse) to the real git binary, but intercepts ls-remote and
+# returns a fixed, wrong SHA -- proving push-main's success verdict depends
+# on the actual ls-remote/HEAD comparison, not merely on push's own exit code.
+BARE_MISMATCH="$WORK/bare-mismatch.git"
+git init -q --bare "$BARE_MISMATCH"
+SCRATCH_PUSH_MISMATCH="$WORK/scratch-push-mismatch"
+mkdir -p "$SCRATCH_PUSH_MISMATCH/scripts"
+cp "$OPS_SH" "$SCRATCH_PUSH_MISMATCH/scripts/v10-ops.sh"
+(
+    cd "$SCRATCH_PUSH_MISMATCH" || exit 1
+    git init -q -b main .
+    git config user.name "test"
+    git config user.email "test@example.com"
+    git remote add origin "$BARE_MISMATCH"
+    echo "hello" > file.txt
+    git add file.txt scripts/v10-ops.sh
+    git commit -q -m "init"
+)
+LOCAL_SHA_MISMATCH="$(cd "$SCRATCH_PUSH_MISMATCH" && git rev-parse HEAD)"
+FAKE_SHA="0000000000000000000000000000000000dead"
+FAKE_GIT_DIR="$WORK/fake-git-mismatch"
+mkdir -p "$FAKE_GIT_DIR"
+cat > "$FAKE_GIT_DIR/git" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+    if [ "\$a" = "ls-remote" ]; then
+        printf '%s\trefs/heads/main\n' "$FAKE_SHA"
+        exit 0
+    fi
+done
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$FAKE_GIT_DIR/git"
+out="$(PATH="$FAKE_GIT_DIR:$PATH" bash "$SCRATCH_PUSH_MISMATCH/scripts/v10-ops.sh" push-main 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] \
+    && printf '%s' "$out" | grep -qF "local HEAD:  $LOCAL_SHA_MISMATCH" \
+    && printf '%s' "$out" | grep -qF "origin/main: $FAKE_SHA" \
+    && printf '%s' "$out" | grep -q "push-main: FAILED"; then
+    ok "push-main reports failure (exit 1) when the push succeeds but ls-remote does not match HEAD"
+else
+    bad "push-main remote-mismatch case: rc=$rc out=$out"
+fi
+# The real push, forwarded through the fake git shim, actually landed --
+# proving the failure verdict comes from the ls-remote comparison, not from
+# the underlying push itself having failed.
+REAL_REMOTE_AFTER_MISMATCH="$(git -C "$BARE_MISMATCH" rev-parse refs/heads/main)"
+if [ "$REAL_REMOTE_AFTER_MISMATCH" = "$LOCAL_SHA_MISMATCH" ]; then
+    ok "the underlying push itself genuinely succeeded despite the reported mismatch (the shim only lied about ls-remote)"
+else
+    bad "the underlying push did not actually land: remote=$REAL_REMOTE_AFTER_MISMATCH local=$LOCAL_SHA_MISMATCH"
+fi
+
 # --- version-check / ci-status: PATH shadowing -----------------------------
 # A minimal PATH containing only the external binaries each subcommand
 # genuinely needs, so `command -v npm` / `command -v gh` reliably fail

@@ -80,6 +80,17 @@
 #                       from input that cannot be proven current.
 #   PULSE_SWARM_START   swarm start time override, epoch seconds or ISO8601
 #   PULSE_NOW           "now" override, epoch seconds or ISO8601
+#   PULSE_LAST_TRAIN_PUSH override for the last train-push time (TRAIN_LATE,
+#                       D27 item 6), epoch seconds or ISO8601. Deliberately
+#                       never the release tag -- a release can lag a push by
+#                       minutes (see NO_RECENT_RELEASE's separate 90-minute
+#                       budget for that). With no override, falls back to the
+#                       mtime of the newest push-*.log file under
+#                       PULSE_PUSH_LOG_DIR.
+#   PULSE_PUSH_LOG_DIR  directory to look for push-*.log files in for the
+#                       PULSE_LAST_TRAIN_PUSH fallback above (default:
+#                       ~/loki-ci-logs, where scripts/v10-ops.sh push-main
+#                       and the swarm's train-push tooling write their logs).
 #   PULSE_PYTHON        python3 interpreter to use (default: python3)
 #   PULSE_DEADLINE_SECS network-call time budget in seconds for npm+gh
 #                       together (default: 6; git/worktree calls use a
@@ -107,6 +118,8 @@ export PULSE_WORKTREE_CMD="${PULSE_WORKTREE_CMD:-}"
 export PULSE_MOAT_RESULT="${PULSE_MOAT_RESULT:-}"
 export PULSE_SWARM_START="${PULSE_SWARM_START:-}"
 export PULSE_NOW="${PULSE_NOW:-}"
+export PULSE_LAST_TRAIN_PUSH="${PULSE_LAST_TRAIN_PUSH:-}"
+export PULSE_PUSH_LOG_DIR="${PULSE_PUSH_LOG_DIR:-}"
 export PULSE_DEADLINE_SECS="${PULSE_DEADLINE_SECS:-6}"
 
 # `-` (read the program from stdin) rather than a real path: sys.path[0] is
@@ -330,8 +343,8 @@ NOW = now_epoch()
 # the TOP violation -- an accidental ordering-by-discovery would misrank it.
 VIOLATION_PRIORITY = [
     "CI_RED", "CI_CANCELLED_STREAK", "MOAT_REGRESSION", "UNRELEASED_MERGE",
-    "REVIEW_STALE", "AGENT_OVER_BUDGET", "IDLE_BUILDERS", "LOW_READY",
-    "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
+    "TRAIN_LATE", "REVIEW_STALE", "AGENT_OVER_BUDGET", "IDLE_BUILDERS",
+    "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
 ]
 
 violations = []          # list of (code, text)
@@ -868,6 +881,87 @@ else:
             )
 
 
+# --- 4c. TRAIN_LATE: push cadence (D27 item 6) ------------------------------
+# Fires only when the merged-but-unreleased computation above (`unreleased`)
+# found real merged-but-unreleased commits AND the last train push is more
+# than 25 minutes old. Reuses `unreleased` rather than re-deriving it, so
+# this can never disagree with UNRELEASED_MERGE about whether anything is
+# actually merged-but-unreleased.
+#
+# "Last train push time" is deliberately NEVER the release tag (a release
+# can lag its push by minutes -- see NO_RECENT_RELEASE's own separate
+# 90-minute budget for that). Source order:
+#   1. PULSE_LAST_TRAIN_PUSH override (epoch seconds or ISO8601) -- same
+#      override convention as PULSE_NOW/PULSE_SWARM_START, and what every
+#      test below uses.
+#   2. The mtime of the newest push-*.log file under PULSE_PUSH_LOG_DIR
+#      (default ~/loki-ci-logs). Simpler than resolving origin/main's real
+#      committer time, which would need this script to run its own `git
+#      fetch` -- a new, unbounded network call this script's fixed npm+gh
+#      NETWORK_DEADLINE was never sized for (see its header comment).
+# With neither source available, this reports UNKNOWN rather than silently
+# not firing, matching every other metric in this script.
+def last_train_push_epoch():
+    override = parse_time_value(os.environ.get("PULSE_LAST_TRAIN_PUSH", ""))
+    if override is not None:
+        return override
+    log_dir = os.environ.get("PULSE_PUSH_LOG_DIR", "") or os.path.expanduser("~/loki-ci-logs")
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        if not (name.startswith("push-") and name.endswith(".log")):
+            continue
+        try:
+            mt = os.stat(os.path.join(log_dir, name)).st_mtime
+        except OSError:
+            continue
+        if best is None or mt > best:
+            best = mt
+    return best
+
+
+_TRAIN_LATE_THRESHOLD_MIN = 25
+
+
+def check_train_late():
+    if unreleased is None:
+        return None
+    if unreleased["unreleased_commits"] == 0:
+        return {"applicable": False}
+    push_epoch = last_train_push_epoch()
+    if push_epoch is None:
+        return {"applicable": True, "unknown": True}
+    return {"applicable": True, "unknown": False, "age_min": (NOW - push_epoch) / 60.0}
+
+
+train_late = safe(check_train_late)
+if train_late is None:
+    # unreleased is itself UNKNOWN (already reported above) or this check
+    # crashed -- either way, never silently skip without a trace.
+    mark_unknown("train_late")
+    emit("Train push cadence: UNKNOWN (could not evaluate merged-unreleased state)")
+elif not train_late["applicable"]:
+    emit("Train push cadence: n/a (no merged-but-unreleased commits)")
+elif train_late["unknown"]:
+    mark_unknown("train_late")
+    emit(
+        "Train push cadence: UNKNOWN (no PULSE_LAST_TRAIN_PUSH override and no "
+        "push-*.log under %s)" % (os.environ.get("PULSE_PUSH_LOG_DIR", "") or os.path.expanduser("~/loki-ci-logs"))
+    )
+else:
+    _tl_age = train_late["age_min"]
+    emit("Minutes since last train push: %.1f" % _tl_age)
+    if _tl_age > _TRAIN_LATE_THRESHOLD_MIN:
+        add_violation(
+            "TRAIN_LATE",
+            "%.1f minutes since the last train push while merged-but-unreleased commits exist (threshold %d)"
+            % (_tl_age, _TRAIN_LATE_THRESHOLD_MIN),
+        )
+
+
 # --- 5. moat proven count vs last release ----------------------------------
 def list_pending_ids(text):
     ids = set()
@@ -1295,6 +1389,7 @@ _NEXT_ACTION_TEXT = {
     "CI_CANCELLED_STREAK": "investigate why Tests keeps getting cancelled on main before anything else",
     "MOAT_REGRESSION": "identify which moat property regressed and revert or fix it before any further merge",
     "UNRELEASED_MERGE": "cut a release now, main has been unreleased past the 30-minute budget",
+    "TRAIN_LATE": "push a release train now, merged-unreleased commits exist and cadence has slipped past the 25-minute budget",
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
     "AGENT_OVER_BUDGET": "check in on the named agent(s), they have exceeded their role/tier time budget",
     "IDLE_BUILDERS": "dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md",

@@ -183,6 +183,12 @@ COMMON_ARGS=(
     "PULSE_MOAT_RESULT="
     "PULSE_SWARM_START=2026-09-26T23:00Z"
     "PULSE_NOW=2026-09-27T02:00:00Z"
+    # A nonexistent directory, not the real ~/loki-ci-logs: without this,
+    # every test below would read the ACTUAL host's push-log mtimes for
+    # TRAIN_LATE, making exact-VIOLATION assertions (T2, T11) depend on real
+    # host state instead of the fixture. Dedicated TRAIN_LATE tests (T29)
+    # override this explicitly.
+    "PULSE_PUSH_LOG_DIR=$WORK/no-such-push-logs"
 )
 
 assert_exact_violations() {
@@ -1244,6 +1250,89 @@ assert_bad_ts_row "feb30-build" "building" "2026-02-30T10:00Z" \
     "building@ Feb 30: UNKNOWN, never silently normalized to March 2"
 assert_bad_ts_row "feb30-review" "review" "2026-02-30T10:00Z" \
     "review@ Feb 30: UNKNOWN, never silently normalized to March 2"
+
+echo "T29 -- TRAIN_LATE (D27 item 6): fires only with merged-but-unreleased commits AND"
+echo "      more than 25 minutes since the last train push"
+BOARD_TRAIN="$WORK/BOARD-train.md"
+cat > "$BOARD_TRAIN" <<'EOF'
+| ID | Owner | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|
+| S-01 | a | x | LOW | ready@2026-09-27T01:00Z | |
+EOF
+# PULSE_NOW (COMMON_ARGS) = 2026-09-27T02:00:00Z = epoch 1790474400 (see T1).
+# 26 min before = 1790472840, 24 min before = 1790472960.
+
+echo "T29c -- does not fire with zero merged-but-unreleased commits, even past 25 minutes"
+# Run BEFORE the unreleased commit below is added: FAKE_REPO is still clean
+# at v1.0.0 here (no test between the last reset at T20 and this one added a
+# commit), so this genuinely exercises the zero-unreleased-commits path.
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_LAST_TRAIN_PUSH=1790472840"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: TRAIN_LATE" \
+    && printf '%s\n' "$OUT" | grep -qF "Train push cadence: n/a (no merged-but-unreleased commits)"; then
+    ok "TRAIN_LATE does not fire with zero unreleased commits regardless of push age"
+else
+    bad "T29c TRAIN_LATE-none case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+(
+    cd "$FAKE_REPO" || exit 1
+    echo "train change" > train-file.txt
+    git add train-file.txt
+    GIT_AUTHOR_DATE="2026-09-27T01:00:00Z" GIT_COMMITTER_DATE="2026-09-27T01:00:00Z" \
+        git commit -q -m "unreleased train change"
+)
+
+echo "T29a -- fires at 26 minutes since last train push"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_TRAIN" "PULSE_LAST_TRAIN_PUSH=1790472840"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^VIOLATION: TRAIN_LATE: 26.0 minutes since the last train push"; then
+    ok "TRAIN_LATE fires at 26 minutes with merged-but-unreleased commits present"
+else
+    bad "T29a TRAIN_LATE-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T29b -- does not fire at 24 minutes (same unreleased commits, under the 25-minute threshold)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_TRAIN" "PULSE_LAST_TRAIN_PUSH=1790472960"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: TRAIN_LATE" \
+    && printf '%s\n' "$OUT" | grep -qF "Minutes since last train push: 24.0"; then
+    ok "TRAIN_LATE does not fire at 24 minutes"
+else
+    bad "T29b TRAIN_LATE-24min case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T29d -- UNKNOWN (never a false negative) with no override and no push-*.log directory"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_TRAIN"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*train_late" \
+    && printf '%s\n' "$OUT" | grep -qF "Train push cadence: UNKNOWN (no PULSE_LAST_TRAIN_PUSH override and no push-*.log under $WORK/no-such-push-logs)" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: TRAIN_LATE"; then
+    ok "TRAIN_LATE reports UNKNOWN, never fires, when neither source is available"
+else
+    bad "T29d TRAIN_LATE-unknown case: output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T29e -- PULSE_PUSH_LOG_DIR fallback: newest push-*.log mtime wins over an older one and a non-matching name"
+LOGDIR="$WORK/push-logs"
+mkdir -p "$LOGDIR"
+: > "$LOGDIR/push-old.log"
+: > "$LOGDIR/push-new.log"
+: > "$LOGDIR/not-a-push-log.txt"
+python3 -c "
+import os
+os.utime('$LOGDIR/push-old.log', (1790472000, 1790472000))
+os.utime('$LOGDIR/push-new.log', (1790472840, 1790472840))
+os.utime('$LOGDIR/not-a-push-log.txt', (1790400000, 1790400000))
+"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_TRAIN" "PULSE_PUSH_LOG_DIR=$LOGDIR"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -q "^VIOLATION: TRAIN_LATE: 26.0 minutes"; then
+    ok "PULSE_PUSH_LOG_DIR fallback uses the NEWEST push-*.log mtime (26.0 min), ignoring an older log and a non-matching filename"
+else
+    bad "T29e push-log-dir fallback case: output follows"
+    printf '%s\n' "$OUT"
+fi
+(cd "$FAKE_REPO" || exit 1; git reset -q --hard v1.0.0)
 
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
