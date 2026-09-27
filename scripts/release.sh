@@ -4,6 +4,7 @@
 #
 # Usage:
 #   ./scripts/release.sh patch|minor|major [--dry-run]
+#   ./scripts/release.sh patch|minor|major --bump-only
 #
 # This script:
 #   1. Bumps version in every file CLAUDE.md's "Release Workflow" section 1
@@ -11,6 +12,19 @@
 #      intentionally left to the Captain.
 #   2. Updates CHANGELOG.md from conventional commits
 #   3. Commits and pushes (triggers GitHub Actions release workflow)
+#
+# --bump-only (S-108, ends the D27 VERSION editor-tool exception): bumps
+# every version file plus loki-ts/dist, then exits. No prompt, no git add,
+# no commit, no push -- the Release Manager runs this instead of hand-editing
+# VERSION, then commits the result itself.
+#
+# RELEASE GATE (S-108, founder P0): a release is a lookup of an already-
+# verified commit, never a bump on an unverified tree. Before ANY bump (this
+# includes --bump-only) the script requires a completed/success run of both
+# the "Tests" and "Bun Parity" GitHub Actions workflows at HEAD's exact SHA.
+# No matching run -> refuse, exit 3 (RELEASE_ON_RED). --dry-run skips the
+# gate since it writes nothing. LOKI_RELEASE_ALLOW_RED=1 bypasses the gate
+# for tests only -- never set it for a real release.
 #
 # Files intentionally NOT bumped by this script (left to the Captain):
 #   - vscode-extension/package.json: CLAUDE.md marks this DEPRECATED since
@@ -44,6 +58,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $*"; }
 
 DRY_RUN="false"
+BUMP_ONLY="false"
 BUMP_TYPE=""
 
 # Parse arguments. Sets the globals DRY_RUN and BUMP_TYPE directly instead of
@@ -58,6 +73,9 @@ parse_args() {
                 ;;
             --dry-run)
                 DRY_RUN="true"
+                ;;
+            --bump-only)
+                BUMP_ONLY="true"
                 ;;
             -h|--help)
                 usage
@@ -89,14 +107,16 @@ Arguments:
   major    Bump major version (X.0.0)
 
 Options:
-  --dry-run  Show what would be done without making changes
-  -h, --help Show this help message
+  --dry-run    Show what would be done without making changes
+  --bump-only  Bump version files + loki-ts/dist, then exit. No commit, no push.
+  -h, --help   Show this help message
 
 Examples:
   $(basename "$0") patch          # 5.8.2 -> 5.8.3
   $(basename "$0") minor          # 5.8.2 -> 5.9.0
   $(basename "$0") major          # 5.8.2 -> 6.0.0
   $(basename "$0") patch --dry-run
+  $(basename "$0") patch --bump-only
 EOF
 }
 
@@ -323,6 +343,112 @@ bump_all_version_files() {
 # a partially-bumped tree (some files updated on disk but left unstaged).
 RELEASE_COMMIT_FILES="VERSION package.json SKILL.md Dockerfile Dockerfile.sandbox plugins/loki-mode/.claude-plugin/plugin.json server.json CLAUDE.md dashboard/__init__.py mcp/__init__.py docs/INSTALLATION.md wiki/Home.md wiki/_Sidebar.md wiki/API-Reference.md CHANGELOG.md"
 
+# --- Release gate (RELEASE_ON_RED, S-108) --------------------------------
+# Founder P0: a release is a lookup of an already-verified commit. Refuses
+# (exit 3) unless HEAD's exact SHA has a completed/success run of every
+# workflow below. Runs before ANY bump, --bump-only included.
+RELEASE_REQUIRED_WORKFLOWS=("Tests" "Bun Parity")
+
+# True (exit 0) iff `gh run list` for $1 at commit $2 contains at least one
+# run whose status/conclusion/headSha all match. Parsed with python3 (already
+# a hard dependency elsewhere in this repo) instead of jq/grep, since gh's
+# --json output is a single compact JSON array and a text match on "success"
+# would also match a run on a different SHA or an unrelated field.
+_release_gate_run_is_green() {
+    local workflow="$1" sha="$2" json rc
+    json="$(gh run list --workflow "$workflow" --commit "$sha" \
+        --json status,conclusion,headSha 2>/dev/null)"
+    rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$json" ] || return 1
+    python3 -c '
+import json, sys
+try:
+    runs = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+sha = sys.argv[2]
+for r in runs:
+    if (r.get("status") == "completed"
+            and r.get("conclusion") == "success"
+            and r.get("headSha") == sha):
+        sys.exit(0)
+sys.exit(1)
+' "$json" "$sha"
+}
+
+require_green_release_gate() {
+    local sha wf missing=""
+
+    sha="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null)" || {
+        log_error "RELEASE_ON_RED: could not resolve HEAD's SHA"
+        exit 3
+    }
+
+    if [ "${LOKI_RELEASE_ALLOW_RED:-}" = "1" ]; then
+        log_warn "=============================================================="
+        log_warn "LOKI_RELEASE_ALLOW_RED=1: SKIPPING the green-CI release gate."
+        log_warn "TEST-ONLY ESCAPE HATCH. NEVER set this for a real release."
+        log_warn "=============================================================="
+        return 0
+    fi
+
+    for wf in "${RELEASE_REQUIRED_WORKFLOWS[@]}"; do
+        if ! _release_gate_run_is_green "$wf" "$sha"; then
+            missing="$missing$wf, "
+        fi
+    done
+
+    if [ -n "$missing" ]; then
+        log_error "RELEASE_ON_RED: refusing to bump. HEAD ($sha) has no"
+        log_error "completed/success run for: ${missing%, }"
+        log_error "Runs gh found at $sha:"
+        for wf in "${RELEASE_REQUIRED_WORKFLOWS[@]}"; do
+            log_error "-- $wf --"
+            gh run list --workflow "$wf" --commit "$sha" \
+                --json status,conclusion,headSha,databaseId,createdAt 2>&1 \
+                | sed 's/^/  /' >&2 || true
+        done
+        exit 3
+    fi
+
+    log_success "Release gate: green Tests + Bun Parity run found at $sha"
+}
+
+# --bump-only (S-108): version files + loki-ts/dist, no git side effects.
+run_bump_only() {
+    local current new dist_file="$ROOT_DIR/loki-ts/dist/loki.js"
+
+    current=$(get_current_version)
+    new=$(bump_version "$current" "$BUMP_TYPE")
+
+    log_step "Bump-only: $current -> $new (no commit, no push)"
+    bump_all_version_files "$new"
+    log_warn "Not bumped (intentionally, see script header): vscode-extension/package.json (deprecated)"
+
+    if [ -d "$ROOT_DIR/loki-ts" ]; then
+        log_step "Rebuilding loki-ts/dist..."
+        ( cd "$ROOT_DIR/loki-ts" && bun run build )
+        if [ -f "$dist_file" ] && grep -q "$new" "$dist_file"; then
+            log_success "loki-ts/dist rebuilt with $new"
+        else
+            log_error "loki-ts/dist rebuild did not embed $new in $dist_file"
+            exit 1
+        fi
+    else
+        log_warn "loki-ts/ not found, skipping dist rebuild"
+    fi
+
+    echo ""
+    log_success "Bump-only complete: v$new"
+    echo "Files changed:"
+    local f
+    for f in $RELEASE_COMMIT_FILES; do
+        [ "$f" = "CHANGELOG.md" ] && continue
+        echo "  $f"
+    done
+    [ -d "$ROOT_DIR/loki-ts" ] && echo "  loki-ts/dist/loki.js"
+}
+
 # Check for uncommitted changes
 check_git_status() {
     if [[ -n "$(git status --porcelain)" ]]; then
@@ -343,6 +469,18 @@ main() {
     cd "$ROOT_DIR"
 
     parse_args "$@"
+
+    # Release gate runs before ANY bump, --bump-only included. Skipped on
+    # --dry-run: it makes no changes, so it never needs to pass the "that
+    # exact tree is verified" bar.
+    if [ "$DRY_RUN" != "true" ]; then
+        require_green_release_gate
+    fi
+
+    if [ "$BUMP_ONLY" = "true" ]; then
+        run_bump_only
+        return
+    fi
 
     local current_version
     current_version=$(get_current_version)
