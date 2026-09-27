@@ -5,6 +5,19 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.72.0
+
+**Failures read as failures across the web app and dashboard.** Released from green tree 2a024770 (Tests run 36346150997 and Bun Parity run 36346151002 both success before the bump).
+
+- Web app: NLSearch, CommandPalette, ProjectsPage, SecretsPanel, DocsPanel and CICDPanel show a failed request as a failure instead of "No results", "No projects yet" or an empty state; CICDPanel shows unlisted conclusions as Unknown; AIChatPanel no longer prints "Done." for a task that failed with no output (S-159..S-164).
+- Web app: removed an unverified "Trusted by developers" claim and stale v6.x Recent Changes (S-165).
+- Dashboard: checkpoint viewer, council transcripts, task board and API keys panel surface a failed read instead of rendering empty or zero (S-166..S-168, S-170); the Cost page budget banner has its own id (S-146).
+- `/api/cost/timeline` and `/api/proofs` carry per-run cost_partial, so a partly priced run renders as "at least", never as a total (S-158).
+- Auto-capture shadow-write skips an empty PROJECT_DIR and passes episode importance as an argument instead of splicing it into Python source (S-156).
+- The pre-push hook refuses a push to main without the Release Manager marker and any push from an agent worktree (S-152).
+- prune-worktrees treats cherry-picked branches as merged (S-154); the reachability scan runs in about 3s instead of 47s with identical verdicts (S-155).
+- Moat P2 drives council_managed_should_stop for the cwd-shadow class (S-173); the shadow-write mutant check is red under bash 3.2 too (S-172).
+
 ## v9.71.0
 
 **Honest metrics JSON and bump-commit verdict reuse for the Footer.** Released from green tree c6ed3882 (Tests run 36344585850 and Bun Parity run 36344585823 both success before the bump).
