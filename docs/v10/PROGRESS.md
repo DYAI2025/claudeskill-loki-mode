@@ -1117,3 +1117,26 @@ removals.
 shards projected at exactly 197 s). Reviewers are instructed to
 recompute it from the raw table rather than trust the report. Clean
 numbers get the same evidence bar as alarming ones.
+
+## Drift audit, turn 198
+
+**Recurrence (guard review rule, D26 item 7):** the "temp file then
+replace narrows mode 644 -> 600" defect appeared twice this session:
+S-16 (scripts/release.sh, mktemp + mv) and now S-74 (v10-ops.sh,
+mkstemp + os.replace). Both were caught only by review. A recurrence
+means the fix-per-slice approach is wrong; the guard belongs in
+GUARDS.md (S-76): a shared helper for atomic in-place rewrite that
+copies mode and resolves symlinks, plus a fixture that asserts mode is
+preserved, and a lint that flags bare mkstemp/mktemp followed by a
+replace without a mode copy.
+
+**Second recurring class:** locating a table cell by value shape
+instead of by header (S-74's Status-cell finder). The pulse's own
+BOARD parser (S-75) uses a position-independent shape scan too;
+S-75's reviewers found it safe because it requires a known token plus
+a full timestamp. Same rule should be written down once for every
+BOARD reader and writer.
+
+**Matched:** release still gated only on Tests shard 0 at b651b98d;
+every finished build this turn went straight to review; three
+engineers again stopped short of committing, committed directly.
