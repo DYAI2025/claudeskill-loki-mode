@@ -512,6 +512,7 @@ a terminal outcome names the next step	5
 loki why is rework-aware on the iteration cap	1
 loki why --json carries the rework split	1
 loki cost --json exposes the token breakdown	1
+loki cost reads unmeasured budget spend as null	2
 all reporting surfaces agree about one run	2
 recorded exit codes match the failure contract	2
 the receipt shows disabled gates	0

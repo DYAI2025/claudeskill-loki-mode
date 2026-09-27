@@ -28444,16 +28444,23 @@ if budget_limit is not None:
 
 # Prefer the recorded cumulative spend; fall back to the current run only when
 # the state file carries no figure. Never silently substitute 0.0 for "unknown".
-if isinstance(budget_used_recorded, (int, float)):
+# A recorded ZERO is not a reading: run.sh check_budget_limit writes
+# "budget_used": 0 for a run it never measured. Same rule as the dashboard
+# (server.py budget readers): only a positive recorded figure counts, and a
+# measured zero comes from current_cost, which collect_efficiency leaves None
+# unless a record passes record_is_measured.
+if isinstance(budget_used_recorded, (int, float)) and budget_used_recorded > 0:
     budget_used = budget_used_recorded
 elif isinstance(current_cost, (int, float)):
     budget_used = current_cost
 else:
-    budget_used = 0.0
+    budget_used = None
 status = "none"
 percent_used = None
 remaining = None
-if budget_limit is not None and budget_limit > 0:
+if budget_limit is not None and budget_limit > 0 and budget_used is None:
+    status = "unknown"
+elif budget_limit is not None and budget_limit > 0:
     percent_used = round(budget_used / budget_limit * 100, 2)
     remaining = max(0.0, budget_limit - budget_used)
     if budget_used >= budget_limit:
@@ -28487,7 +28494,7 @@ if show_json:
         "by_model": {k: round(v, 6) for k, v in by_model.items()},
         "budget": {
             "limit": budget_limit,
-            "used": round(budget_used, 6),
+            "used": round(budget_used, 6) if budget_used is not None else None,
             "remaining": round(remaining, 6) if remaining is not None else None,
             "percent_used": percent_used,
             "status": status,
@@ -28538,13 +28545,17 @@ if budget_limit is None:
     print(DIM + "  When set, Loki warns at 80% and hard-stops at 100%." + NC)
 else:
     col = GREEN
-    if status == "warn":
+    if status in ("warn", "unknown"):
         col = YELLOW
     elif status == "exceeded":
         col = RED
     print("  Cap:       " + _fmt_usd(budget_limit))
-    print("  Used:      " + _fmt_usd(budget_used) + " (" + col + str(percent_used) + "%" + NC + ")")
-    print("  Remaining: " + _fmt_usd(remaining))
+    if budget_used is None:
+        print("  Used:      not recorded (no measured iteration cost)")
+        print("  Remaining: not recorded")
+    else:
+        print("  Used:      " + _fmt_usd(budget_used) + " (" + col + str(percent_used) + "%" + NC + ")")
+        print("  Remaining: " + _fmt_usd(remaining))
     print("  Status:    " + col + BOLD + status.upper() + NC)
     if status == "warn":
         print(YELLOW + "  Warning: at or above 80% of cap. Run continues; hard-stop at 100%." + NC)

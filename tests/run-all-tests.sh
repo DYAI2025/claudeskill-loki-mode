@@ -1390,6 +1390,7 @@ run_test "a terminal outcome names the next step" "$SCRIPT_DIR/test-terminal-nex
 run_test "loki why is rework-aware on the iteration cap" "$SCRIPT_DIR/test-why-rework-aware.sh"
 run_test "loki why --json carries the rework split" "$SCRIPT_DIR/test-why-json-rework.sh"
 run_test "loki cost --json exposes the token breakdown" "$SCRIPT_DIR/test-cost-json-tokens.sh"
+run_test "loki cost reads unmeasured budget spend as null" "$SCRIPT_DIR/test-loki-cost-unmeasured.sh"
 run_test "all reporting surfaces agree about one run" "$SCRIPT_DIR/test-surfaces-agree.sh"
 run_test "recorded exit codes match the failure contract" "$SCRIPT_DIR/test-exit-code-contract.sh"
 run_test "the receipt shows disabled gates" "$SCRIPT_DIR/test-receipt-shows-disabled-gates.sh"
