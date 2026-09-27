@@ -9236,6 +9236,94 @@ _loki_snapshot_or_fail_closed() {
 # ~9165) so that path is never reported as tampering.
 _LOKI_SNAPSHOT_SEAL=""
 
+# BACKLOG 129 (follow-up to BACKLOG 70/BACKLOG 70-awk): the DIGEST computation
+# above is hardened (fixed-root-path-first, no awk), but until this function
+# was added the snapshot WRITER (_loki_untracked_merge) and READER
+# (_loki_covered_paths), plus the hash-snapshot helper that produces .sha.z,
+# still ran bare `python3 -E`. -E only blocks PYTHON* env vars; it does NOT
+# stop user (or Homebrew) site-packages from loading, and Python execs every
+# line starting "import " in every .pth file found there on every startup
+# (confirmed empirically: a .pth planted in user site-packages fired and
+# silently rewrote the writer's declared output file after the legitimate
+# write completed). A same-UID agent that plants such a .pth can forge the
+# CONTENT of the snapshot BEFORE the (correctly hardened) seal ever computes a
+# digest over it -- the seal then faithfully approves the forgery. Resolved
+# the same way as _loki_snapshot_hash_tool: fixed root-owned candidate paths
+# first (a materially higher bar than a user-writable site-packages
+# directory), each PROBED with a real run (not just `-x`, which a Command Line
+# Tools-less Mac's /usr/bin shims would still pass while failing to execute
+# and possibly popping an install dialog), then a PATH walk restricted to
+# absolute entries as a last resort. -I -S (isolated mode, and -S also skips
+# `import site` entirely) is used at every call site below: -I alone still
+# loads site-packages (verified: `python3 -I` still lists Homebrew's
+# site-packages on this host), so -S is required to close the .pth vector,
+# not just narrow it. Accepted gap, same shape as _loki_snapshot_hash_tool's:
+# replacing the interpreter binary AT ONE OF THE FIXED PATHS this resolves to
+# first requires root; a host with none of the fixed candidates falls through
+# to the PATH-walk, which still trusts whatever sits first on an absolute PATH
+# entry under that name. A further, host-specific gap: on macOS these fixed
+# paths are typically Command Line Tools / Xcode shims that dispatch into
+# /Applications/Xcode.app -- root-owned on a normal install, but the fixed
+# path is only as trustworthy as that dispatch target on any host where it is
+# not.
+_loki_snapshot_py_tool() {
+    local c
+    for c in /usr/bin/python3 /bin/python3; do
+        [ -x "$c" ] && [ ! -d "$c" ] && "$c" -I -S -c '' >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+    done
+    local dir
+    local IFS=:
+    for dir in $PATH; do
+        case "$dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        if [ -x "$dir/python3" ] && [ ! -d "$dir/python3" ] \
+           && "$dir/python3" -I -S -c '' >/dev/null 2>&1; then
+            printf '%s\n' "$dir/python3"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# BACKLOG 129: same rationale and pattern as _loki_snapshot_py_tool above, for
+# `git`. Every call in this snapshot writer/reader chain
+# (_loki_untracked_status, _loki_tracked_by_user_since_anchor,
+# _loki_snapshot_preexisting's own `git rev-parse --show-toplevel`) used a bare
+# `git` -- an unscoped PATH lookup a same-UID attacker can shadow with a fake
+# binary placed in a user-writable directory ahead of the real one, exactly
+# the class of bypass _loki_snapshot_hash_tool's own comment already documents
+# for sha256sum/shasum. Reproduced empirically: a fake `git` ahead on PATH
+# that filters one path out of `git status`'s output caused that path to be
+# completely absent from the sealed snapshot. `_loki_untrack_agent_committed_
+# user_files`'s git calls (feeding the READER path, _loki_covered_paths) and
+# the commit-time `git reset`/`git commit`/`git update-index` calls in
+# commit_session_changes are DELIBERATELY left unresolved here (out of scope
+# for this fix): a fake git on PATH already defeats the commit gate directly
+# at commit time regardless of what the snapshot says, so resolving only the
+# reader's git feed would not change that attacker's outcome. Tracked as a
+# follow-up (process-wide resolved git) rather than folded into this change.
+_loki_snapshot_git_tool() {
+    local c
+    for c in /usr/bin/git /bin/git; do
+        [ -x "$c" ] && [ ! -d "$c" ] && "$c" --version >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+    done
+    local dir
+    local IFS=:
+    for dir in $PATH; do
+        case "$dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        if [ -x "$dir/git" ] && [ ! -d "$dir/git" ] && "$dir/git" --version >/dev/null 2>&1; then
+            printf '%s\n' "$dir/git"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # _loki_snapshot_hash_tool: resolve an absolute path to sha256sum or shasum.
 # Fixed, root-owned candidate paths are tried FIRST, before any PATH walk: a
 # same-UID agent that can write to a user-writable directory ahead of the real
@@ -9512,9 +9600,10 @@ _loki_snapshot_verify() {
 # list in place, when git cannot list. Seals a digest of both files on success
 # (BACKLOG 70) so later reads can detect tampering.
 _loki_snapshot_preexisting() {
-    local snap=".loki/state/preexisting-untracked.z" top="" base="" exclude="" tracked=""
+    local snap=".loki/state/preexisting-untracked.z" top="" base="" exclude="" tracked="" gittool="" pytool=""
     rm -f "${snap%.z}.sha.z" 2>/dev/null
-    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+    gittool="$(_loki_snapshot_git_tool)" || return 1
+    top="$("$gittool" rev-parse --show-toplevel 2>/dev/null)" || return 1
     mkdir -p .loki/state 2>/dev/null || return 1
     # "union" never adds a path listed in session-created.z: those files were
     # made by a session that did not finish (interrupt, pod loss), so the
@@ -9538,7 +9627,16 @@ _loki_snapshot_preexisting() {
         return 1
     fi
     rm -f "$tracked" "$snap.status"
-    python3 -E "$SCRIPT_DIR/lib/workspace_diff.py" hash-snapshot "$top" "$snap" >/dev/null 2>&1 \
+    # BACKLOG 129: write_snapshot_hashes (the only code path "hash-snapshot"
+    # reaches) does pure file I/O (open/os.path/hashlib), no sibling import
+    # from autonomy/lib and no subprocess/git call, so -I -S is safe here: it
+    # never needs the script's own directory on sys.path or anything from
+    # site-packages. This writes .sha.z, one of the two files the seal above
+    # digests, so it is in scope of the same forgery class as the merge/covered
+    # sites below. A failed resolve here degrades to the existing log_warn path
+    # (receipt loses preexisting_modified detection) rather than blocking the
+    # snapshot -- matching this call's pre-existing non-fatal-on-failure shape.
+    pytool="$(_loki_snapshot_py_tool)" && "$pytool" -I -S "$SCRIPT_DIR/lib/workspace_diff.py" hash-snapshot "$top" "$snap" >/dev/null 2>&1 \
         || log_warn "Could not hash your pre-existing untracked files; the receipt cannot list the ones this run changes"
     _loki_snapshot_seal
     # A seal failure (empty digest or an unreadable-file "?", see the comment
@@ -9566,11 +9664,18 @@ _loki_snapshot_preexisting() {
 # and the session-created record, so the two always agree: raw
 # `git status --porcelain -z` records for the whole repo, .loki excluded.
 # Non-zero, writing nothing, when git cannot list.
+# BACKLOG 129: resolved via _loki_snapshot_git_tool (fixed root-owned path
+# first, PATH walk restricted to absolute entries as a last resort), not a
+# bare `git`, which a same-UID attacker can shadow with a fake binary on a
+# user-writable PATH entry ahead of the real one -- reproduced empirically: a
+# fake git filtering one path out of its `status` output made that path
+# entirely absent from the sealed snapshot this function ultimately feeds.
 _loki_untracked_status() {
-    local top="" prefix=""
-    top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
-    prefix="$(git rev-parse --show-prefix 2>/dev/null)" || return 1
-    git -C "$top" --no-optional-locks status --porcelain -z --no-renames -uall \
+    local top="" prefix="" gittool=""
+    gittool="$(_loki_snapshot_git_tool)" || return 1
+    top="$("$gittool" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    prefix="$("$gittool" rev-parse --show-prefix 2>/dev/null)" || return 1
+    "$gittool" -C "$top" --no-optional-locks status --porcelain -z --no-renames -uall \
         --ignored=matching --ignore-submodules=all -- ":(exclude,literal)${prefix}.loki" \
         > "$1" 2>/dev/null && return 0
     rm -f "$1"
@@ -9587,10 +9692,25 @@ _loki_untracked_status() {
 # <exclude> is an empty list; any other read or write failure is non-zero and
 # leaves <out> as it was. Sorted bytewise, like `LC_ALL=C sort -z -u`. One
 # python process: bash 3.2 has no associative arrays, and a bash loop cost
-# 300ms per 6,000 entries on /bin/bash. -E and no cwd on sys.path (D7): the cwd
-# is the agent's repo.
+# 300ms per 6,000 entries on /bin/bash. -I -S and no cwd on sys.path (D7): the
+# cwd is the agent's repo.
+# BACKLOG 129: this is the snapshot WRITER -- its <out> becomes
+# preexisting-untracked.z, one of the two files the seal above digests. A bare
+# `python3 -E` here still loads user site-packages (-E only blocks PYTHON* env
+# vars), so a same-UID .pth planted there can run arbitrary code during this
+# call and rewrite <out> after the legitimate write, forging exactly the bytes
+# the seal is about to trust -- reproduced empirically (a .pth that stripped
+# an entry from the just-written output). Resolved via _loki_snapshot_py_tool
+# (fixed root-owned path first) and run with -I -S: -I alone is not enough
+# (verified: `python3 -I` alone still lists Homebrew's user-writable
+# site-packages on this host), -S additionally skips `import site` so no .pth
+# anywhere is ever processed. A resolve failure fails this function closed
+# (return 1, same as any other read/write failure here) rather than silently
+# falling back to a bare, unresolved `python3`.
 _loki_untracked_merge() {
-    python3 -E -c 'import sys
+    local pytool=""
+    pytool="$(_loki_snapshot_py_tool)" || return 1
+    "$pytool" -I -S -c 'import sys
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import os
 status, base, exclude, mode, out = sys.argv[1:6]
@@ -9649,15 +9769,22 @@ os.replace(out + ".tmp", out)' "$@" 2>/dev/null
 # --diff-filter=A, --no-renames: only additions, matching
 # _loki_untrack_agent_committed_user_files's own diff so the two never
 # disagree about which paths are "added since X".
+# BACKLOG 129: <out> here is subtracted from the snapshot base inside
+# _loki_untracked_merge (the "tracked" argument) before that WRITER seals its
+# result -- a fake git that lists an extra path here can prune a real
+# untracked path (e.g. a secret) out of the sealed snapshot, the same attack
+# as a forged `git status`, just one function over. Resolved via
+# _loki_snapshot_git_tool like the other git calls in this writer chain.
 _loki_tracked_by_user_since_anchor() {
-    local top="$1" out="$2" anchor_file=".loki/state/tracked-since.sha" anchor=""
+    local top="$1" out="$2" anchor_file=".loki/state/tracked-since.sha" anchor="" gittool=""
     [ -f .loki/state/turn-in-flight ] && return 1
     [ -s "$anchor_file" ] || return 1
     anchor="$(cat "$anchor_file" 2>/dev/null)"
     [ -n "$anchor" ] || return 1
-    git rev-parse --verify -q "$anchor" >/dev/null 2>&1 || return 1
-    git merge-base --is-ancestor "$anchor" HEAD 2>/dev/null || return 1
-    git -C "$top" diff --name-only -z --no-renames --diff-filter=A "$anchor" HEAD > "$out.tmp" 2>/dev/null \
+    gittool="$(_loki_snapshot_git_tool)" || return 1
+    "$gittool" rev-parse --verify -q "$anchor" >/dev/null 2>&1 || return 1
+    "$gittool" merge-base --is-ancestor "$anchor" HEAD 2>/dev/null || return 1
+    "$gittool" -C "$top" diff --name-only -z --no-renames --diff-filter=A "$anchor" HEAD > "$out.tmp" 2>/dev/null \
         || { rm -f "$out.tmp"; return 1; }
     mv -f "$out.tmp" "$out"
     return 0
@@ -9784,10 +9911,21 @@ if ! type _commit_path_looks_secret >/dev/null 2>&1; then _commit_path_looks_sec
 # _loki_covered_paths <paths> <snapshot> <top> <out>
 # Atomically write <out>: the NUL-delimited entries of <paths> that <snapshot>
 # covers (the entry itself or a parent "dir/" entry, as workspace_diff._covered)
-# and that still exist under <top>. Non-zero on a read or write failure. -E and
-# no cwd on sys.path (D7): the cwd is the agent's repo.
+# and that still exist under <top>. Non-zero on a read or write failure. -I -S
+# and no cwd on sys.path (D7): the cwd is the agent's repo.
+# BACKLOG 129: this is the snapshot READER -- it reads <snapshot>
+# (preexisting-untracked.z, sealed content) and decides which of the agent's
+# newly-added paths are actually the user's pre-existing files (to be removed
+# from the branch tip, see _loki_untrack_agent_committed_user_files). A bare
+# `python3 -E` here has the same .pth exposure as the writer above: a same-UID
+# .pth can run arbitrary code during this call, including rewriting <out>
+# after the legitimate write. Resolved via _loki_snapshot_py_tool, run with
+# -I -S (see _loki_untracked_merge's comment for why -S, not just -I, is
+# required to close it). A resolve failure fails this function closed.
 _loki_covered_paths() {
-    python3 -E -c 'import sys
+    local pytool=""
+    pytool="$(_loki_snapshot_py_tool)" || return 1
+    "$pytool" -I -S -c 'import sys
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 import os
 paths, snap, top, out = sys.argv[1:5]
