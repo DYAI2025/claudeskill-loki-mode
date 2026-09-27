@@ -158,6 +158,66 @@ else
   bad "hostname-prefix confusion (127.0.0.1.evil.example.com) was treated as loopback"
 fi
 
+# --- 6. Cases 4-5, repeated against loki_proof_attestation_check -----------
+# loki_proof_attestation_check is a byte-identical copy-pasted guard, covered
+# by a different test file (test-proof-verify-jwks.sh) than the sibling
+# function above. That other file never exercises userinfo/hostname-prefix
+# confusion for THIS function, so a mutation deleting its own "*@*" reject
+# line is invisible to every existing suite even though the same class of bug
+# is checked for the sibling. These two cases close that blind spot here.
+_out="$(_run loki_proof_attestation_check "http://127.0.0.1:80@evil.example.com/")"
+if [ -z "$_out" ] && [ ! -f "$MARK_PY" ] && [ ! -f "$MARK_CURL" ]; then
+  ok "loki_proof_attestation_check: userinfo confusion is rejected, not waved through"
+else
+  bad "loki_proof_attestation_check: userinfo confusion bypassed the loopback check"
+fi
+
+_out="$(_run loki_proof_attestation_check "http://127.0.0.1.evil.example.com/")"
+if [ -z "$_out" ] && [ ! -f "$MARK_PY" ] && [ ! -f "$MARK_CURL" ]; then
+  ok "loki_proof_attestation_check: hostname-prefix confusion is rejected"
+else
+  bad "loki_proof_attestation_check: hostname-prefix confusion (127.0.0.1.evil.example.com) was treated as loopback"
+fi
+
+# --- 7. Bracketed-IPv6 host bound must not accept a hostname suffix --------
+# "[::1].evil.example.com" is a hostname, not the address "::1"; the bracket
+# match must require the bracket pair to be the WHOLE host (optionally with a
+# ":port"), or "]"-then-anything is silently dropped and this reads as
+# loopback. Checked for both functions since both carry the same match.
+_out="$(_run loki_remote_attestation_status "http://[::1].evil.example.com/")"
+if [ -z "$_out" ] && [ ! -f "$MARK_PY" ] && [ ! -f "$MARK_CURL" ]; then
+  ok "bracketed-IPv6 host-suffix confusion ([::1].evil.example.com) is rejected"
+else
+  bad "bracketed-IPv6 host-suffix confusion was treated as the [::1] loopback"
+fi
+
+_out="$(_run loki_proof_attestation_check "http://[::1].evil.example.com/")"
+if [ -z "$_out" ] && [ ! -f "$MARK_PY" ] && [ ! -f "$MARK_CURL" ]; then
+  ok "loki_proof_attestation_check: bracketed-IPv6 host-suffix confusion is rejected"
+else
+  bad "loki_proof_attestation_check: bracketed-IPv6 host-suffix confusion was treated as loopback"
+fi
+
+# --- 8. Local-file shadow of a URL string must not bypass the scheme gate --
+# The process cwd is the checkout being verified (attacker-controlled). If a
+# repo ships a file whose literal PATH is an http(s) URL string, a "-f" test
+# run before the scheme check would treat it as the local-file form and hand
+# its content to the caller with no network involved -- silently defeating
+# "only https is trusted" for loki_proof_attestation_check (the only one of
+# the two functions that accepts a file source at all).
+SHADOW_DIR="$WORK/shadow"
+mkdir -p "$SHADOW_DIR/http:/evil.example.com"
+echo '{"keys":[]}' > "$SHADOW_DIR/http:/evil.example.com/x"
+rm -f "$MARK_CURL" "$MARK_PY"
+_out="$(cd "$SHADOW_DIR" && PATH="$STUBBIN:$PATH" _LOKI_SCRIPT_DIR="$REPO_ROOT/autonomy" bash -c "
+  source '$FRAG'
+  loki_proof_attestation_check '$PJ' 'http://evil.example.com/x'")"
+if [ -z "$_out" ] && [ ! -f "$MARK_PY" ] && [ ! -f "$MARK_CURL" ]; then
+  ok "a local file literally named like a non-loopback http URL does not bypass the scheme gate"
+else
+  bad "local-file shadow of a non-loopback http URL bypassed the MITM guard (python3 was invoked against shadowed content)"
+fi
+
 echo ""
 echo "  Passed: $PASS   Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

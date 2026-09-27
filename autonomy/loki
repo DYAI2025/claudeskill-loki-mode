@@ -880,8 +880,15 @@ loki_remote_attestation_status() {
             case "$_jh" in
                 *@*) printf ''; return 0 ;;
             esac
+            # A bracketed IPv6 literal must be the WHOLE host: "[::1]" or
+            # "[::1]:port", never a prefix, or "[::1].evil.com" (not itself
+            # resolvable as loopback, but not rejected either) would parse as
+            # loopback "::1" with everything after the first "]" silently
+            # dropped instead of validated.
             case "$_jh" in
-                \[*\]*) _jh="${_jh#\[}"; _jh="${_jh%%\]*}" ;;
+                \[*\]) _jh="${_jh#\[}"; _jh="${_jh%\]}" ;;
+                \[*\]:*) _jh="${_jh#\[}"; _jh="${_jh%%\]:*}" ;;
+                \[*) printf ''; return 0 ;;
                 *) _jh="${_jh%%:*}" ;;
             esac
             case "$_jh" in
@@ -994,26 +1001,44 @@ loki_proof_attestation_check() {
     # never travels a network and needs no scheme at all. The host is bounded
     # exactly and a userinfo "@" is rejected outright -- see the sibling
     # function's comment for why a trailing glob is not safe here.
-    if [ ! -f "$src" ]; then
-        case "$src" in
-            https://*|file://*) ;;
-            http://*)
-                _jh="${src#http://}"; _jh="${_jh%%/*}"
-                case "$_jh" in
-                    *@*) printf ''; return 0 ;;
-                esac
-                case "$_jh" in
-                    \[*\]*) _jh="${_jh#\[}"; _jh="${_jh%%\]*}" ;;
-                    *) _jh="${_jh%%:*}" ;;
-                esac
-                case "$_jh" in
-                    127.0.0.1|localhost|::1) ;;
-                    *) printf ''; return 0 ;;
-                esac
-                ;;
-            *) printf ''; return 0 ;;
-        esac
-    fi
+    #
+    # A recognized scheme prefix is checked FIRST, before any "-f" test: the
+    # process cwd is the checkout being verified (attacker-controlled), and a
+    # repo can ship a file whose literal name IS a URL string (for example
+    # "https:/evil.example.com/.well-known/jwks.json" as a real path on disk).
+    # Testing "-f" first would treat that shadow file as the local-file form
+    # and hand its content straight to the caller with no network involved at
+    # all -- silently defeating the "only https is trusted" guarantee this
+    # function exists to provide. Scheme detection must win over the
+    # filesystem every time, not just when no file happens to collide.
+    case "$src" in
+        https://*|http://*|file://*)
+            case "$src" in
+                https://*|file://*) ;;
+                http://*)
+                    _jh="${src#http://}"; _jh="${_jh%%/*}"
+                    case "$_jh" in
+                        *@*) printf ''; return 0 ;;
+                    esac
+                    # See loki_remote_attestation_status above for why the
+                    # bracketed-IPv6 match must bound the closing bracket.
+                    case "$_jh" in
+                        \[*\]) _jh="${_jh#\[}"; _jh="${_jh%\]}" ;;
+                        \[*\]:*) _jh="${_jh#\[}"; _jh="${_jh%%\]:*}" ;;
+                        \[*) printf ''; return 0 ;;
+                        *) _jh="${_jh%%:*}" ;;
+                    esac
+                    case "$_jh" in
+                        127.0.0.1|localhost|::1) ;;
+                        *) printf ''; return 0 ;;
+                    esac
+                    ;;
+            esac
+            ;;
+        *)
+            [ -f "$src" ] || { printf ''; return 0; }
+            ;;
+    esac
     command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
     python3 -E - "$pj" "$src" "${_LOKI_SCRIPT_DIR}" <<'PY' 2>/dev/null || printf ''
 # The cwd is the checkout being verified: drop it from sys.path before any
@@ -1042,15 +1067,20 @@ if tok is None or tok == "" or tok is False:
     print("none"); sys.exit(0)       # a FACT about the receipt, not an error
 src = sys.argv[2]
 try:
-    if os.path.isfile(src):
-        jwks = json.load(open(src))
-    else:
-        if not src.startswith(("http://", "https://")):
-            sys.exit(1)
+    # Scheme check first, same as the bash gate above -- a "-f" test run
+    # first would let a local file whose literal name IS an http(s) URL
+    # string (the process cwd is the checkout being verified) silently stand
+    # in for a real fetch. A recognized scheme always means "URL", even if a
+    # same-named file happens to exist on disk.
+    if src.startswith(("http://", "https://")):
         url = src if src.rstrip("/").endswith("jwks.json") else \
             src.rstrip("/") + "/.well-known/jwks.json"
         with urllib.request.urlopen(url, timeout=10) as r:
             jwks = json.loads(r.read())
+    elif os.path.isfile(src):
+        jwks = json.load(open(src))
+    else:
+        sys.exit(1)
 except Exception:
     sys.exit(1)                      # "" : unreachable/unreadable, no verdict
 # A key set that is not {"keys": [{...}, ...]} -- INCLUDING an empty list -- is
