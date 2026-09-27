@@ -9236,12 +9236,161 @@ _loki_snapshot_or_fail_closed() {
 # ~9165) so that path is never reported as tampering.
 _LOKI_SNAPSHOT_SEAL=""
 
+# _loki_snapshot_hash_tool: resolve an absolute path to sha256sum or shasum.
+# Fixed, root-owned candidate paths are tried FIRST, before any PATH walk: a
+# same-UID agent that can write to a user-writable directory ahead of the real
+# tool on PATH (Homebrew's prefix, e.g. /opt/homebrew/bin, is user-writable by
+# default on macOS and typically precedes /usr/bin) could otherwise drop its
+# own sha256sum/shasum there that reads the two snapshot files and echoes back
+# whatever hash it wants -- the same class of bypass as the .pth hijack this
+# whole function exists to close, just with a fake binary as the carrier
+# instead of a fake module. Trying the standard system locations first closes
+# that: they require root to write to, a materially higher bar than a
+# user-writable site-packages directory or a user-writable PATH entry.
+# A PATH walk (D7: never trust a bare command name -- restricted to absolute
+# entries, matching autonomy/loki's loki_verify_tool_path) is kept only as a
+# last resort for a host that keeps sha256sum/shasum somewhere nonstandard;
+# document there that this fallback still trusts whatever is first on an
+# absolute PATH entry, which a user-writable directory ahead of the system
+# dirs can still shadow. Prints nothing (caller then falls back) when no tool
+# is found anywhere.
+_loki_snapshot_hash_tool() {
+    local c
+    for c in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum \
+             /usr/bin/shasum /bin/shasum; do
+        [ -x "$c" ] && [ ! -d "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    # Last resort: PATH walk, absolute entries only. Still trusts whatever
+    # sits first on PATH under that name; see comment above.
+    local name dir
+    local IFS=:
+    for name in sha256sum shasum; do
+        for dir in $PATH; do
+            case "$dir" in
+                /*) ;;
+                *) continue ;;
+            esac
+            if [ -x "$dir/$name" ] && [ ! -d "$dir/$name" ]; then
+                printf '%s\n' "$dir/$name"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 # _loki_snapshot_digest: sha256 of preexisting-untracked.z + .sha.z content
-# (each independently, "-" standing in for "file absent" so a delete is part of
-# the digest, not indistinguishable from an empty file). python3 -E, no cwd on
-# sys.path (D7): cwd is the agent's repo. Empty output on any read error.
+# (each independently, "-" standing in for "file absent" so a delete is part
+# of the digest, not indistinguishable from an empty file; "?" standing in for
+# "file present but the hash tool failed to produce a real digest" -- a
+# nonzero exit, empty output, or output that fails validation below -- so a
+# transient read error never seals or compares as an empty string).
+#
+# HIGH-severity reviewer finding on the original python3 -E version: -E only
+# ignores PYTHON* env vars, it does NOT stop Python from loading user (or, on
+# macOS with Homebrew, system) site-packages, and Python executes every .pth
+# file found there on every startup. A same-UID agent process can plant a .pth
+# file there that hijacks this script's own print() to emit a cached, stale
+# (pre-tamper) digest -- fully defeating the seal while `git`/file state show
+# real tampering happened. Fixed by computing the digest with sha256sum/shasum
+# instead: neither has a .pth-style module-loading path for that hijack to
+# attach to. shasum is a Perl script on macOS (not a compiled binary), but its
+# @INC search path is root-owned system Perl library directories, not a user
+# site-packages directory, so the .pth carrier does not transfer to it.
+#
+# SECOND reviewer finding, on the shasum/sha256sum version that first closed
+# the .pth hole: the digest was piped through a bare `awk '{print $1}')`
+# resolved via an unscoped PATH lookup (`awk '{...}'` runs whatever `awk`
+# comes first on PATH). A fake `awk` placed in a user-writable directory ahead
+# of the real one (the same Homebrew-prefix-precedes-/usr/bin shape as the
+# hash-tool bypass above) can intercept the pipe and print a cached, stale
+# digest, defeating the seal exactly as before -- the fix reintroduced the
+# same bypass class it was written to close, just moved one command over.
+# Fixed by dropping awk entirely: the first whitespace-delimited field is
+# taken with the shell builtin `${h%% *}` (parameter expansion, no external
+# process, nothing on PATH to hijack), and the result is validated as exactly
+# 64 lowercase hex characters before being trusted as a real sha256 digest --
+# anything else (empty, wrong length, non-hex, a hand-rolled fake tool that
+# does not bother to format like sha256sum/shasum) becomes "?". The hash
+# tool's own exit status is also checked explicitly now: a piped
+# `cmd | awk ...` hid a nonzero exit from the hash tool behind awk's exit
+# status; capturing to a plain variable surfaces it.
+#
+# Resolved via _loki_snapshot_hash_tool above (fixed root-owned paths first,
+# PATH walk restricted to absolute entries only as a last resort), not a bare
+# `command -v`, so this also closes the sibling D7-pattern gap: an unscoped
+# lookup could otherwise resolve to a same-named binary planted in a
+# user-writable directory ahead of the real tool on PATH.
+#
+# Accepted gaps (disclosure, not prevention, per BACKLOG 70's own bar, same as
+# documented at _LOKI_SNAPSHOT_SEAL above): a same-UID ptrace attack on this
+# process or on the sha256sum/shasum child process itself; replacing the
+# sha256sum/shasum binary AT ONE OF THE FIXED SYSTEM PATHS this resolves to
+# first (requires root, a materially higher bar than a user-writable
+# site-packages .pth or a user-writable PATH entry); on a host with none of
+# the fixed candidates, the PATH-walk fallback inside _loki_snapshot_hash_tool
+# still trusts whatever sits first on an absolute PATH entry under that name,
+# which a user-writable directory ahead of the system dirs (e.g. Homebrew's
+# prefix on macOS) can shadow -- not fully closed, only narrowed to hosts
+# lacking the standard tool paths; the python3 fallback below, kept only for
+# the extremely rare host with neither tool anywhere, is not proof against the
+# .pth class this function exists to close -- that path additionally hardens
+# with -I (isolated mode: also disables user site-packages, stronger than -E)
+# but remains narrower than the shasum/sha256sum path on a host where
+# Homebrew's system site-packages is itself user-writable.
 _loki_snapshot_digest() {
-    python3 -E -c 'import sys, hashlib, os
+    local tool
+    tool="$(_loki_snapshot_hash_tool)" || tool=""
+    if [ -n "$tool" ]; then
+        local out="" path h
+        for path in ".loki/state/preexisting-untracked.z" ".loki/state/preexisting-untracked.sha.z"; do
+            if [ -f "$path" ]; then
+                h=""
+                case "${tool##*/}" in
+                    shasum) h="$("$tool" -a 256 -- "$path" 2>/dev/null)" || h="" ;;
+                    *)      h="$("$tool" -- "$path" 2>/dev/null)" || h="" ;;
+                esac
+                # No awk: take the first whitespace-delimited field with a
+                # shell builtin (nothing on PATH to hijack), then require
+                # exactly 64 lowercase hex characters. Anything else -- empty
+                # output, a nonzero exit already caught above, an unexpected
+                # format, a hand-rolled fake tool -- becomes "?" rather than
+                # being trusted as a real digest. "?" is distinct from "-"
+                # (file absent) and from any real hex digest, so a later
+                # successful read of the same file mismatches it and is still
+                # disclosed as tampering.
+                h="${h%% *}"
+                if [ "${#h}" -eq 64 ]; then
+                    case "$h" in
+                        *[!0123456789abcdef]*) h="?" ;;
+                    esac
+                else
+                    h="?"
+                fi
+                out="$out $h"
+            else
+                out="$out -"
+            fi
+        done
+        printf '%s\n' "${out# }"
+        return 0
+    fi
+    # Fallback: neither sha256sum nor shasum found anywhere checked above
+    # (extremely rare on macOS/Linux). -I is isolated mode: stronger than -E,
+    # also disables user site-packages, but this remains narrower than the
+    # tool-based path above on a host whose Python ships a hijackable system
+    # site-packages outside the user's control (see comment above). Additional
+    # accepted gap specific to this fallback (not present on the tool-based
+    # path above, which distinguishes "-" from "?"): OSError covers BOTH
+    # "file does not exist" and "file exists but is unreadable" here, so an
+    # unreadable file on this path is indistinguishable from an absent one --
+    # both print "-". The tool-based path above tells them apart ("-" for
+    # absent, "?" for present-but-unreadable, caught by the seal-time
+    # fail-closed check). Narrowing this further (os.path.lexists to emit "?"
+    # for present-but-unreadable) is straightforward but left undone here: this
+    # fallback only runs on a host with neither sha256sum nor shasum anywhere,
+    # already the rare case this whole function treats as a residual gap.
+    python3 -I -c 'import sys, hashlib, os
 sys.path[:] = [p for p in sys.path if p not in ("", ".")]
 out = []
 for path in sys.argv[1:]:
@@ -9255,9 +9404,49 @@ print(" ".join(out))' \
 }
 
 # _loki_snapshot_seal: record this process's own memory of what it just wrote.
-# Called only right after a successful _loki_snapshot_preexisting.
+# Called only right after a successful _loki_snapshot_preexisting. Minor
+# reviewer note: a legitimate snapshot write should never hit an unreadable-
+# file condition immediately after writing it, so a "?" in the digest AT SEAL
+# TIME (as opposed to at a later verify) is itself suspicious -- both seal and
+# a later verify could then read "?", compare equal, and silently disarm the
+# guard for the rest of the session (the same failure mode
+# _loki_snapshot_verify's mismatch path exists to catch, just never triggered
+# because both sides agree on the sentinel). Closed cheaply: reject an empty
+# or "?"-containing digest at seal time the same way _loki_snapshot_verify
+# rejects a mismatch -- log and disclose it, write the .failed marker, AND
+# clear _LOKI_SNAPSHOT_THIS_RUN directly here (belt-and-braces: the actual
+# gate that stops a commit). The call site right after `_loki_snapshot_seal`
+# in _loki_snapshot_preexisting also checks `_LOKI_SNAPSHOT_SEAL` and returns
+# non-zero on failure, which is what actually propagates to
+# _loki_snapshot_or_fail_closed / _loki_resume_snapshot and keeps their
+# existing callers from ever setting _LOKI_SNAPSHOT_THIS_RUN=1 in the first
+# place (see the comment there) -- so the in-function clear here is redundant
+# with that, not the sole mechanism, kept only as defense in depth in case a
+# future caller invokes this function directly. The call site above is
+# intentionally left as a bare `_loki_snapshot_seal` (no `|| return`):
+# tests/test-branch-lifecycle.sh's RED harness matches that exact line to
+# strip the guard; the propagation check right after it carries its own
+# trailing-comment marker the RED harness also strips (see the comment at
+# that check, in _loki_snapshot_preexisting, for the exact text -- not
+# repeated here so a grep for it does not also match this sentence), so
+# removing either half of the guard is enough to reproduce the pre-fix
+# silent-degrade behavior in that test.
 _loki_snapshot_seal() {
-    _LOKI_SNAPSHOT_SEAL="$(_loki_snapshot_digest)"
+    local d
+    d="$(_loki_snapshot_digest)"
+    case "$d" in
+        ""|*'?'*)
+            _LOKI_SNAPSHOT_SEAL=""
+            _LOKI_SNAPSHOT_THIS_RUN=0
+            log_warn "Could not seal the pre-existing-file snapshot (hash tool failed or produced no readable digest); treating this session as unsnapshotted (nothing will be committed)"
+            audit_log "SNAPSHOT_SEAL_FAILED" "_loki_snapshot_digest returned empty or an unreadable-file sentinel at seal time"
+            mkdir -p .loki/state 2>/dev/null
+            : > .loki/state/preexisting-untracked.failed 2>/dev/null
+            ;;
+        *)
+            _LOKI_SNAPSHOT_SEAL="$d"
+            ;;
+    esac
 }
 
 # _loki_snapshot_verify: compare the live files against the sealed digest.
@@ -9352,6 +9541,24 @@ _loki_snapshot_preexisting() {
     python3 -E "$SCRIPT_DIR/lib/workspace_diff.py" hash-snapshot "$top" "$snap" >/dev/null 2>&1 \
         || log_warn "Could not hash your pre-existing untracked files; the receipt cannot list the ones this run changes"
     _loki_snapshot_seal
+    # A seal failure (empty digest or an unreadable-file "?", see the comment
+    # at _loki_snapshot_seal) leaves _LOKI_SNAPSHOT_SEAL empty; propagate that
+    # as a failure of this function too, so both callers'
+    # (_loki_snapshot_or_fail_closed and _loki_resume_snapshot) existing
+    # fail-closed handling applies, instead of silently reporting success on a
+    # session this process could not actually seal. This is the line that
+    # actually makes a seal failure fail closed (_loki_snapshot_seal's own
+    # in-function clear is defense in depth, not the mechanism -- see the
+    # comment there). This line is deliberately also stripped by
+    # tests/test-branch-lifecycle.sh's BACKLOG-70 RED mutation, by its trailing
+    # comment marker (kept off this sentence on purpose, so a grep for the
+    # marker text matches only the one real code line below, not this prose),
+    # same as the guard calls above it: without it, on a mutated copy that
+    # also strips `_loki_snapshot_seal`, _LOKI_SNAPSHOT_SEAL stays at its
+    # global initial value ("") and this check alone would still return 1 and
+    # fail closed, masking the RED reproduction the test relies on to prove
+    # the mutation of the ACTUAL guard calls is non-vacuous.
+    [ -n "$_LOKI_SNAPSHOT_SEAL" ] || return 1  # BACKLOG-70-SEAL-CHECK
     return 0
 }
 
