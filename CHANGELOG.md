@@ -5,6 +5,27 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.57.0
+
+**Release train 2: the D26 guardrails go live, CI stops cancelling itself, and the Python suite runs in parallel.** 21 code commits since v9.56.0.
+
+**Guardrails (D26):**
+- `scripts/v10-guard.sh`, a PreToolUse Bash hook, blocks kill-by-name or kill-by-pattern, force-push, `reset --hard` on main, `git add -A`/`git add .`, a commit that drops a BOARD.md row, `rm -rf` outside the worktree and temp roots, and a VERSION write outside the release path. 114 fixtures; two HIGH reviewers over four rounds (S-73).
+- `scripts/v10-ops.sh` runs the orchestrator's trivial operations (clean check, status, commit-message template, BOARD row status flip) as a script instead of an agent. Atomic write, mode and symlink preserved, and it refuses rather than edit a cell it cannot place by position (S-74).
+- `scripts/v10-pulse.sh` gains AGENT_OVER_BUDGET, CI_CANCELLED_STREAK and the merged-unreleased age check, and an UNKNOWN CI state no longer hides any other violation (S-71, S-75).
+
+**CI:**
+- Push concurrency is scoped per commit SHA in the three gating workflows, so a new push no longer cancels the previous commit's run; pull requests still cancel in progress (S-80).
+- The Python suite runs under pytest-xdist: 261.9s serial to about 80s (S-86).
+- `bun=latest`, the macOS bun job and hyperfine move from the push gate to nightly (S-90).
+- Four suites lose fixed sleeps that waited without testing anything (for example 24.9s to 12.9s and 13.3s to 2.0s) (S-87).
+
+**Fixes:**
+- On git older than 2.18, a failed mint snapshot now keeps a fallback list of pre-existing untracked files, so the receipt no longer claims them as the session's work (S-67, BACKLOG 88).
+- `.loki/state/agent-committed-user-files.z` is cleared by a later session with no hits (S-68, BACKLOG 102).
+
+**Docs:** `docs/v10/OPERATING-MODEL.md` is loaded in every session; CLAUDE.md shrinks to 150 lines with the rest under `docs/dev/` (S-78).
+
 ## v9.56.0
 
 **Release train 1 under the new release-train model: 157 commits since v9.55.0, verified together on one frozen commit.** Rule of Two now covers every agent workflow, the tamper seal on the session-created record closes a FIFO and symlink bypass, several dashboard panels stop showing a guess or a zero as if it were measured, and the macOS 27 sandbox profile actually blocks the ports it claims to.
