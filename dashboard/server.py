@@ -10350,7 +10350,7 @@ async def get_checklist_waivers():
     try:
         return json.loads(waivers_file.read_text())
     except (json.JSONDecodeError, IOError):
-        return {"waivers": [], "error": "Failed to read waivers file"}
+        return JSONResponse(status_code=500, content={"error": "Failed to read waivers file"})
 
 
 @app.post("/api/checklist/waivers", dependencies=[Depends(auth.require_scope("control"))])
