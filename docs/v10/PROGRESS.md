@@ -1208,3 +1208,5 @@ sample.
 | 15:50 | S-80 verified on a real push: Tests on 89e350bd stayed in_progress after 5332bfc3 landed | gh run list |
 | 15:53:23-26 | Train 3 (S-79, S-81, S-82, S-83, S-85) plus release commit v9.58.0 pushed, rc=0 | HEAD = ls-remote = c2eccb21c1273b27a385aa785fedee3269c4f605 |
 - Next: each train counts as released when its publish-npm job succeeds. Train 4 opens now: S-84 (Part C items 3 and 5) once approved, plus S-97 and S-98 (D27 hook and cadence guard). Target push by 16:13 (20-minute cadence).
+| 16:05 | Train 3 Tests run 36331204715 FAILED: test_build_supervisor lineage race on Python 3.10+3.11 (also 3.11+3.12 on 89e350bd; identical code passed on 5332bfc3), so the Release required-ci failed. Failed jobs rerun at 16:05:48Z; P0 S-102 opened | gh run view |
+| 16:06:59-07:02 | Train 4 (S-49, S-91, S-89, S-16, S-77) plus release commit v9.59.0 pushed, rc=0 | HEAD = ls-remote = 08d64f4e05b2a475ecde30a393d3f660963f95a9 |
