@@ -571,7 +571,20 @@ print("\n".join(fs))' "$MOAT_TMP" "$REPO_ROOT/dashboard-ui/core" "$REPO_ROOT/das
 #      not literal. A named module-level table (DEFAULT_PERMISSIONS, COLUMNS,
 #      GALLERY, TABS, DEFAULT_PROVIDERS) is a negative control even when it
 #      seeds useState, and a timer callback (setTimeout/setInterval/etc.) is
-#      never treated as a setter. See the ponytail comment above
+#      never treated as a setter. Also covers the literal hiding one level
+#      deeper: a same-file `function`/arrow/function-expression helper
+#      (including a `useCallback`-wrapped arrow) whose body `return`s literal
+#      rows, called (directly or through a local) into the same setter/
+#      useState/`this.x =` sink (BACKLOG 125 B-7; e.g.
+#      `function getRows(d){ if(!d) return [{...}]; return d; }
+#      setRows(getRows(d))`, which no call-site-only arm above can see). The
+#      sink match itself tolerates a spread element, a nested call inside the
+#      sink's own argument, and a trailing method call chained after the sink
+#      call (`setRowsX([...buildRows(records)])`,
+#      `setRowsX(buildRows(normalize(records)))`,
+#      `setRowsX(buildRows(records).slice())`), since it scans the whole
+#      balanced argument span for the helper's name rather than a single
+#      non-nested-paren regex. See the ponytail comment above
 #      whole_file_findings() for the shapes this rule still cannot see.
 #   7. No binding NAMED sample, mock, demo, fake, dummy or placeholder (bare,
 #      camelCase or SAMPLE_-style) is bound to an array or object literal. A
@@ -907,6 +920,67 @@ def ternary_colon_of(s, q):
 #   would start. Upgrade only alongside the TS-AST rewrite already flagged
 #   below (`# Upgrade to the TS AST if a multi-line fallback is ever found by
 #   review`), not as another regex patch on top of six rounds of them.
+#   ponytail: the helper-return arm below (BACKLOG 125 B-7) has its own
+#   ceilings.
+#   False-negative only:
+#   - it only follows a SAME-FILE helper, never one imported from another
+#     module;
+#   - it recognizes `function`/arrow/function-expression/useCallback-wrapped
+#     declarations only, never a class method. A neutrally-named method
+#     (`_getRows() { return [{...}]; }` then `this._rows = this._getRows();`)
+#     is NOT caught by any other rule either: rule 5's DEMO/GEN name check
+#     only fires on a sample/mock/demo/fake/generate-prefixed name, so this is
+#     a real coverage gap on dashboard-ui's LokiElement classes, not merely an
+#     unhandled syntax form (filed as BACKLOG 144, not fixed here);
+#   - a return whose literal is built across an intermediate local inside the
+#     helper (`const rows = [...]; return rows;`) is not seen, since only a
+#     literal directly after `return` is checked;
+#   - a `function`/function-expression head's return-type annotation
+#     containing a brace (`function getRows(d): { rows: Row[] } {`) would
+#     misplace the body opener onto the type instead of the real body (arrow
+#     heads are unaffected: HELPER_ARROW_TAIL spans any return type, braces
+#     included, before looking for the body);
+#   - the two-hop local-variable form's flow check (HELPER_LOCAL_DECL_TMPL ->
+#     FLOWS_TO_STATE_TMPL) only recognizes a plain or `await`ed direct call as
+#     the local's initializer, not a chained/wrapped call
+#     (`const rows = getRows(d).slice(); setRows(rows);`);
+#   - useMemo is deliberately out of scope (documented at HELPER_HEAD above),
+#     and a class-method helper is BACKLOG 144, not this arm.
+#   Can in principle over-flag (not false-negative only):
+#   - both the sink-span search and the two-hop local-variable hop
+#     (`const rows = getRows(d); setRows(rows)`) search the WHOLE FILE by
+#     name, not by lexical scope (the same file-wide, not scope-aware, search
+#     DECL_ARR itself already uses for its own local-flows-to-state check), so
+#     a fabricating helper in one component and an unrelated same-named
+#     setter call in a different component could in principle be credited to
+#     each other;
+#   - `literal_rows` cannot distinguish a fabricated data row from a real
+#     static options/config list, so a helper like
+#     `function getDefaultFilters() { return [{ id: 'all', label: 'All' }]; }`
+#     feeding `useState(getDefaultFilters)` would be flagged even though it is
+#     honest UI config, not fabricated data. This arm deliberately has NO
+#     column-0 module-scope exemption like DECL_ARR's MODULE_DECL skip: the
+#     reported bypass itself is written at column 0
+#     (`function getRows(d){...} setRows(getRows(d));`), so a column-0 skip
+#     here would silently reopen the exact bug this arm exists to close;
+#   - a return nested inside a callback INSIDE the helper body IS excluded via
+#     NESTED_FN_HEAD when that callback is an untyped `function`/arrow
+#     (`function loadRows(d){ const cols = () => { return [{...}]; }; return
+#     d.rows; }` correctly returns clean), but NESTED_FN_HEAD does not
+#     recognize a TYPED nested function head (`function cols(): Col[] {`) or
+#     object-method shorthand (`{ cols() { return [...]; } }`); in both of
+#     those two forms the inner callback's return is (wrongly) credited to the
+#     outer helper, which then gets flagged even though its own return is
+#     real data;
+#   - the sink-span search matches the helper's name followed by `(` ANYWHERE
+#     in a sink's balanced argument span, including inside an unrelated
+#     nested closure that happens to also call a same-named function; this is
+#     the same file-wide-by-name trade-off as the point above, deliberately
+#     accepted for the same reason (a scope-aware rewrite is a bigger change
+#     than this bug fix warrants without a real instance to justify it).
+#   None of these false-positive vectors has a known instance in this
+#   codebase today (the real-scan diff before/after this arm is empty).
+#   Upgrade only on a real instance, not preemptively.
 FALLBACK_ARR = re.compile(r'(?:\|\||\?\?)\s*\[')
 TIMER_LIKE = re.compile(r'^(?:setTimeout|setInterval|setImmediate|setAttribute|setItem|setProperty)$')
 ARRAY_OF = re.compile(r'\bArray\.(of|from)\s*\(')
@@ -923,6 +997,104 @@ REASSIGN_ARR = re.compile(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*=(?![=>])\s*\[')
 DECL_KEYWORD = re.compile(r'\b(?:const|let|var)\s*$')
 FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?'
                        r'{name}\s*[,)]|\bthis\.\w+\s*=\s*{name}\b')
+# Rule 6, function-return extension (BACKLOG 125 B-7): `function getRows(d){
+# if(!d) return [{...}]; return d; } setRows(getRows(d))` has no literal array
+# at the call site, so every arm above (which all look at the call site)
+# misses it. This arm looks inside same-file helper bodies instead: a
+# function/arrow/function-expression (including a useCallback-wrapped arrow)
+# whose body RETURNs a literal-rows array marks that name as a fabricating
+# helper, and a later call `name(...)` feeding the same sink template as
+# DECL_ARR (a setter/useState, `this.x =`, or a local that flows into one) is
+# flagged. `close_of` on the head's own `(` (not a `[^)]*` regex) so a
+# parameter default `(d = {})` does not truncate the params span early.
+#
+# HELPER_HEAD alternatives, in order: `function name(`; `const/let/var name =
+# function(`; `const/let/var name = (params) =>` (parenthesized, 0+ params);
+# `const/let/var name = param =>` (bare single param, no parens); and
+# `const/let/var name = useCallback(` / `React.useCallback(`, whose own first
+# argument is itself a nested function/arrow head (handled the same as a
+# direct assignment once matched, since the callback body is what fabricates,
+# not the useCallback() wrapper). No `let`/`var` exclusion: unlike DECL_ARR's
+# MODULE_DECL column-0 skip (a *data* exemption for a named config table),
+# there is no equivalent "this let/var is honest config" signal for a
+# *helper*, so `let`/`var` heads are covered identically to `const`.
+# useMemo is deliberately NOT covered: it computes its value eagerly at render
+# time and is never itself called later as `name(args)` the way this bug's
+# `setRows(getRows(d))` call-back-in shape requires; a useMemo whose factory
+# returns literal rows is already the ordinary DECL_ARR/rule-5 shape at the
+# point the memoized value is consumed, not a new one this arm needs to add.
+HELPER_HEAD = re.compile(r'\b(?:export\s+(?:default\s+)?)?(?:async\s+)?'
+                          r'(?:function\s+([A-Za-z_$][\w$]*)\s*\('
+                          r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?function\s*\('
+                          r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?\('
+                          # useCallback/React.useCallback MUST be tried before
+                          # the generic bare-param alternative below: both
+                          # start with "const NAME = <identifier>", and
+                          # alternation is ordered, so a bare-param attempt
+                          # tried first would consume "useCallback" itself as
+                          # if it were the bare param name (then correctly
+                          # fail its own `=>` check and be skipped entirely,
+                          # silently losing the whole useCallback fixture).
+                          r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:React\.)?useCallback\s*(?:<[^()]*?>)?\s*\('
+                          r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?(?=[A-Za-z_$]))')
+# A bare single-param arrow head (`param => {...}`, HELPER_HEAD's 4th
+# alternative) has no `(` for close_of to span, so its own params-end is the
+# identifier's own end, not a paren match; BARE_PARAM below finds that
+# identifier's end directly from the match position instead of close_of.
+BARE_PARAM = re.compile(r'\s*([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=>')
+HELPER_ARROW_TAIL = re.compile(r'\s*(?::[^=]*)?=>\s*')
+# A `function`/function-expression head's own non-brace TypeScript return type
+# (`function getRows(d): Row[] {`, `: Promise<Row[]>`): skipped so body_start
+# lands on the real `{`, not on the type's leading `:`. A brace-containing
+# return type (`: { rows: Row[] }`) DOES match, via the lookahead on the
+# type's own opening `{`: body_start then lands on the type's brace, not the
+# function's, so `close_of` spans the type instead of the real body, no
+# `return` is found inside it, and the helper is silently skipped. That stays
+# a false-negative-only miss (documented below), same outcome as before this
+# fix, just reached via a different, still-wrong body_start.
+HELPER_RETURN_TYPE = re.compile(r'\s*:[^={;]*(?=\{)')
+RETURN_ARR = re.compile(r'\breturn\s*\[')
+# A return inside a NESTED function/arrow body belongs to that inner callback,
+# not to the outer helper being checked (`function loadRows(d){ const cols =
+# () => { return [{...}]; }; return d.rows; }` returns real data; the literal
+# never reaches loadRows's own caller). Matches a nested `function(...) {`,
+# `(...) => {` or a bare-param arrow `x => {`; only the block-body form needs
+# excluding, since a concise `=> [...]` is itself an array literal, not a
+# `return`, and is out of scope for this exclusion.
+NESTED_FN_HEAD = re.compile(r'\bfunction\b[^{}();]*\([^()]*\)\s*\{'
+                             r'|\([^()]*\)\s*(?::[^=]*)?=>\s*\{'
+                             r'|\b[A-Za-z_$][\w$]*\s*=>\s*\{')
+# Sink match: rather than a single non-nested-paren regex for the call's own
+# argument list (which cannot span a nested call, and cannot see a spread
+# element or a trailing chained method call), find the sink's own balanced
+# argument span with close_of and search inside it for the helper's name
+# followed by `(`, anywhere in that span. This one change covers all three
+# CONCERN-reported sink gaps at once: `setRowsX([...buildRows(records)])` (a
+# spread element ahead of the call), `setRowsX(buildRows(normalize(records)))`
+# (a nested call wrapping the fabricating call), and
+# `setRowsX(buildRows(records).slice())` (a trailing method call chained after
+# the sink call: the call to `name(` is still found inside the span
+# regardless of what follows it). The lookbehind excludes a plain member
+# access (`obj.getRows(`) or a substring match (`rebuildRows(`), but must NOT
+# exclude a spread's three dots (`[...getRows(...)]`): `(?:(?<![\w$.])|
+# (?<=\.\.\.))` reads as "not preceded by a word char or a single dot, UNLESS
+# the three characters immediately before are exactly '...'".
+HELPER_CALL_SINK_HEAD = re.compile(r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(')
+HELPER_CALL_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*\('
+# useState's lazy-initializer form passes the bare function reference, never
+# calling it at the sink at all (`useState(getRows)`, React calls it once on
+# mount): the called-form template above can never match this, since there is
+# no `(` after the name at the sink. Sink-span-scoped (not whole-file) so a
+# same-named setter call elsewhere cannot falsely satisfy a different helper.
+HELPER_BARE_REF_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*[,)]'
+# The two-hop form: `const rows = getRows(d); setRows(rows);` -- the literal
+# never appears at the sink call at all (the sink is fed a bare local), so
+# HELPER_CALL_SINK_HEAD's span search cannot see it either; this is the same
+# "capture the intermediate local, then re-check FLOWS_TO_STATE_TMPL on it"
+# shape DECL_ARR itself already can't need (DECL_ARR's own literal sits right
+# at the local's declaration). `(?:await\s+)?` covers `const rows = await
+# getRows();`.
+HELPER_LOCAL_DECL_TMPL = r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{{}}]*)?=(?![=>])\s*(?:await\s+)?{name}\s*\('
 DEMO_NAME = re.compile(r'(?:\b(?:const|let|var)\s+|\bthis\.)([A-Za-z_$][\w$]*)\s*(?::[^=;]*?)?=(?![=>])\s*([\[{])')
 BARE = re.compile(r'^_*(?:sample|mock|demo|fake|dummy|placeholder)s?$|^_*placeholder(?=[A-Z_\d])|^_*PLACEHOLDER_', re.I)
 STAT_KEY = re.compile(r'^["\']?(?:uses|usage|rating|ratings|stars|forks|downloads|installs|views|users|builds|runs|count|total|score|percent|tokens|cost|spend|revenue|reviews|likes|confidence|coverage)["\']?$', re.I)
@@ -1718,6 +1890,132 @@ def whole_file_findings(s):
             continue
         spans.append((idx, end))
         out.append((line_of(s, idx), 'fabricated static fields via Array.from() generator callback'))
+    fabricators = {}
+    def check_body_for_literal_return(name, decl_at, body_start):
+        """body_start points at the helper's own body: '[' for a concise arrow
+        (`=> [...]`) or '{' for a block body. Marks `name` a fabricator in
+        fabricators (keyed so first-declaration wins, matching add_rows'
+        dedupe-by-span convention elsewhere in this function) when the body's
+        own top-level return (or the concise-arrow expression itself) is a
+        literal-rows array. A nested function/arrow's own return is excluded
+        via NESTED_FN_HEAD so a real helper with an inner callback that merely
+        happens to return literal rows (config passed to a nested consumer,
+        never reaching THIS helper's own caller) is not wrongly credited."""
+        body_start += len(s[body_start:]) - len(s[body_start:].lstrip())
+        if body_start >= len(s):
+            return
+        if s[body_start] == '[':
+            body_end = close_of(s, body_start)
+            if body_end > 0 and literal_rows(s[body_start:body_end + 1]):
+                fabricators.setdefault(name, decl_at)
+            return
+        if s[body_start] != '{':
+            return
+        body_end = close_of(s, body_start)
+        if body_end < 0:
+            return
+        body = s[body_start:body_end + 1]
+        nested = []
+        for nm in NESTED_FN_HEAD.finditer(body):
+            nb = close_of(body, nm.end() - 1)
+            if nb > 0:
+                nested.append((nm.end() - 1, nb))
+        for rm in RETURN_ARR.finditer(body):
+            if any(a <= rm.start() <= b for a, b in nested):
+                continue  # a nested function/arrow's own return; not this helper's
+            arr_end = close_of(body, rm.end() - 1)
+            if arr_end > 0 and literal_rows(body[rm.end() - 1:arr_end + 1]):
+                fabricators.setdefault(name, decl_at)
+                break
+    for m in HELPER_HEAD.finditer(s):
+        name = m.group(1) or m.group(2) or m.group(3) or m.group(4) or m.group(5)
+        if not name:
+            continue
+        if m.group(5):
+            # Bare single-param arrow (`const name = param => {...}`): no `(`
+            # for close_of to span, so find the arrow directly from here.
+            bp = BARE_PARAM.match(s, m.end() - 1)
+            if not bp:
+                continue
+            check_body_for_literal_return(name, m.start(), bp.end())
+            continue
+        if m.group(4):
+            # useCallback/React.useCallback-wrapped: the match consumed up to
+            # and including the wrapper's OWN opening `(`; the wrapped
+            # function/arrow head starts right there. Re-run HELPER_ARROW_TAIL/
+            # a `function` head detection on that inner head the same way a
+            # bare `const name = (...) => {...}` head would be, by locating the
+            # inner head's own parameter list (parens, for `(params) =>` and
+            # `function(params)`) or bare single param.
+            inner_start = m.end()
+            inner_bare = BARE_PARAM.match(s, inner_start)
+            if inner_bare:
+                check_body_for_literal_return(name, m.start(), inner_bare.end())
+                continue
+            fn_head = re.match(r'\s*function\s*\(', s[inner_start:])
+            paren_head = re.match(r'\s*\(', s[inner_start:])
+            if fn_head:
+                inner_params = inner_start + fn_head.end() - 1
+            elif paren_head:
+                inner_params = inner_start + paren_head.end() - 1
+            else:
+                continue
+            inner_params_end = close_of(s, inner_params)
+            if inner_params_end < 0:
+                continue
+            arrow = HELPER_ARROW_TAIL.match(s, inner_params_end + 1)
+            if fn_head:
+                ws = len(s[inner_params_end + 1:]) - len(s[inner_params_end + 1:].lstrip())
+                check_body_for_literal_return(name, m.start(), inner_params_end + 1 + ws)
+            elif arrow:
+                check_body_for_literal_return(name, m.start(), arrow.end())
+            continue
+        params_end = close_of(s, m.end() - 1)
+        if params_end < 0:
+            continue
+        head_tail = s[params_end + 1:]
+        if m.group(3):
+            arrow = HELPER_ARROW_TAIL.match(head_tail)
+            if not arrow:
+                continue
+            body_start = params_end + 1 + arrow.end()
+        else:
+            # A `function`/function-expression head can carry a non-brace
+            # TypeScript return type (`function getRows(d): Row[] {`); skip
+            # past it so body_start lands on the real `{`, never on the type's
+            # leading `:` (a brace-containing return type such as
+            # `: { rows: Row[] }` would still misplace the opener onto the
+            # type, a known false-negative-only ceiling documented above).
+            ann = HELPER_RETURN_TYPE.match(head_tail)
+            if ann:
+                body_start = params_end + 1 + ann.end()
+            else:
+                ws = len(head_tail) - len(head_tail.lstrip())
+                body_start = params_end + 1 + ws
+        check_body_for_literal_return(name, m.start(), body_start)
+    for name, decl_at in fabricators.items():
+        name_re = re.escape(name)
+        hit = None
+        for sm in HELPER_CALL_SINK_HEAD.finditer(s):
+            i = sm.end() - 1
+            j = close_of(s, i)
+            if j < 0:
+                continue
+            span = s[i:j + 1]
+            if re.search(HELPER_CALL_IN_SPAN_TMPL.format(name=name_re), span) \
+                    or re.search(HELPER_BARE_REF_IN_SPAN_TMPL.format(name=name_re), span):
+                hit = sm
+                break
+        if not hit:
+            hit = re.search(r'\bthis\.\w+\s*=\s*(?:await\s+)?' + name_re + r'\s*\(', s)
+        if not hit:
+            for lm in re.finditer(HELPER_LOCAL_DECL_TMPL.format(name=name_re), s):
+                local = lm.group(1)
+                if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(local)), s):
+                    hit = lm
+                    break
+        if hit:
+            out.append((line_of(s, decl_at), f"'{name}' returns fabricated literal rows reaching a data sink"))
     return sorted(set(out))
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
@@ -2384,6 +2682,322 @@ export function OC({ x }) {
   return <b>{data}</b>;
 }
 TSX
+    # Rule 6, function-return extension (BACKLOG 125 B-7): the literal never
+    # sits at the call site, only inside a same-file helper's own return, so
+    # every arm above misses it. The reported bypass verbatim, at column 0
+    # exactly as filed (no column-0 module-scope exemption exists for this
+    # arm; see the ponytail comment above whole_file_findings()).
+    cat > "$d/src/components/HelperReturnTaskVerbatim.tsx" <<'TSX'
+function getRows(d) {
+  if (!d) return [{id: 1, name: 'Sample User', action: 'Deployed'}];
+  return d;
+}
+setRows(getRows(d));
+TSX
+    # Four more fixtures, one per HELPER_HEAD branch and sink form: the same
+    # `function` declaration fed straight to a setter but inside a component
+    # (not column 0), an arrow with a block body fed to useState, a function
+    # expression fed to `this.x =` in a shipped web component, and the
+    # two-hop form (`const rows = getRows(d); setRows(rows)`).
+    cat > "$d/src/components/HelperReturnFnDecl.tsx" <<'TSX'
+export function HF({ d }) {
+  function getRows(d) {
+    if (!d) return [{ id: 1, name: 'Sample User', action: 'Deployed' }];
+    return d;
+  }
+  setRows(getRows(d));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnArrow.tsx" <<'TSX'
+export function HA({ d }) {
+  const getRows = (d) => {
+    if (!d) return [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return d;
+  };
+  const [rows] = useState(getRows(d));
+  return null;
+}
+TSX
+    cat > "$d/dash/components/HelperReturnThisSink.js" <<'JS'
+export class HelperReturnThisSink extends LokiElement {
+  _seed(data) {
+    const getPhases = function (d) {
+      if (!d) return [{ phase: 'build', cost_usd: 0.42, tokens: 18000 }];
+      return d;
+    };
+    this._phases = getPhases(data);
+  }
+}
+JS
+    # A `function` declaration head carrying a non-brace TypeScript return
+    # type (`function getRows(d): Row[] {`): without HELPER_RETURN_TYPE this
+    # is a one-token bypass of the whole arm, since body_start would land on
+    # the annotation's leading `:` and never find the real `{`.
+    cat > "$d/src/components/HelperReturnTyped.tsx" <<'TSX'
+export function HTY({ d }) {
+  function getRows(d: Row[] | null): Row[] {
+    if (!d) return [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return d;
+  }
+  setRows(getRows(d));
+  return null;
+}
+TSX
+    # Per-alternative coverage for the sink-span search: an `await`ed call fed
+    # to a setter (a plain call already covers the non-await setter form
+    # above), an `await`ed call assigned to `this.x` (HelperReturnThisSink
+    # above is a plain, non-await call and does not reach this alternative),
+    # and a lazy bare-reference passed to useState (never called at the sink,
+    # so no other fixture's call-site text can satisfy it).
+    cat > "$d/src/components/HelperReturnAwaitSetter.tsx" <<'TSX'
+export function HW() {
+  async function getRows() {
+    return [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  }
+  async function run() {
+    setRows(await getRows());
+  }
+  run();
+  return null;
+}
+TSX
+    cat > "$d/dash/components/HelperReturnAwaitThisSink.js" <<'JS'
+export class HelperReturnAwaitThisSink extends LokiElement {
+  async _seed() {
+    async function getPhases() {
+      return [{ phase: 'build', cost_usd: 0.42, tokens: 18000 }];
+    }
+    this._phases = await getPhases();
+  }
+}
+JS
+    cat > "$d/src/components/HelperReturnLazyRef.tsx" <<'TSX'
+export function HLR() {
+  function getRows() {
+    return [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  }
+  const [rows] = useState(getRows);
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnTwoHop.tsx" <<'TSX'
+export function HT({ d }) {
+  function getRows(d) {
+    if (!d) return [{ id: 1, name: 'Sample User', action: 'Deployed' }];
+    return d;
+  }
+  const rows = getRows(d);
+  setRows(rows);
+  return null;
+}
+TSX
+    # A concise arrow (`=> [...]`, no block body) hits the OTHER HELPER_HEAD
+    # branch than the three fixtures above (body_start is '[' directly, never
+    # '{'); without this fixture that branch has no committed control at all.
+    cat > "$d/src/components/HelperReturnConcise.tsx" <<'TSX'
+export function HC() {
+  const getRows = () => [{ id: 'a1', action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+  setRows(getRows());
+  return null;
+}
+TSX
+    # CONCERN fix, sink side (3): a spread element inside a sink array
+    # argument, a nested call wrapping the fabricating call, and a trailing
+    # method call chained after the sink call. None of these fixtures'
+    # fabricating helper is itself named sample/mock/demo/fake, so only the
+    # new sink-span search (not rules 5/7's name check) can catch them.
+    cat > "$d/src/components/HelperReturnSinkSpread.tsx" <<'TSX'
+export function HSP({ records }) {
+  function buildRowsX(r) {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }
+  setRowsX([...buildRowsX(records)]);
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnSinkNestedCall.tsx" <<'TSX'
+export function HSN({ records }) {
+  function buildRowsX(r) {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }
+  function normalizeX(r) {
+    return r;
+  }
+  setRowsX(normalizeX(buildRowsX(records)));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnSinkTrailingCall.tsx" <<'TSX'
+export function HST({ records }) {
+  function buildRowsX(r) {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }
+  setRowsX(buildRowsX(records).slice());
+  return null;
+}
+TSX
+    # CONCERN fix, head side (3): a bare single-param arrow with no parens, a
+    # `let` declaration (not `const`), and a `useCallback`-wrapped arrow (the
+    # highest-value gap: a mainstream React idiom, and both dashboard-ui and
+    # web-app use hooks extensively).
+    cat > "$d/src/components/HelperReturnBareParamArrow.tsx" <<'TSX'
+export function HBP({ records }) {
+  const buildRowsY = records => {
+    if (!records) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return records;
+  };
+  setRowsY(buildRowsY(records));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnLetVar.tsx" <<'TSX'
+export function HLV({ records }) {
+  let buildRowsZ = (r) => {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  };
+  setRowsZ(buildRowsZ(records));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnUseCallback.tsx" <<'TSX'
+export function HUC({ records }) {
+  const buildRowsW = useCallback((r) => {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }, []);
+  setRowsW(buildRowsW(records));
+  return null;
+}
+TSX
+    # useCallback per-alternative coverage: a bare single-param arrow inside
+    # useCallback (both new head branches at once), and the React.useCallback
+    # qualified form.
+    cat > "$d/src/components/HelperReturnUseCallbackBareParam.tsx" <<'TSX'
+export function HUB({ records }) {
+  const buildRowsV = useCallback(records => {
+    if (!records) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return records;
+  }, []);
+  setRowsV(buildRowsV(records));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnReactUseCallback.tsx" <<'TSX'
+export function HRU({ records }) {
+  const buildRowsU = React.useCallback((r) => {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }, []);
+  setRowsU(buildRowsU(records));
+  return null;
+}
+TSX
+    # Honest look-alikes for the same arm: an empty-array fallback (a genuine
+    # "nothing yet" default), a real config/enum object return, a helper whose
+    # fabricated return never reaches a sink (render-only .map() - this is
+    # what makes the sink gate load-bearing rather than flagging every helper
+    # that merely contains a literal-rows return), and a helper whose OWN
+    # return is real data while a NESTED callback inside its body returns a
+    # literal that never reaches the outer helper's caller (round-review
+    # adversarial fixture for the arm's own known ceiling: RETURN_ARR must be
+    # scoped to the helper's own top-level returns, not to the whole body
+    # text, or this one goes red).
+    cat > "$d/src/components/HelperReturnEmptyHonest.tsx" <<'TSX'
+export function HE({ d }) {
+  function getRows(d) {
+    if (!d) return [];
+    return d;
+  }
+  setRows(getRows(d));
+  const getConfig = () => {
+    return { retries: 3, timeout: 30 };
+  };
+  setConfig(getConfig());
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnRenderOnlyHonest.tsx" <<'TSX'
+export function HR({ d }) {
+  function getRows(d) {
+    if (!d) return [{ id: 1, name: 'Sample User', action: 'Deployed' }];
+    return d;
+  }
+  return getRows(d).map((r) => r.id);
+}
+TSX
+    cat > "$d/src/components/HelperReturnNestedCallbackHonest.tsx" <<'TSX'
+export function HNC({ api }) {
+  function loadRows(d) {
+    const cols = () => {
+      return [{ key: 'id', label: 'ID' }];
+    };
+    void cols;
+    return d.rows;
+  }
+  setRows(loadRows(api));
+  return null;
+}
+TSX
+    # CONCERN-fix honest look-alikes: a spread of REAL (non-literal) data, a
+    # nested call whose OUTER helper returns real data (the nested call inside
+    # the sink span belongs to an honest transform, not a fabricator), a
+    # trailing method call on a real-data helper's result, a useCallback
+    # helper returning REAL mapped data (not literal rows), and an
+    # `obj.buildRowsY(` method-call collision that must not credit a same-named
+    # plain function to an unrelated method call.
+    cat > "$d/src/components/HelperReturnSinkSpreadHonest.tsx" <<'TSX'
+export function HSPH({ records }) {
+  function passThroughX(r) {
+    return r;
+  }
+  setRowsX([...passThroughX(records)]);
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnSinkNestedCallHonest.tsx" <<'TSX'
+export function HSNH({ records }) {
+  function passThroughX(r) {
+    return r;
+  }
+  function normalizeX(r) {
+    return r;
+  }
+  setRowsX(normalizeX(passThroughX(records)));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnSinkTrailingCallHonest.tsx" <<'TSX'
+export function HSTH({ records }) {
+  function passThroughX(r) {
+    return r;
+  }
+  setRowsX(passThroughX(records).slice());
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnUseCallbackHonest.tsx" <<'TSX'
+export function HUCH({ records }) {
+  const mapRowsW = useCallback((r) => r.map((row) => ({ id: row.id })), []);
+  setRowsW(mapRowsW(records));
+  return null;
+}
+TSX
+    cat > "$d/src/components/HelperReturnMethodCollisionHonest.tsx" <<'TSX'
+export function HMC({ obj, records }) {
+  function buildRowsY(r) {
+    if (!r) return [{ id: 1, action: 'Deployed', user: 'Admin', timestamp: 'now' }];
+    return r;
+  }
+  void buildRowsY;
+  setRowsY(obj.buildRowsY(records));
+  return null;
+}
+TSX
     # Negative controls for the rule 6 extension: a ternary between two
     # literals (advisorOpts, real shape at loki-session-control.js:471), a
     # render-local literal list mapped straight into markup with no setter, a
@@ -2830,6 +3444,24 @@ BareCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS13' (fabricated row
 BareOrChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS14' (fabricated rows) used as a fallback
 BareNullishChainTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS15' (fabricated rows) used as a fallback
 BareOrChainCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS16' (fabricated rows) used as a fallback
+HelperReturnTaskVerbatim.tsx:1|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnFnDecl.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnArrow.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnThisSink.js:3|'getPhases' returns fabricated literal rows reaching a data sink
+HelperReturnTwoHop.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnConcise.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnTyped.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnAwaitSetter.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnAwaitThisSink.js:3|'getPhases' returns fabricated literal rows reaching a data sink
+HelperReturnLazyRef.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
+HelperReturnSinkSpread.tsx:2|'buildRowsX' returns fabricated literal rows reaching a data sink
+HelperReturnSinkNestedCall.tsx:2|'buildRowsX' returns fabricated literal rows reaching a data sink
+HelperReturnSinkTrailingCall.tsx:2|'buildRowsX' returns fabricated literal rows reaching a data sink
+HelperReturnBareParamArrow.tsx:2|'buildRowsY' returns fabricated literal rows reaching a data sink
+HelperReturnLetVar.tsx:2|'buildRowsZ' returns fabricated literal rows reaching a data sink
+HelperReturnUseCallback.tsx:2|'buildRowsW' returns fabricated literal rows reaching a data sink
+HelperReturnUseCallbackBareParam.tsx:2|'buildRowsV' returns fabricated literal rows reaching a data sink
+HelperReturnReactUseCallback.tsx:2|'buildRowsU' returns fabricated literal rows reaching a data sink
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -2855,6 +3487,17 @@ EOF
         DefaultProvidersSpreadHonest.tsx:0 \
         ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
         BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
+        HelperReturnTaskVerbatim.tsx:1 \
+        HelperReturnFnDecl.tsx:1 HelperReturnArrow.tsx:1 HelperReturnThisSink.js:1 HelperReturnTwoHop.tsx:1 \
+        HelperReturnConcise.tsx:1 HelperReturnTyped.tsx:1 \
+        HelperReturnAwaitSetter.tsx:1 HelperReturnAwaitThisSink.js:1 HelperReturnLazyRef.tsx:1 \
+        HelperReturnSinkSpread.tsx:1 HelperReturnSinkNestedCall.tsx:1 HelperReturnSinkTrailingCall.tsx:1 \
+        HelperReturnBareParamArrow.tsx:1 HelperReturnLetVar.tsx:1 HelperReturnUseCallback.tsx:1 \
+        HelperReturnUseCallbackBareParam.tsx:1 HelperReturnReactUseCallback.tsx:1 \
+        HelperReturnEmptyHonest.tsx:0 HelperReturnRenderOnlyHonest.tsx:0 HelperReturnNestedCallbackHonest.tsx:0 \
+        HelperReturnSinkSpreadHonest.tsx:0 HelperReturnSinkNestedCallHonest.tsx:0 \
+        HelperReturnSinkTrailingCallHonest.tsx:0 HelperReturnUseCallbackHonest.tsx:0 \
+        HelperReturnMethodCollisionHonest.tsx:0 \
         AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
         ModuleTablesHonest.tsx:0 TimerHonest.tsx:0 \
         ModuleTableSelfDerivedHonest.tsx:0 ModuleTableDefaultOptsHonest.tsx:0 \
