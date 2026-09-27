@@ -840,6 +840,79 @@ case_council_readers_not_shadowed() {
     if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
 }
 
+# BACKLOG 134: -E ignores PYTHON* env vars but still loads user site-packages,
+# and Python execs every "import" line of every .pth found there at startup,
+# before any sys.path scrub. A same-UID agent that plants one can forge what
+# the council's three test-result readers see. The payload forges json.load
+# ONLY for test-results.json (and marks it), so the council's other, unrelated
+# python3 calls neither pollute the verdict nor the marker.
+case_council_readers_no_user_site_pth() {
+    need python3 git || return
+    local fail='{"runner":"jest","pass":false,"summary":"1 failed"}'
+    local green='{"runner":"jest","pass":true,"summary":"green"}'
+    local home="$RUN/pth-home" mark="$RUN/pth.mark" py site planted="" bad="" leg d b out want
+    mkdir -p "$home"
+    # Plant in the user site of every interpreter the council could run: the
+    # PATH python3 (the pre-fix reader) and the fixed root-owned candidates the
+    # resolver tries first. Each plant gets its own positive control below.
+    for py in "$(command -v python3)" /usr/bin/python3 /bin/python3; do
+        [ -x "$py" ] && "$py" -I -S -c '' >/dev/null 2>&1 || continue
+        site="$(HOME="$home" "$py" -E -c 'import site; print(site.getusersitepackages())' 2>/dev/null)"
+        [ -n "$site" ] || continue
+        mkdir -p "$site" || continue
+        printf 'import zzz_loki_s49\n' > "$site/zzz_loki_s49.pth"
+        cat > "$site/zzz_loki_s49.py" <<'EOF'
+import json, os
+_real = json.load
+def load(fp, *a, **k):
+    if str(getattr(fp, "name", "")).endswith("test-results.json"):
+        open(os.environ.get("MOAT_MARK", os.devnull), "a").write("pth\n")
+        return {"runner": "jest", "pass": True, "status": "passed"}
+    return _real(fp, *a, **k)
+json.load = load
+EOF
+        planted="$planted $py"
+    done
+    [ -n "$planted" ] || { _why="control broken: no runnable python3 to plant a user-site .pth for"; return; }
+    for leg in pth-fail plain-green; do
+        d="$RUN/pth-$leg"
+        case "$leg" in *-fail) b="$(council_repo "$d" "$fail")" ;; *) b="$(council_repo "$d" "$green")" ;; esac \
+            || { _why="fixture $leg failed"; return; }
+        : > "$d/neutral-evidence.txt"
+        # Control: under -E, every planted interpreter really does run the .pth
+        # and forge this fixture's test-results.json, so "no effect" below is
+        # a measurement, not an absence.
+        if [ "$leg" = pth-fail ]; then
+            for py in $planted; do
+                rm -f "$mark"
+                out="$(cd "$d" && HOME="$home" MOAT_MARK="$mark" "$py" -E -c 'import json; print(json.load(open(".loki/quality/test-results.json"))["pass"])' 2>/dev/null)"
+                if [ "$out" != "True" ] || ! grep -q '^pth$' "$mark" 2>/dev/null; then
+                    _why="control broken: $py -E did not run the planted .pth (got '$out')"
+                    return
+                fi
+            done
+            rm -f "$mark"
+        fi
+        # The plain-green leg runs without the planted HOME: it proves the
+        # harness can reach the approving words at all.
+        for want in "council_heuristic_review test_auditor $d/neutral-evidence.txt|VOTE:REJECT|VOTE:APPROVE" \
+                    "council_evaluate_member requirements_verifier|CONTINUE|COMPLETE" \
+                    "council_devils_advocate_review|OVERRIDE_CONTINUE|CONFIRMED_COMPLETE"; do
+            local call="${want%%|*}" rest="${want#*|}" w
+            case "$leg" in *-fail) w="${rest%%|*}" ;; *) w="${rest#*|}" ;; esac
+            # shellcheck disable=SC2086
+            if [ "$leg" = pth-fail ]; then
+                out="$(export HOME="$home" MOAT_MARK="$mark"; council_call_args "$d" "$b" $call)"
+            else
+                out="$(council_call_args "$d" "$b" $call)"
+            fi
+            [ "$out" = "$w" ] || bad="$bad [$leg ${call%% *}: got '$out' want $w]"
+        done
+    done
+    [ ! -s "$mark" ] || bad="$bad [the planted .pth forged a council read: $(sort -u "$mark" | tr '\n' ' ')]"
+    if [ -z "$bad" ]; then _st="PASS"; else _why="${bad# }"; fi
+}
+
 # D7 on the checklist side (backlog 53): PRD checklist verification runs inside
 # the agent's repo too. This json.py is smarter than the one above: it loads the
 # real json and then rewrites every failing check it reads or writes as passing,
@@ -1260,6 +1333,7 @@ run_case P2.verify-exit-contract "loki verify maps nothing-to-check to 3, could-
 run_case P2.fast-verify-inconclusive-not-zero "loki verify --fast with nothing scanned, a nonexistent root or an unknown flag does not exit 0 (bash-only command, both entry points)" case_fast_verify
 run_case P2.council-inconclusive-cannot-exit-zero "inconclusive evidence plus a council vote alone cannot approve completion" case_council_inconclusive
 run_case P2.council-readers-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing test results green in the council's readers" case_council_readers_not_shadowed
+run_case P2.council-readers-no-user-site-pth "a .pth planted in user site-packages cannot turn failing test results green in the council's three test-result readers (heuristic, member, devil's advocate)" case_council_readers_no_user_site_pth
 run_case P2.checklist-verify-not-shadowed "a json.py/sitecustomize.py in the agent's repo (hostile PYTHONPATH) cannot turn failing PRD checklist checks green (checklist-verify.py, summary, council evidence, hard gate)" case_checklist_not_shadowed
 run_case P2.exit-zero-with-failures-not-pass "a runner that exits 0 while its own summary reports failures (jest 'Tests: 1 failed') is recorded pass:false with no unit-tests.pass, and the council blocks it (bash); a recorded failed_count > 0 (or legacy failed > 0) with pass:true fails the council evidence gate and the Bun test gate alike, while 0, null and a missing count still pass on both" case_exit_zero_with_failures
 run_case P2.console-verdict-needs-computed-result "a console verdict word needs a computed result: the receipt route carries the verifier's integrity_check (tampered, not_verified, verified on a real generator receipt), the audit verify route says nothing_checked for zero files, the audit viewer never reads VALID for nothing checked or TAMPERED for a failed request, and the receipt panel never affirms without a server-verified result; both client probes flag the verbatim pre-fix lines" case_console_verdict

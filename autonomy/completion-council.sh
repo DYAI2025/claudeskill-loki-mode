@@ -72,6 +72,38 @@ for _cc_cand in "$_LOKI_CC_DIR/lib/secret-scan.sh" "${SCRIPT_DIR:-}/lib/secret-s
 done
 unset _LOKI_CC_DIR _cc_cand
 
+# BACKLOG 134: the three test-result readers (council_heuristic_review,
+# council_evaluate_member, council_devils_advocate_review) resolve their
+# interpreter through run.sh's _loki_snapshot_py_tool and run it -I -S: -E alone
+# still loads user site-packages, whose .pth "import" lines run before any
+# sys.path scrub and can forge json.load (see that function's comment in
+# run.sh for the full rationale and accepted gaps). run.sh sources this file
+# BEFORE it defines _loki_snapshot_py_tool, so in production run.sh's own
+# definition replaces this one; the copy below only serves callers that source
+# this file on its own (tests). run.sh is the source of truth: keep this copy
+# byte-identical to it.
+declare -F _loki_snapshot_py_tool >/dev/null 2>&1 || \
+_loki_snapshot_py_tool() {
+    local c
+    for c in /usr/bin/python3 /bin/python3; do
+        [ -x "$c" ] && [ ! -d "$c" ] && "$c" -I -S -c '' >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+    done
+    local dir
+    local IFS=:
+    for dir in $PATH; do
+        case "$dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        if [ -x "$dir/python3" ] && [ ! -d "$dir/python3" ] \
+           && "$dir/python3" -I -S -c '' >/dev/null 2>&1; then
+            printf '%s\n' "$dir/python3"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Council configuration
 COUNCIL_ENABLED=${LOKI_COUNCIL_ENABLED:-true}
 COUNCIL_SIZE=${LOKI_COUNCIL_SIZE:-3}
@@ -3484,8 +3516,10 @@ council_heuristic_review() {
             # evidence -> REJECT (keep iterating), never a heuristic APPROVE.
             local _tr_file=".loki/quality/test-results.json"
             local _tests_ok=0
-            if [ -f "$_tr_file" ] && command -v python3 >/dev/null 2>&1; then
-                _tests_ok=$(_TR="$_tr_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+            local _tr_py=""
+            [ -f "$_tr_file" ] && _tr_py="$(_loki_snapshot_py_tool)" || _tr_py=""
+            if [ -n "$_tr_py" ]; then
+                _tests_ok=$(_TR="$_tr_file" "$_tr_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os
 try:
     with open(os.environ['_TR']) as f:
@@ -3668,9 +3702,11 @@ council_evaluate_member() {
     local tr_file="$loki_dir/quality/test-results.json"
     local test_evidence="absent"   # absent | pass | fail | inconclusive
     local test_runner_seen="none"
-    if [ -f "$tr_file" ]; then
+    local _tr_py=""
+    [ -f "$tr_file" ] && _tr_py="$(_loki_snapshot_py_tool)" || _tr_py=""
+    if [ -n "$_tr_py" ]; then
         local _tr_status
-        _tr_status=$(_TR_FILE="$tr_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+        _tr_status=$(_TR_FILE="$tr_file" "$_tr_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_TR_FILE']) as f:
@@ -3969,9 +4005,11 @@ council_devils_advocate_review() {
     # (nothing writes .loki/logs/test-*.log, so an empty glob is the normal case
     # and must never veto a unanimous COMPLETE on its own).
     local tr_file="$loki_dir/quality/test-results.json"
-    if [ -f "$tr_file" ]; then
+    local _tr_py=""
+    [ -f "$tr_file" ] && _tr_py="$(_loki_snapshot_py_tool)" || _tr_py=""
+    if [ -n "$_tr_py" ]; then
         local _tr_status
-        _tr_status=$(_TR_FILE="$tr_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+        _tr_status=$(_TR_FILE="$tr_file" "$_tr_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, os, sys
 try:
     with open(os.environ['_TR_FILE']) as f:
