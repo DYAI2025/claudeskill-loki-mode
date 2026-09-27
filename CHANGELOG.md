@@ -5,6 +5,16 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.73.0
+
+**Council votes honor failed counts; the log stream says when its API is down.** Released from green tree ec01d54b (Tests run 36346770258 and Bun Parity run 36346770129 both success before the bump).
+
+- A council member vote and the convergence floor no longer read `pass:true` as green when `failed_count` is above zero (S-157).
+- The dashboard log stream shows "Log source unreachable" after two failed polls instead of a quiet, empty log (S-169).
+- A lint flags run-written values spliced into dashboard innerHTML without the escape helper (S-171).
+- A lint refuses test code that writes the real ~/.gitconfig unless it first sources the shared isolation helper (S-138).
+- Trust-core probe mutations run in parallel, each worker on a private copy of the repo (S-135).
+
 ## v9.72.0
 
 **Failures read as failures across the web app and dashboard.** Released from green tree 2a024770 (Tests run 36346150997 and Bun Parity run 36346151002 both success before the bump).
