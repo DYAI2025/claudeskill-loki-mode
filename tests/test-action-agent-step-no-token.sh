@@ -32,6 +32,23 @@
 #     each of those five forms is now caught (and that a properly-blanked
 #     step in each form still passes).
 #
+# REWORK (S-54 round 3): a reviewer reproduced that round 2's narrowed _SEP
+# (statement-boundary anchor) over-corrected: it dropped bare whitespace
+# entirely, so it also lost every case where the real command-start boundary
+# is a shell keyword or a wrapper rather than punctuation -- `if`/`while`/
+# `until`/`elif`/`else`/`then`/`do`, negation (`!`), and a wrapper that execs
+# the real command in place (`timeout N`, `env VAR=..`, `nice`, `command`,
+# `exec`). A scratch "Agent pass" step made the new test pass while the old
+# round-1 test still failed on it. Fixed below: _SEP now requires a genuine
+# punctuation boundary first, then allows at most one keyword/negation and
+# any number of wrappers before the command, so `if loki start; then ...`,
+# `while ! loki start; do ...`, `(loki start)`, `{ loki start; }`, a bare
+# pipe, and each wrapper are all detected again, while a stray English "if"
+# mid-string (e.g. inside an echo) still cannot anchor on its own because
+# nothing before it is a real boundary. New fixtures:
+# tests/fixtures/action-agent-step-forms/keyword-prefixes.yml,
+# negation-pipe-subshell.yml, wrapper-commands.yml.
+#
 # Usage: test-action-agent-step-no-token.sh [root]   (root defaults to repo)
 set -uo pipefail
 
@@ -47,11 +64,32 @@ TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPR
 TOKEN_EXPR_RE = re.compile(r"\$\{\{[^}]*(github\.token|github_token|GITHUB_TOKEN|GH_TOKEN)[^}]*\}\}")
 
 # A command-position anchor: start of the run text, a new shell statement
-# (after ; && || a backtick or a $( ), never bare whitespace. Bare whitespace
-# would also match mid-argument, e.g. `--provider "$LOKI_PROVIDER"`, or a
-# plain assignment value like `OUT="$RUNNER_TEMP/loki-out"` -- neither of
-# those runs anything.
-_SEP = r'(?:\A|\n|;|&&|\|\||\$\(|`)\s*'
+# (after ; && || a bare | ( { a backtick or a $( ), never bare whitespace.
+# Bare whitespace would also match mid-argument, e.g. `--provider
+# "$LOKI_PROVIDER"`, or a plain assignment value like
+# `OUT="$RUNNER_TEMP/loki-out"` -- neither of those runs anything.
+#
+# ROUND 3: a reviewer reproduced that the round-2 anchor, by dropping bare
+# whitespace entirely, also lost every case where the real boundary is a
+# shell keyword or wrapper rather than punctuation: `if loki start; then`,
+# `while loki start; do`, `until`/`elif`/`else`, negation (`! loki start`),
+# and a wrapper that execs the real command in place (`timeout 30 loki
+# start`, `env FOO=bar loki start`, `nice`/`command`/`exec loki start`).
+# Fixed by requiring a genuine punctuation BOUNDARY first (so a stray
+# English "if" mid-sentence, e.g. `echo "check if loki config is valid"`,
+# still cannot anchor on its own -- there is no boundary char directly
+# before that "if"), then letting an optional keyword AND an optional
+# negation stack (so `if ! loki start; then`, the common shell form of a
+# negated condition, is caught too -- not just a bare keyword or a bare `!`),
+# followed by any number of wrappers, before the real command.
+_BOUNDARY = r'(?:\A|\n|;|&&|\|\||\||\(|\{|\$\(|`)'
+_KEYWORD = r'(?:if|while|until|elif|else|then|do)\b'
+_WRAPPER = (
+    r'(?:timeout\b\s+\S+'
+    r'|env\b(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)+'
+    r'|nice\b|command\b|exec\b)'
+)
+_SEP = rf'{_BOUNDARY}\s*(?:{_KEYWORD}\s+)?(?:!\s+)?(?:{_WRAPPER}\s+)*'
 
 # Any direct invocation of the loki / loki-mode binary: bare word, an
 # absolute or ./relative path in front of it, npx with or without a pinned
@@ -138,9 +176,14 @@ print(f"  phase 1 (shipped actions, {len(action_files)} file(s) via glob): "
       f"checked {shipped_passes} agent steps")
 
 # --- Phase 2: fixtures proving each previously-missed form is now caught. ---
-# Each fixture has an "Unblanked ..." step (must be flagged) and a
-# "Blanked ..." step in the SAME invocation form (must not be flagged, so the
-# detector isn't just failing every step in a file it touches).
+# Each fixture has one or more "Unblanked ..." steps (each must be flagged)
+# and at least one "Blanked ..." step (must not be flagged, so the detector
+# isn't just failing every step in a file it touches). Checked by NAME
+# against the full step list, not "any() of the detected steps" -- an "any"
+# check is satisfied by ONE detected form and stays silent about every other
+# named form in the same file that the detector missed, which is exactly how
+# a single dropped alternative (e.g. losing brace-group or elif coverage)
+# could hide behind neighboring forms that still work.
 fixdir = os.path.join(root, "tests/fixtures/action-agent-step-forms")
 fixture_files = sorted(glob.glob(os.path.join(fixdir, "*.yml")))
 if not fixture_files:
@@ -149,21 +192,21 @@ if not fixture_files:
 fixture_checks = 0
 for path in fixture_files:
     rel = os.path.relpath(path, root)
-    steps = list(agent_steps(path))
-    names = [n for n, _ in steps]
-    if not any(n.lower().startswith("unblanked") for n in names):
-        fails.append(f"{rel}: detector did not recognize the unblanked form as an agent step (regression)")
-        continue
-    if not any(n.lower().startswith("blanked") for n in names):
-        fails.append(f"{rel}: detector did not recognize the blanked form as an agent step")
-        continue
-    for name, st in steps:
+    all_names = [st.get("name", "") for st in yaml.safe_load(open(path))["runs"]["steps"]]
+    detected = dict(agent_steps(path))
+    for name in all_names:
+        lname = name.lower()
+        if not (lname.startswith("unblanked") or lname.startswith("blanked")):
+            continue
+        if name not in detected:
+            fails.append(f"{rel} [{name}]: form not detected as an agent step (regression)")
+            continue
         step_fails = []
-        check_step(rel, name, st, step_fails)
+        check_step(rel, name, detected[name], step_fails)
         fixture_checks += 1
-        if name.lower().startswith("unblanked") and not step_fails:
+        if lname.startswith("unblanked") and not step_fails:
             fails.append(f"{rel} [{name}]: expected a token-holding failure but none was reported")
-        elif name.lower().startswith("blanked") and step_fails:
+        elif lname.startswith("blanked") and step_fails:
             fails.extend(f"{rel} [{name}]: unexpected: {m}" for m in step_fails)
 
 print(f"  phase 2 (missed-form fixtures, {len(fixture_files)} file(s)): "
