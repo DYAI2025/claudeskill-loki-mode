@@ -1,0 +1,59 @@
+name: Tier A (fast feedback)
+
+# Feedback only, not release authority: this selects and runs only the
+# suites a change can plausibly affect (scripts/select-tests.sh, S-91), aimed
+# at 2 minutes for a typical PR diff. It never replaces Tier B: the full
+# "Tests" workflow (test.yml) still runs on every push/PR to main and is what
+# actually gates. R0 (a broad-blast-radius or unrecognized-path diff) is the
+# declared exception to the 2-minute target: it runs the full
+# tests/run-all-tests.sh suite instead, which is why the job timeout below is
+# generous rather than tight.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier-a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  select-and-run:
+    name: Tier A selected suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies (for R5 dashboard/web-app pytest)
+        run: python3 -m pip install -r requirements-test.txt
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install loki-ts dependencies (for R4 bun test / typecheck)
+        working-directory: loki-ts
+        run: bun install
+
+      - name: Install web-app dependencies (for R5 node_lint / pytest)
+        working-directory: web-app
+        run: npm ci --no-audit --no-fund
+
+      - name: Select suites for this diff
+        run: |
+          bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}"
+
+      - name: Run selected suites
+        run: |
+          bash scripts/select-tests.sh --base "origin/${{ github.base_ref }}" --run
