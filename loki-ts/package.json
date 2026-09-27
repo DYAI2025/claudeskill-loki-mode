@@ -11,7 +11,7 @@
   "scripts": {
     "version": "bun src/cli.ts version",
     "typecheck": "bun run --bun tsc --noEmit",
-    "test": "bun test",
+    "test": "LOKI_NO_BROWSER=1 bun test",
     "bench": "bun run scripts/bench.ts",
     "build": "bun run scripts/build.ts",
     "build:binary": "bun build --compile src/cli.ts --outfile=dist/loki-ts"

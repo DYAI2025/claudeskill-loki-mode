@@ -3,6 +3,8 @@
 # Runs all test cases for the Loki Mode skill
 
 set -euo pipefail
+# Tests always run headless: no suite may open a browser (S-103).
+export LOKI_NO_BROWSER=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL_PASSED=0
@@ -1434,6 +1436,7 @@ run_test "Project graph discovery" "$SCRIPT_DIR/test-project-graph.sh"
 run_test "State versioning (SYN-015)" "$SCRIPT_DIR/test-state-versioning.sh"
 run_test "Welcome opener (terminal + browser)" "$SCRIPT_DIR/test-welcome-opener.sh"
 
+run_test "Browser-open guard (tests never open a browser, S-103)" "$SCRIPT_DIR/test-browser-open-guard.sh"
 run_test "ShellCheck Linting" "$SCRIPT_DIR/run-shellcheck.sh"
 
 # Summary

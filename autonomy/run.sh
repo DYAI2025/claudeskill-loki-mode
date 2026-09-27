@@ -1228,6 +1228,12 @@ if [ -f "$LOCK_LIB" ]; then
     source "$LOCK_LIB"
 fi
 
+# Guarded browser opener (loki_open_url): the only way run.sh opens a browser.
+if [ -f "$SCRIPT_DIR/lib/browser-open.sh" ]; then
+    # shellcheck source=lib/browser-open.sh
+    source "$SCRIPT_DIR/lib/browser-open.sh"
+fi
+
 # Git PR advisory (shared print-only helper for create_session_pr and loki deploy)
 GIT_PR_ADVISORY_LIB="$SCRIPT_DIR/lib/git-pr-advisory.sh"
 if [ -f "$GIT_PR_ADVISORY_LIB" ]; then
@@ -19183,21 +19189,10 @@ start_dashboard() {
         log_info "Dashboard: ${CYAN}${url_scheme}://127.0.0.1:$DASHBOARD_PORT/${NC}"
 
         # Auto-open the dashboard in the browser, but ONLY for an interactive
-        # foreground session. Gated on: a TTY on stdout ([ -t 1 ]), not
-        # background/detached mode, and not explicitly opted out via
-        # LOKI_NO_AUTO_OPEN=1. This keeps CI, --detach, SSH-no-TTY, and piped
-        # runs from spawning a browser. Cross-platform: open / xdg-open / start.
-        if [ -t 1 ] && [ "${BACKGROUND_MODE:-false}" != "true" ] && [ "${LOKI_NO_AUTO_OPEN:-0}" != "1" ]; then
-            local _dash_url="${url_scheme}://127.0.0.1:$DASHBOARD_PORT/"
-            if command -v open >/dev/null 2>&1; then
-                open "$_dash_url" 2>/dev/null || true
-            elif command -v xdg-open >/dev/null 2>&1; then
-                xdg-open "$_dash_url" 2>/dev/null || true
-            elif command -v cmd.exe >/dev/null 2>&1; then
-                # Windows (Git Bash/WSL): `start` is a cmd builtin, not on PATH,
-                # so invoke it via cmd.exe. The empty "" is start's title arg.
-                cmd.exe /c start "" "$_dash_url" 2>/dev/null || true
-            fi
+        # foreground session. loki_open_url (lib/browser-open.sh) refuses on
+        # no TTY, CI, test runners, LOKI_NO_BROWSER=1 or LOKI_NO_AUTO_OPEN=1.
+        if [ "${BACKGROUND_MODE:-false}" != "true" ]; then
+            loki_open_url "${url_scheme}://127.0.0.1:$DASHBOARD_PORT/" 2>/dev/null || true
         fi
         return 0
     else

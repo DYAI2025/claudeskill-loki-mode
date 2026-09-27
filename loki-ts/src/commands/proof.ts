@@ -161,20 +161,32 @@ async function openProof(id: string | undefined): Promise<number> {
     return 1;
   }
   process.stdout.write(`${GREEN}Opening proof: ${html}${NC}\n`);
-  // Try each opener in turn. Bun.spawn cannot run the `command -v` shell
-  // builtin, so we probe by invoking the opener directly: a missing binary
-  // surfaces as a spawn failure (caught) and we move to the next.
-  for (const opener of ["open", "xdg-open", "start"]) {
-    try {
-      const r = await run([opener, html], { timeoutMs: 5000 });
-      if (r.exitCode === 0) return 0;
-    } catch {
-      /* opener not present; try the next one */
+  // Try each opener in turn, but only when browserOpenAllowed() says so.
+  // Bun.spawn cannot run the `command -v` shell builtin, so we probe by
+  // invoking the opener directly: a missing binary surfaces as a spawn
+  // failure (caught) and we move to the next.
+  if (browserOpenAllowed()) {
+    for (const opener of ["open", "xdg-open", "start"]) {
+      try {
+        const r = await run([opener, html], { timeoutMs: 5000 });
+        if (r.exitCode === 0) return 0;
+      } catch {
+        /* opener not present; try the next one */
+      }
     }
   }
-  process.stdout.write("\nCould not detect browser opener.\n");
+  process.stdout.write("\nBrowser not opened (headless, test, or no opener).\n");
   process.stdout.write(`Please open in browser: ${html}\n`);
   return 0;
+}
+
+// Mirror of loki_browser_allowed (autonomy/lib/browser-open.sh, S-103): never
+// open a browser from tests, CI, or a non-TTY run. Keep the two in step.
+export function browserOpenAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.LOKI_NO_BROWSER === "1" || env.LOKI_NO_AUTO_OPEN === "1") return false;
+  if (env.CI) return false;
+  if (env.LOKI_TEST || env.BATS_VERSION || env.BATS_TEST_FILENAME || env.PYTEST_CURRENT_TEST) return false;
+  return process.stdout.isTTY === true;
 }
 
 function confirm(question: string): Promise<boolean> {

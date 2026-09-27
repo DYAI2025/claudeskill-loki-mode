@@ -35,6 +35,9 @@
 # Exit code 0 = green; nonzero = at least one check failed (printed loudly).
 
 set -uo pipefail
+# Tests always run headless: loki_open_url (autonomy/lib/browser-open.sh) and
+# proof.ts never open a browser under this (S-103).
+export LOKI_NO_BROWSER=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 2
