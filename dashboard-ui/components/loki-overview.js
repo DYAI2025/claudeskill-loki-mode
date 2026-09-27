@@ -500,7 +500,7 @@ export class LokiOverview extends LokiElement {
         <div class="journey-heading" id="journey-heading">Issue to PR</div>
         <div class="journey-steps">
           ${this._renderJourneyStep('Current phase', phaseValue, 'Live session status')}
-          ${this._renderJourneyStep('First useful result', firstValue, firstMeasured && journey.first_result_verified_patch !== true ? 'Plan only, no code change yet' : 'From the run receipt')}
+          ${this._renderJourneyStep('First useful result', firstValue, firstMeasured && journey.first_result_kind === 'proposed_solution_plan' ? 'Plan only, no code change yet' : 'From the run receipt')}
           ${this._renderJourneyStep('Gates and evidence', proofValue, proofMeta)}
           ${this._renderJourneyStep('PR readiness', prValue, prLink || 'No public PR URL recorded')}
         </div>

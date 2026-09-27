@@ -1152,16 +1152,25 @@ def _collect_journey(loki_dir):
         },
     }
 
-    # Time to first useful result. Prefer the first verified code artifact when
-    # one exists. Before that, issue mode can truthfully report its acceptance-
+    # Time to first useful result. Prefer the first code artifact when one
+    # exists. Before that, issue mode can truthfully report its acceptance-
     # bound proposed plan, explicitly labelled as NOT a verified patch.
+    #
+    # first_result_verified_patch is honesty-critical: it must be True only
+    # when a verification step actually ran on the first result, never merely
+    # because a code change happened. first-artifact.json (run.sh) is written
+    # from `git status --porcelain` the instant the tree goes dirty -- a
+    # change signal, not a verification signal -- so this branch is False,
+    # same as the plan branch below. No producer in this codebase sets this
+    # True today; it stays here, honestly False, for the day a verified-patch
+    # signal exists to flip it.
     fa = _read_json(os.path.join(state, "first-artifact.json"), default=None)
     if isinstance(fa, dict):
         v = fa.get("seconds_to_first_artifact")
         if isinstance(v, (int, float)) and v >= 0:
             out["time_to_first_result_sec"] = int(v)
             out["first_result_kind"] = "code_change"
-            out["first_result_verified_patch"] = True
+            out["first_result_verified_patch"] = False
     else:
         fr = _read_json(os.path.join(state, "first-useful-result.json"), default=None)
         if isinstance(fr, dict):
