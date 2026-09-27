@@ -53,13 +53,22 @@ Subcommands:
       tokens (ready building review review-blocked approved merged released
       blocked rejected parked) -- rejected before the file is touched, exit 2,
       so it can never carry an "@", "|", whitespace, or a newline into the
-      table. The Status column is found by walking up to the nearest table
-      header and matching its "Status" label, never by scanning cell shapes
-      (a Branch/SHA cell like "main@abc123" can look just like
-      "<token>@<timestamp>"); the existing cell must already match
-      <known-token>@YYYY-MM-DDTHH:MMZ or the flip is refused, exit 2. Reads
-      and writes the file with no newline translation, so a CRLF board keeps
-      CRLF. Writes atomically (temp file + fsync + rename, permission bits
+      table. The Status column index comes from walking up to the nearest
+      table header and matching its "Status" label, never from scanning cell
+      shapes anywhere in the row (a Branch/SHA cell like "main@abc123" can
+      shape-match just like "<token>@<timestamp>", and so can an unrelated
+      Notes fragment after an embedded "|" splits it). If the row's column
+      count differs from its header's, the index shifts by POSITION, not by
+      re-scanning: one column fewer shifts left by one (the real board's only
+      observed short shape, a missing "Acceptance checks" column before
+      Status); one column more keeps the header's index (an embedded "|"
+      inside Notes, the last column, after Status); any other column-count
+      difference refuses outright. Whichever index is chosen, the existing
+      cell there must already match <known-token>@YYYY-MM-DDTHH:MMZ or the
+      flip is refused, exit 2 -- this is what catches a wrong positional
+      guess instead of silently overwriting the wrong cell. Reads and writes
+      the file with no newline translation, so a CRLF board keeps CRLF.
+      Writes atomically (temp file + fsync + rename, permission bits
       preserved) so a kill mid-write cannot leave BOARD.md empty, and
       resolves symlinks first so a symlinked board edits its real target,
       not the link. After the replace, re-reads the file from disk and
@@ -235,37 +244,47 @@ current_status_re = re.compile(
     + r")@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\s*$"
 )
 
-if len(cells) == len(header_cells):
-    # Primary path: the row has the same column count as its header, so the
-    # header-derived index points at the real Status cell.
+# Decide the Status index by POSITION, never by scanning for a cell that
+# happens to shape-match anywhere in the row -- an anywhere-in-row scan
+# cannot tell a real Status cell apart from a Notes fragment that, after an
+# embedded "|" split it into pieces, coincidentally also shape-matches
+# <token>@<timestamp> (e.g. a "was ready | review@..." fragment sitting
+# right after a genuine, untouched "in progress" Status cell). Two real
+# column-count drifts are measured in docs/v10/BOARD.md:
+#   - one column MORE than the header: the extra cell(s) come from a
+#     literal "|" inside Notes, the LAST column -- everything before Notes,
+#     including Status, keeps the same index the header gives it.
+#   - one column FEWER than the header: the missing column is "Acceptance
+#     checks", which sits immediately BEFORE Status in that layout -- every
+#     later column, including Status, shifts one index to the left.
+# Any other column-count difference is unrecognized shape drift; refuse
+# rather than guess a position.
+if len(cells) == len(header_cells) or len(cells) > len(header_cells):
     status_idx = header_status_idx
-    if not current_status_re.match(cells[status_idx]):
-        print("board-row-status: the Status cell for " + slice_id
-              + " does not match <token>@YYYY-MM-DDTHH:MMZ -- refusing to edit "
-              "an unexpected cell: " + cells[status_idx].strip(), file=sys.stderr)
-        sys.exit(2)
+elif len(cells) == len(header_cells) - 1:
+    status_idx = header_status_idx - 1
 else:
-    # A real BOARD.md shape: some rows drop a column relative to their
-    # header (measured: 30 rows missing "Acceptance checks"), which shifts
-    # every later column left by one and makes the header-derived index
-    # point at the wrong cell. Fall back to locating the Status cell by its
-    # full, exact shape -- known token, "@", a complete UTC timestamp -- not
-    # by the loose shape scan this script used before (which a bare
-    # "word@something" Branch/SHA cell like "main@779c50e5" could satisfy).
-    shape_matches = [i for i, c in enumerate(cells) if current_status_re.match(c)]
-    if len(shape_matches) == 0:
-        print("board-row-status: row for " + slice_id + " has " + str(len(cells))
-              + " columns (header has " + str(len(header_cells)) + ") and no cell "
-              "matches <known-token>@YYYY-MM-DDTHH:MMZ -- refusing to guess",
-              file=sys.stderr)
-        sys.exit(2)
-    if len(shape_matches) > 1:
-        print("board-row-status: row for " + slice_id + " has " + str(len(cells))
-              + " columns (header has " + str(len(header_cells)) + ") and "
-              + str(len(shape_matches)) + " cells match <known-token>@YYYY-MM-DDTHH:MMZ "
-              "-- refusing to guess", file=sys.stderr)
-        sys.exit(2)
-    status_idx = shape_matches[0]
+    print("board-row-status: row for " + slice_id + " has " + str(len(cells))
+          + " columns, header has " + str(len(header_cells)) + " -- unrecognized "
+          "column-count drift, refusing to guess a position", file=sys.stderr)
+    sys.exit(2)
+
+if status_idx < 0 or status_idx >= len(cells):
+    print("board-row-status: computed Status index " + str(status_idx)
+          + " is out of range for row " + slice_id + " (" + str(len(cells))
+          + " columns) -- refusing to guess", file=sys.stderr)
+    sys.exit(2)
+
+# Whichever way the index was derived, the cell it points at must already
+# be exactly "<known-token>@<full UTC timestamp>". This is what catches a
+# wrong positional guess (e.g. a column-drift shape this script does not
+# actually match the two recognized cases above) instead of silently
+# overwriting an unrelated cell.
+if not current_status_re.match(cells[status_idx]):
+    print("board-row-status: the Status cell for " + slice_id
+          + " does not match <token>@YYYY-MM-DDTHH:MMZ -- refusing to edit "
+          "an unexpected cell: " + cells[status_idx].strip(), file=sys.stderr)
+    sys.exit(2)
 
 timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 cells[status_idx] = " " + new_token + "@" + timestamp + " "

@@ -508,23 +508,94 @@ else
     bad "the extra-pipe row was not handled correctly: $row_after"
 fi
 
-# --- board-row-status: sweeps EVERY slice row in the real BOARD.md ---------
-# The prior version of this test sampled only the FIRST row under each of
-# the 4 headers -- which is exactly why it missed this regression: none of
-# those 4 sampled rows happened to have a mismatched column count. This
-# sweeps every single slice row instead, each against a FRESH copy of the
-# real board (so one row's outcome can never mask or compound into the
-# next), asserting each flip touches exactly one line and exactly one cell.
+# --- board-row-status: round-5 REJECT repro (Z-9) ---------------------------
+# Tech Lead REJECT: the shape-only fallback (any cell, anywhere in the row,
+# that shape-matches) ignored position. This exact row has 10 cells against
+# a 9-cell header; the real Status cell ("in progress", header index 6) sits
+# untouched while a Notes fragment happened to shape-match and would have
+# been overwritten. "in progress" is not <token>@<timestamp> either way, so
+# the correct behavior is a clean refusal, never a guess.
 
-echo "== board-row-status: sweeps every slice row in the real BOARD.md =="
-REAL_BOARD_HASH_BEFORE=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
-[ -n "$REAL_BOARD_HASH_BEFORE" ] || REAL_BOARD_HASH_BEFORE=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
+echo "== board-row-status: Z-9 (round-5 REJECT repro) refuses cleanly, file untouched =="
+BOARD_Z9="$WORK/BOARD-z9.md"
+cat > "$BOARD_Z9" <<'EOF'
+# Board
+
+| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| Z-9 | owner | main @ abc | files | HIGH | in progress | was ready | review@2026-09-27T10:00Z |
+EOF
+cp "$BOARD_Z9" "$WORK/BOARD-z9.before.md"
+out="$(bash "$OPS_SH" board-row-status "Z-9" "merged" "$BOARD_Z9" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "does not match"; then
+    ok "board-row-status refuses the Z-9 repro instead of guessing a position"
+else
+    bad "board-row-status Z-9 repro case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-z9.before.md" "$BOARD_Z9" >/dev/null 2>&1; then
+    ok "the Z-9 refusal left the file byte-identical"
+else
+    bad "the Z-9 refusal modified the file"
+fi
+
+# --- board-row-status: unrecognized column-count drift refuses -------------
+# Two fewer, or two more, columns than the header is neither of the two
+# recognized real shapes; must refuse rather than guess.
+
+echo "== board-row-status: two fewer columns than the header refuses =="
+BOARD_TOOSHORT="$WORK/BOARD-tooshort.md"
+cat > "$BOARD_TOOSHORT" <<'EOF'
+# Board
+
+| ID | Owner | File set | Tier | Acceptance checks (Wall) | Status | Notes |
+|---|---|---|---|---|---|---|
+| W-1 | owner | files | ready@2026-09-27T09:00Z | notes |
+EOF
+cp "$BOARD_TOOSHORT" "$WORK/BOARD-tooshort.before.md"
+out="$(bash "$OPS_SH" board-row-status "W-1" "merged" "$BOARD_TOOSHORT" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "unrecognized"; then
+    ok "board-row-status refuses a row two columns short of its header"
+else
+    bad "board-row-status two-short case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-tooshort.before.md" "$BOARD_TOOSHORT" >/dev/null 2>&1; then
+    ok "the two-short refusal left the file untouched"
+else
+    bad "the two-short refusal modified the file"
+fi
+
+# --- board-row-status: sweeps EVERY slice row in the CANONICAL real board --
+# The prior version of this test sampled only the FIRST row under each of
+# the 4 headers -- which is exactly why it missed the round-4 regression:
+# none of those 4 sampled rows happened to have a mismatched column count.
+# This sweeps every single slice row instead, against the canonical main
+# checkout's docs/v10/BOARD.md (never this worktree's own, older copy of
+# that file -- they can and do diverge), each against a FRESH copy of it
+# (so one row's outcome can never mask or compound into the next).
+#
+# Two real rows (S-29, S-36) are a COMPOUND shape: each is independently
+# missing one column (no "Acceptance checks", before Status) AND has an
+# embedded "||" in Notes (after Status), and the two effects net out to
+# exactly one MORE cell than the header -- indistinguishable, by column
+# count alone, from a row that is purely long. The position rule picks the
+# header's own index for "one more" rows, which for these two lands on the
+# Notes text, not Status; the required <token>@<timestamp> shape check then
+# correctly refuses rather than silently editing the wrong cell. That
+# refusal is the intended, safe outcome for a genuinely ambiguous shape, so
+# this sweep asserts refusal-with-untouched-file for those two IDs and a
+# clean flip for every other row.
+
+echo "== board-row-status: sweeps every slice row in the canonical real BOARD.md =="
+REAL_BOARD="/Users/lokesh/git/lokimode-anthropic/docs/v10/BOARD.md"
+REAL_BOARD_HASH_BEFORE=$(md5sum "$REAL_BOARD" 2>/dev/null | awk '{print $1}')
+[ -n "$REAL_BOARD_HASH_BEFORE" ] || REAL_BOARD_HASH_BEFORE=$(md5 -q "$REAL_BOARD")
 BOARD_SWEEP="$WORK/BOARD-sweep.md"
+expected_refuse_ids="S-29 S-36"
 
 sweep_ids=()
 while IFS= read -r sweep_id; do
     [ -n "$sweep_id" ] && sweep_ids+=("$sweep_id")
-done < <(grep -E '^\| [A-Za-z]+-[0-9]+ ' "$REPO_ROOT/docs/v10/BOARD.md" \
+done < <(grep -E '^\| [A-Za-z]+-[0-9]+ ' "$REAL_BOARD" \
     | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
 
 if [ "${#sweep_ids[@]}" -eq 0 ]; then
@@ -532,14 +603,35 @@ if [ "${#sweep_ids[@]}" -eq 0 ]; then
 else
     sweep_fail=0
     for row_id in "${sweep_ids[@]}"; do
-        cp "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_SWEEP"
+        cp "$REAL_BOARD" "$BOARD_SWEEP"
+        is_expected_refuse=0
+        for erid in $expected_refuse_ids; do
+            [ "$row_id" = "$erid" ] && is_expected_refuse=1
+        done
+
+        if [ "$is_expected_refuse" -eq 1 ]; then
+            out="$(bash "$OPS_SH" board-row-status "$row_id" "review" "$BOARD_SWEEP" 2>&1)"; rc=$?
+            if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "does not match"; then
+                :
+            else
+                bad "real-board sweep: $row_id expected a clean refusal (exit 2), got rc=$rc out=$out"
+                sweep_fail=$((sweep_fail + 1))
+                continue
+            fi
+            if ! diff -q "$REAL_BOARD" "$BOARD_SWEEP" >/dev/null 2>&1; then
+                bad "real-board sweep: $row_id refusal still modified the file"
+                sweep_fail=$((sweep_fail + 1))
+            fi
+            continue
+        fi
+
         out="$(bash "$OPS_SH" board-row-status "$row_id" "review" "$BOARD_SWEEP" 2>&1)"; rc=$?
         if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q -- "-> review@"; then
             bad "real-board sweep: $row_id failed to flip: rc=$rc out=$out"
             sweep_fail=$((sweep_fail + 1))
             continue
         fi
-        changed_lines=$(diff "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_SWEEP" | grep -c '^[<>]')
+        changed_lines=$(diff "$REAL_BOARD" "$BOARD_SWEEP" | grep -c '^[<>]')
         if [ "$changed_lines" -ne 2 ]; then
             bad "real-board sweep: $row_id changed $changed_lines diff line(s), expected exactly 2 (one before, one after)"
             sweep_fail=$((sweep_fail + 1))
@@ -548,7 +640,7 @@ else
         # Line-anchored: an ID like "PF-2" can also appear as plain text
         # inside another row's Notes cell (e.g. "...@01:33Z | PF-2 (P7
         # scanner..."), which an unanchored search would match first.
-        before_row=$(grep -E "^\| $row_id " "$REPO_ROOT/docs/v10/BOARD.md" | head -1)
+        before_row=$(grep -E "^\| $row_id " "$REAL_BOARD" | head -1)
         after_row=$(grep -E "^\| $row_id " "$BOARD_SWEEP" | head -1)
         cell_diff=$(python3 -c '
 import sys
@@ -561,18 +653,18 @@ print("COUNT_MISMATCH" if len(ca) != len(cb) else sum(1 for x, y in zip(ca, cb) 
         fi
     done
     if [ "$sweep_fail" -eq 0 ]; then
-        ok "all ${#sweep_ids[@]} real BOARD.md slice rows flip cleanly, exactly one line and one cell each"
+        ok "all ${#sweep_ids[@]} rows in the canonical real BOARD.md behave correctly (flip cleanly, or refuse the 2 known-ambiguous rows untouched)"
     fi
 fi
 rm -f "$BOARD_SWEEP"
 
-# The real board itself must never be touched by this test.
-REAL_BOARD_HASH_AFTER=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
-[ -n "$REAL_BOARD_HASH_AFTER" ] || REAL_BOARD_HASH_AFTER=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
+# The canonical real board itself must never be touched by this test.
+REAL_BOARD_HASH_AFTER=$(md5sum "$REAL_BOARD" 2>/dev/null | awk '{print $1}')
+[ -n "$REAL_BOARD_HASH_AFTER" ] || REAL_BOARD_HASH_AFTER=$(md5 -q "$REAL_BOARD")
 if [ -n "$REAL_BOARD_HASH_BEFORE" ] && [ "$REAL_BOARD_HASH_BEFORE" = "$REAL_BOARD_HASH_AFTER" ]; then
-    ok "the real docs/v10/BOARD.md is byte-identical before and after the sweep"
+    ok "the canonical real docs/v10/BOARD.md is byte-identical before and after the sweep"
 else
-    bad "the real docs/v10/BOARD.md changed during the sweep: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
+    bad "the canonical real docs/v10/BOARD.md changed during the sweep: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
 fi
 
 # --- version-check / ci-status: PATH shadowing -----------------------------
