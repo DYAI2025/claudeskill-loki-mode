@@ -1036,7 +1036,9 @@ loki_proof_attestation_check() {
             esac
             ;;
         *)
-            [ -f "$src" ] || { printf ''; return 0; }
+            # A plain path is decided in python below, which reports an
+            # unsigned receipt as "none" BEFORE it looks at the key file, so a
+            # missing key file on an unsigned receipt still fails (exit 1).
             ;;
     esac
     command -v python3 >/dev/null 2>&1 || { printf ''; return 0; }
