@@ -399,7 +399,8 @@ NOW = now_epoch()
 VIOLATION_PRIORITY = [
     "CI_RED", "CI_CANCELLED_STREAK", "RELEASE_ON_RED", "HIGH_LOAD",
     "MOAT_REGRESSION", "UNRELEASED_MERGE", "TRAIN_LATE", "REVIEW_STALE",
-    "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM", "ORPHAN_TEST", "STRAY_CONTAINER",
+    "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM", "RELEASED_AHEAD_OF_NPM",
+    "ORPHAN_TEST", "STRAY_CONTAINER",
     "WORKTREE_COUNT", "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE",
     "LOW_RELEASE_VOLUME", "CONTROL_OVERSIZE",
 ]
@@ -655,7 +656,8 @@ def parse_npm_releases(rc, out):
     # 'created' and 'modified' are metadata, not releases; excluding them
     # matters because 'modified' updates on every publish including the
     # current one and would otherwise always read as "just released".
-    stamps = []
+    stamps = []       # epoch seconds, every real version entry
+    versioned = []     # (epoch, version key), for latest_version below
     for key, val in data.items():
         if key in ("created", "modified"):
             continue
@@ -672,12 +674,25 @@ def parse_npm_releases(rc, out):
                 t = None
         if t is not None:
             stamps.append(t)
+            versioned.append((t, key))
     if not stamps:
         return None
     stamps.sort()
     last = stamps[-1]
     count_24h = sum(1 for t in stamps if NOW - t <= 24 * 3600)
-    return {"last_release_epoch": last, "count_24h": count_24h}
+    # latest_version: the version key with the newest publish stamp (S-139 /
+    # BACKLOG 136) -- read from this SAME `npm view ... time --json` result,
+    # never a second `npm view ... dist-tags`/`version` call, to stay inside
+    # S-104's shared network-cache budget. A tie on the stamp is broken by
+    # the larger key string, deterministic but arbitrary; real npm publish
+    # timestamps do not collide in practice.
+    versioned.sort(key=lambda pair: (pair[0], pair[1]))
+    latest_version = versioned[-1][1]
+    return {
+        "last_release_epoch": last,
+        "count_24h": count_24h,
+        "latest_version": latest_version,
+    }
 
 
 npm_result = safe(parse_npm_releases, _npm_rc, _npm_out)
@@ -880,6 +895,42 @@ else:
     if board["unparsed"]:
         emit("BOARD unparsed rows (no status token found): " + ", ".join(board["unparsed"]))
 
+    # RELEASED_AHEAD_OF_NPM (S-139 / GUARDS 13 / BACKLOG 136): a `released@`
+    # row stamped LATER than npm's own newest publish time claims a release
+    # npm has no record of yet -- either it never actually reached npm, or
+    # the row's token/timestamp is wrong. Reuses npm_result (metric 1's
+    # already-cached/network npm read) rather than a second npm call, to
+    # stay inside S-104's 5s budget.
+    released_ahead = []
+    released_ts_unknown = []
+    if npm_result is not None:
+        for row_id, token, ts in board_rows:
+            if token != "released":
+                continue
+            t = parse_time_value(ts)
+            if t is None:
+                released_ts_unknown.append(row_id)
+                continue
+            if t > npm_result["last_release_epoch"]:
+                released_ahead.append((row_id, t))
+    if released_ts_unknown:
+        mark_unknown("released_vs_npm")
+        emit(
+            "Released-vs-npm check: UNKNOWN for %s (no parseable Status timestamp on a released row)"
+            % ", ".join(sorted(released_ts_unknown))
+        )
+    if released_ahead:
+        released_ahead.sort(key=lambda pair: -pair[1])
+        ids_desc = ", ".join(
+            "%s (released@%s)" % (rid, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(t)))
+            for rid, t in released_ahead
+        )
+        add_violation(
+            "RELEASED_AHEAD_OF_NPM",
+            "%s marked released after npm's newest publish (%s); npm shows no publish that recent"
+            % (ids_desc, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(npm_result["last_release_epoch"]))),
+        )
+
     # Every review-pending slice over the 45-minute budget, oldest first.
     stale_reviews = []
     all_reviews = []  # (row_id, age) for every parseable review-pending row
@@ -1058,9 +1109,32 @@ def check_unreleased_merge_age():
 
 
 unreleased = safe(check_unreleased_merge_age)
+# S-139 / BACKLOG 136: the "N commit(s) since <tag>" report below trusts
+# `unreleased["tag"]` (the newest local v* tag) as ground truth for "what was
+# last released". When npm's own latest published version (from the SAME
+# npm_result computed above -- no second network call) disagrees with that
+# tag, the tag is stale (a fetch is missing, or the release process tagged
+# something npm never got), and "N commits since v9.54.2" is a confident
+# answer built on a basis known to be wrong. Report UNKNOWN instead of
+# either sub-case (0 or >0 unreleased commits) -- `unreleased` itself is left
+# untouched so TRAIN_LATE (which only checks `unreleased is None`) is not
+# affected by this npm-only cross-check.
+_npm_tag_mismatch = None
+if unreleased is not None and npm_result is not None:
+    _local_tag_version = unreleased["tag"][1:] if unreleased["tag"].startswith("v") else unreleased["tag"]
+    _npm_latest_version = npm_result.get("latest_version")
+    if _npm_latest_version is not None and _local_tag_version != _npm_latest_version:
+        _npm_tag_mismatch = (unreleased["tag"], _npm_latest_version)
+
 if unreleased is None:
     mark_unknown("unreleased_merge_age")
     emit("Merged-but-unreleased age: UNKNOWN (git tag/log check failed)")
+elif _npm_tag_mismatch is not None:
+    mark_unknown("unreleased_merge_age")
+    emit(
+        "Merged-but-unreleased age: UNKNOWN (local tag %s disagrees with npm's latest published version %s)"
+        % _npm_tag_mismatch
+    )
 else:
     if unreleased["unreleased_commits"] == 0:
         emit("Merged-but-unreleased age: none (all commits released at %s)" % unreleased["tag"])
@@ -2076,6 +2150,7 @@ _NEXT_ACTION_TEXT = {
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
     "AGENT_OVER_BUDGET": "check in on the named agent(s), they have exceeded their role/tier time budget",
     "UNEVIDENCED_CLAIM": "add a command/output citation to the named line(s) or retract the claim (D26 guard 4)",
+    "RELEASED_AHEAD_OF_NPM": "verify the named release(s) actually reached npm, or fix the BOARD row's status/timestamp",
     "ORPHAN_TEST": "investigate the named orphaned/long-running test process; stop by exact PID only if confirmed stale, never by name or pattern",
     "STRAY_CONTAINER": "remove or fix the named swarm container: capped resources, restart policy 'no', removed when done (D28)",
     "WORKTREE_COUNT": "prune stale worktrees under .claude/worktrees (git worktree remove), it is over the 15 max",

@@ -330,13 +330,17 @@ BOARD_CLEAN="$WORK/BOARD-clean.md"
     for i in 1 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
 } > "$BOARD_CLEAN"
 NPM_TIME_JSON="$WORK/npm-time.json"
+# Latest key deliberately "1.0.0", matching FAKE_REPO's v1.0.0 tag exactly
+# (S-139's tag-vs-npm-latest cross-check): every test below that reuses this
+# fixture keeps its unreleased-merge-age assertions unaffected by that check.
+# Dedicated NPM_MISMATCH_JSON below covers the disagreeing case.
 python3 -c "
 import json
 print(json.dumps({
     'created': '2020-01-01T00:00:00.000Z',
     'modified': '2026-09-27T01:55:00.000Z',
-    '9.54.0': '2026-09-27T01:00:00.000Z',
-    '9.55.0': '2026-09-27T01:50:00.000Z',
+    '0.9.0': '2026-09-27T01:00:00.000Z',
+    '1.0.0': '2026-09-27T01:50:00.000Z',
 }))
 " > "$NPM_TIME_JSON"
 WT_CLEAN=()
@@ -623,12 +627,14 @@ cat > "$BOARD_ALL" <<'EOF'
 | S-02 | a | x | LOW | ready@2026-09-27T01:00Z | |
 EOF
 NPM_OLD_JSON="$WORK/npm-old.json"
+# Same "1.0.0" convention as NPM_TIME_JSON above, matching v1.0.0 exactly so
+# S-139's tag-vs-npm-latest cross-check stays a no-op here too.
 python3 -c "
 import json
 print(json.dumps({
     'created': '2020-01-01T00:00:00.000Z',
     'modified': '2026-09-25T00:00:00.000Z',
-    '9.50.0': '2026-09-25T00:00:00.000Z',
+    '1.0.0': '2026-09-25T00:00:00.000Z',
 }))
 " > "$NPM_OLD_JSON"
 (
@@ -1777,6 +1783,109 @@ if printf '%s\n' "$OUT" | grep -qF "VIOLATION: WORKTREE_COUNT: 16 worktrees unde
     ok "16 worktrees under .claude/worktrees fires WORKTREE_COUNT"
 else
     bad "T38b WORKTREE_COUNT-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T39 -- S-139/BACKLOG 136: RELEASED_AHEAD_OF_NPM fires when a released@ row is stamped"
+echo "      after npm's own newest publish time"
+BOARD_RELEASED_AHEAD="$WORK/BOARD-released-ahead.md"
+cat > "$BOARD_RELEASED_AHEAD" <<'EOF'
+| ID | Owner | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|
+| S-01 | a | x | LOW | released@2026-09-27T01:54Z | |
+EOF
+# NPM_TIME_JSON's newest publish stamp is 2026-09-27T01:50Z (see its fixture
+# above); the BOARD row claims a release 4 minutes AFTER that -- npm has no
+# record of a publish that recent.
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_RELEASED_AHEAD" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: RELEASED_AHEAD_OF_NPM: S-01 (released@2026-09-27T01:54Z) marked released after npm's newest publish (2026-09-27T01:50Z); npm shows no publish that recent"; then
+    ok "released@ row stamped after npm's newest publish fires RELEASED_AHEAD_OF_NPM"
+else
+    bad "T39 RELEASED_AHEAD_OF_NPM-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T39b -- RELEASED_AHEAD_OF_NPM does not fire when the released@ row is stamped"
+echo "       before (or at) npm's newest publish time"
+BOARD_RELEASED_OK="$WORK/BOARD-released-ok.md"
+cat > "$BOARD_RELEASED_OK" <<'EOF'
+| ID | Owner | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|
+| S-01 | a | x | LOW | released@2026-09-27T01:40Z | |
+EOF
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_RELEASED_OK" \
+    "PULSE_NPM_CMD=cat $NPM_TIME_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: RELEASED_AHEAD_OF_NPM"; then
+    ok "released@ row stamped before npm's newest publish does not fire RELEASED_AHEAD_OF_NPM"
+else
+    bad "T39b RELEASED_AHEAD_OF_NPM-no-fire case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T40 -- S-139/BACKLOG 136: unreleased-merge age reports UNKNOWN, not a confident"
+echo "      'N commit(s) since', when the local release tag disagrees with npm's latest version"
+# A dedicated, isolated repo (like RELEASE_REPO/CLAIM_REPO_FLAGGED above) so
+# this never touches FAKE_REPO's shared v1.0.0 tag history. Exact repro of
+# the red-case bullet: local tag v9.54.2, npm's latest published version
+# 9.55.0 (from the SAME npm_result computed above -- no second npm call).
+TAG_MISMATCH_REPO="$WORK/tag-mismatch-repo"
+mkdir -p "$TAG_MISMATCH_REPO"
+(
+    cd "$TAG_MISMATCH_REPO" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    echo "seed" > file.txt
+    git add file.txt
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "seed"
+    git tag v9.54.2
+    echo "change" > file2.txt
+    git add file2.txt
+    GIT_AUTHOR_DATE="2026-09-27T01:00:00Z" GIT_COMMITTER_DATE="2026-09-27T01:00:00Z" \
+        git commit -q -m "unreleased change after v9.54.2"
+)
+NPM_MISMATCH_JSON="$WORK/npm-mismatch.json"
+python3 -c "
+import json
+print(json.dumps({
+    'created': '2020-01-01T00:00:00.000Z',
+    'modified': '2026-09-27T01:50:00.000Z',
+    '9.55.0': '2026-09-27T01:50:00.000Z',
+}))
+" > "$NPM_MISMATCH_JSON"
+if run_pulse "${COMMON_ARGS[@]}" "PULSE_REPO_ROOT=$TAG_MISMATCH_REPO" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "PULSE_NPM_CMD=cat $NPM_MISMATCH_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$TAG_MISMATCH_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Merged-but-unreleased age: UNKNOWN (local tag v9.54.2 disagrees with npm's latest published version 9.55.0)" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*unreleased_merge_age" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: UNRELEASED_MERGE" \
+    && ! printf '%s\n' "$OUT" | grep -q "commit(s) since v9.54.2"; then
+    ok "tag/npm-latest disagreement reports UNKNOWN, never the confident 'N commit(s) since' line"
+else
+    bad "T40 tag-vs-npm-mismatch case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T40b -- unreleased-merge age reports normally when the local tag AGREES with npm's latest version"
+NPM_MATCH_JSON="$WORK/npm-match.json"
+python3 -c "
+import json
+print(json.dumps({
+    'created': '2020-01-01T00:00:00.000Z',
+    'modified': '2026-09-27T01:50:00.000Z',
+    '9.54.2': '2026-09-27T01:50:00.000Z',
+}))
+" > "$NPM_MATCH_JSON"
+UNRELEASED_MISMATCH_SHA="$(cd "$TAG_MISMATCH_REPO" && git rev-parse --short=8 main)"
+if run_pulse "${COMMON_ARGS[@]}" "PULSE_REPO_ROOT=$TAG_MISMATCH_REPO" "PULSE_MAIN_REF=main" \
+    "BOARD_MD=$BOARD_CLEAN" "PULSE_NPM_CMD=cat $NPM_MATCH_JSON" "PULSE_GH_CMD=cat $GH_GREEN_JSON" \
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$TAG_MISMATCH_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Merged-but-unreleased age: 60.0 min (1 commit(s) since v9.54.2, oldest $UNRELEASED_MISMATCH_SHA)"; then
+    ok "tag/npm-latest agreement (v9.54.2 == 9.54.2) keeps the normal confident report"
+else
+    bad "T40b tag-vs-npm-match case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
