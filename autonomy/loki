@@ -28664,6 +28664,8 @@ def load_json(path):
         return None
 
 def fmt_number(n):
+    if n is None:
+        return "N/A"
     return f"{n:,}"
 
 def load_queue(path):
@@ -28702,7 +28704,8 @@ if os.path.isfile(checkpoint_index):
         pass
 
 # Orchestrator state
-orch = load_json(os.path.join(loki_dir, "state", "orchestrator.json")) or {}
+orch_raw = load_json(os.path.join(loki_dir, "state", "orchestrator.json"))
+orch = orch_raw or {}
 current_phase = orch.get("currentPhase", "N/A")
 orch_metrics = orch.get("metrics", {})
 tasks_completed_orch = orch_metrics.get("tasksCompleted", 0)
@@ -28721,7 +28724,19 @@ if os.path.isdir(eff_dir):
 if last_n > 0 and len(iterations) > last_n:
     iterations = iterations[-last_n:]
 
-total_iterations = len(iterations) if iterations else max(orch.get("currentIteration", 0), 0)
+# BACKLOG 118 / S-147: a fresh .loki with no efficiency files and no
+# orchestrator state has nothing to count. total_iterations (and the
+# time_saved estimate derived from it) must come back null, not a
+# fabricated 0, so callers can tell "never ran" from "ran zero".
+if iterations:
+    total_iterations = len(iterations)
+    iterations_known = True
+elif orch_raw is not None and "currentIteration" in orch:
+    total_iterations = max(orch.get("currentIteration", 0), 0)
+    iterations_known = True
+else:
+    total_iterations = None
+    iterations_known = False
 
 # Gather agent types from iterations and agents.json
 for it in iterations:
@@ -28829,19 +28844,23 @@ except Exception:
 total_cost = sum(it.get("cost_usd", 0) for it in iterations)
 total_input_tokens = sum(it.get("input_tokens", 0) for it in iterations)
 total_output_tokens = sum(it.get("output_tokens", 0) for it in iterations)
+tokens_known = bool(iterations)
 
 # Also check context tracking for cost data
 ctx_file = os.path.join(loki_dir, "context", "tracking.json")
 ctx = load_json(ctx_file)
-if ctx and total_cost == 0:
-    totals = ctx.get("totals", {})
-    total_cost = totals.get("total_cost_usd", 0)
-    total_input_tokens = totals.get("total_input", 0)
-    total_output_tokens = totals.get("total_output", 0)
+if ctx is not None:
+    if total_cost == 0 and not tokens_known:
+        totals = ctx.get("totals", {})
+        total_cost = totals.get("total_cost_usd", 0)
+        total_input_tokens = totals.get("total_input", 0)
+        total_output_tokens = totals.get("total_output", 0)
+    tokens_known = True
 
 # --- Time saved estimate ---
-# Each Loki iteration replaces ~15min of manual work
-time_saved_hours = round(total_iterations * 15 / 60, 2)
+# Each Loki iteration replaces ~15min of manual work. Null (not a computed
+# number) when no iteration was ever recorded (BACKLOG 118 / S-147).
+time_saved_hours = round(total_iterations * 15 / 60, 2) if iterations_known else None
 
 # --- Memory stats ---
 episodic_count = 0
@@ -28891,10 +28910,10 @@ data = {
         "tests_written": tests_written
     },
     "tokens": {
-        "input": total_input_tokens,
-        "output": total_output_tokens,
-        "total": total_input_tokens + total_output_tokens,
-        "cost_usd": round(total_cost, 2)
+        "input": total_input_tokens if tokens_known else None,
+        "output": total_output_tokens if tokens_known else None,
+        "total": (total_input_tokens + total_output_tokens) if tokens_known else None,
+        "cost_usd": round(total_cost, 2) if tokens_known else None
     },
     "time_saved": {
         "hours": time_saved_hours,
@@ -28935,15 +28954,18 @@ else:
     lines.append(f"  Commits:             {fmt_number(commits_made)}")
     lines.append(f"  Tests written:       {fmt_number(tests_written)}")
     lines.append("")
-    if total_cost > 0 or total_input_tokens > 0:
+    if tokens_known and (total_cost > 0 or total_input_tokens > 0):
         lines.append("TOKEN USAGE")
         lines.append(f"  Input tokens:        {fmt_number(total_input_tokens)}")
         lines.append(f"  Output tokens:       {fmt_number(total_output_tokens)}")
         lines.append(f"  Estimated cost:      ${total_cost:.2f}")
         lines.append("")
     lines.append("TIME SAVED")
-    lines.append(f"  Estimated:           {time_saved_hours} hours")
-    lines.append(f"  (based on {fmt_number(total_iterations)} iterations x 15min each)")
+    if iterations_known:
+        lines.append(f"  Estimated:           {time_saved_hours} hours")
+        lines.append(f"  (based on {fmt_number(total_iterations)} iterations x 15min each)")
+    else:
+        lines.append("  Estimated:           unknown (no iterations recorded)")
     lines.append("")
     if episodic_count > 0 or semantic_count > 0:
         lines.append("MEMORY")
