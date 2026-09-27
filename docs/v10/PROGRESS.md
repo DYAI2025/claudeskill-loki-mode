@@ -575,3 +575,33 @@ shard 2/4 hangs a 5th time, stop treating cancel-and-repush as
 sufficient and escalate to actually implementing BACKLOG 143's fix
 (per-suite timeout instrumentation) as the next ready slice, ahead of
 anything else in the queue.
+
+### Drift audit (turn 60, 6-hour window)
+
+**Matched CONTROL.md:** BACKLOG 143 was escalated to an actual ready
+slice (S-44) after the 4th confirmed shard-2/4 hang, exactly per the
+turn-54 correction's own stated trigger -- the correction converted to
+action the same window it was written, not just logged and left. The
+P7-scanner sibling group (S-29 through S-32) continued producing real
+adversarial findings on every pass: S-31's rework got dispatched with
+per-arm mutation isolation specifically because prior rounds taught
+that "the builder tested it" isn't sufficient without independent
+per-fix isolation.
+
+**Drifted:** NO_RECENT_RELEASE has now stood for over 4.5 hours (280+
+minutes). The stated root cause from turn 54 (CI kept hanging before
+it could go green) is holding: the CI run that would carry this
+release has been in flight for 10+ minutes multiple audits in a row,
+still not confirmed green at this writing. This is not a process
+failure inside this session's control -- the discipline of "wait for
+green, don't push into an in-flight run" is being followed correctly
+-- but it means the release itself remains blocked on infrastructure
+outside a swarm turn's power to fix directly, apart from the S-44 fix
+now in flight.
+
+**Correction for the next 6 hours:** no new correction needed beyond
+what's already in flight (S-44's fix, once merged, should end the
+shard-2/4 hangs and unblock the release path). If NO_RECENT_RELEASE is
+still the top violation at the NEXT audit (turn 66) with S-44 already
+merged, that would mean the hang has a second, undiagnosed cause
+worth a fresh investigation rather than continued cancel-and-repush.
