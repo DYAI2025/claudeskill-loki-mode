@@ -959,13 +959,10 @@ def ternary_colon_of(s, q):
 #   False-negative only:
 #   - it only follows a SAME-FILE helper, never one imported from another
 #     module;
-#   - it recognizes `function`/arrow/function-expression/useCallback-wrapped
-#     declarations only, never a class method. A neutrally-named method
-#     (`_getRows() { return [{...}]; }` then `this._rows = this._getRows();`)
-#     is NOT caught by any other rule either: rule 5's DEMO/GEN name check
-#     only fires on a sample/mock/demo/fake/generate-prefixed name, so this is
-#     a real coverage gap on dashboard-ui's LokiElement classes, not merely an
-#     unhandled syntax form (filed as BACKLOG 144, not fixed here);
+#   - a class method (BACKLOG 144, METHOD_HEAD) counts only when its head
+#     starts a line and it is called as `this.name(...)`; a `#private` method,
+#     a getter, or a call through another reference (`self.name()`) is not
+#     seen;
 #   - a return whose literal is built across an intermediate local inside the
 #     helper (`const rows = [...]; return rows;`) is not seen, since only a
 #     literal directly after `return` is checked;
@@ -978,7 +975,7 @@ def ternary_colon_of(s, q):
 #     FLOWS_TO_STATE_TMPL) only recognizes a plain or `await`ed direct call as
 #     the local's initializer, not a chained/wrapped call
 #     (`const rows = getRows(d).slice(); setRows(rows);`);
-#   - a class-method helper is BACKLOG 144, not this arm. (A useMemo-bound
+#   - a useMemo-bound value is not this arm either. (A useMemo-bound
 #     name is a VALUE, never itself called later as name(args), so it cannot
 #     use this arm's call-site-registration machinery. The separate
 #     DECL_USEMEMO arm below covers ONLY the case where useMemo's own factory
@@ -1119,6 +1116,17 @@ HELPER_HEAD = re.compile(r'\b(?:export\s+(?:default\s+)?)?(?:async\s+)?'
 # identifier's own end, not a paren match; BARE_PARAM below finds that
 # identifier's end directly from the match position instead of close_of.
 BARE_PARAM = re.compile(r'\s*([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=>')
+# BACKLOG 144 (S-180): a class-method helper head, `_getRows() {` / `async
+# load(d): Row[] {` at the start of a line, called later as `this.name(...)`
+# (never a bare `name(...)`, so its call-site prefix differs; see
+# METHOD_CALL_PRE). Statement keywords that also take `(...) {` are excluded
+# by the lookahead; the body `{` right after the params is required below, so
+# a plain call statement (`setRows(x);`) never registers.
+METHOD_HEAD = re.compile(r'^[ \t]*(?:(?:static|async|public|private|protected|override)\s+)*'
+                         r'(?!(?:if|for|while|switch|catch|with|function|return|await|typeof|new|super)\b)'
+                         r'([A-Za-z_$][\w$]*)\s*\(', re.M)
+METHOD_CALL_PRE = r'\bthis\.'
+HELPER_CALL_PRE = r'(?:(?<![\w$.])|(?<=\.\.\.))'
 HELPER_ARROW_TAIL = re.compile(r'\s*(?::[^=]*)?=>\s*')
 # A `function`/function-expression head's own non-brace TypeScript return type
 # (`function getRows(d): Row[] {`, `: Promise<Row[]>`): skipped so body_start
@@ -1157,13 +1165,13 @@ NESTED_FN_HEAD = re.compile(r'\bfunction\b[^{}();]*\([^()]*\)\s*\{'
 # (?<=\.\.\.))` reads as "not preceded by a word char or a single dot, UNLESS
 # the three characters immediately before are exactly '...'".
 HELPER_CALL_SINK_HEAD = re.compile(r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(')
-HELPER_CALL_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*\('
+HELPER_CALL_IN_SPAN_TMPL = r'{pre}{name}\s*\('
 # useState's lazy-initializer form passes the bare function reference, never
 # calling it at the sink at all (`useState(getRows)`, React calls it once on
 # mount): the called-form template above can never match this, since there is
 # no `(` after the name at the sink. Sink-span-scoped (not whole-file) so a
 # same-named setter call elsewhere cannot falsely satisfy a different helper.
-HELPER_BARE_REF_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*[,)]'
+HELPER_BARE_REF_IN_SPAN_TMPL = r'{pre}{name}\s*[,)]'
 # The two-hop form: `const rows = getRows(d); setRows(rows);` -- the literal
 # never appears at the sink call at all (the sink is fed a bare local), so
 # HELPER_CALL_SINK_HEAD's span search cannot see it either; this is the same
@@ -1171,7 +1179,7 @@ HELPER_BARE_REF_IN_SPAN_TMPL = r'(?:(?<![\w$.])|(?<=\.\.\.)){name}\s*[,)]'
 # shape DECL_ARR itself already can't need (DECL_ARR's own literal sits right
 # at the local's declaration). `(?:await\s+)?` covers `const rows = await
 # getRows();`.
-HELPER_LOCAL_DECL_TMPL = r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{{}}]*)?=(?![=>])\s*(?:await\s+)?{name}\s*\('
+HELPER_LOCAL_DECL_TMPL = r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{{}}]*)?=(?![=>])\s*(?:await\s+)?{pre}{name}\s*\('
 # useMemo extension (BACKLOG 125 B-7 rework, mainstream React idiom): `const
 # rows = useMemo(() => [...fabricated rows...], deps); setRows(rows);` is
 # caught by NO rule without this arm. It is NOT the HELPER_HEAD shape: `rows`
@@ -2144,7 +2152,22 @@ def whole_file_findings(s):
                 ws = len(head_tail) - len(head_tail.lstrip())
                 body_start = params_end + 1 + ws
         check_body_for_literal_return(name, m.start(), body_start)
-    for name, decl_at in fabricators.items():
+    helper_fabs = list(fabricators.items())
+    fabricators.clear()
+    for m in METHOD_HEAD.finditer(s):
+        if DEMO.search(m.group(1)) or GEN.search(m.group(1)):
+            continue  # rule 5's name check already reports it at the call site
+        params_end = close_of(s, m.end() - 1)
+        if params_end < 0:
+            continue
+        head_tail = s[params_end + 1:]
+        ann = HELPER_RETURN_TYPE.match(head_tail)
+        body_start = params_end + 1 + (ann.end() if ann else len(head_tail) - len(head_tail.lstrip()))
+        if s[body_start:body_start + 1] == '{':
+            check_body_for_literal_return(m.group(1), m.start(), body_start)
+    candidates = [(n, d, HELPER_CALL_PRE) for n, d in helper_fabs] \
+        + [(n, d, METHOD_CALL_PRE) for n, d in fabricators.items()]
+    for name, decl_at, pre in candidates:
         name_re = re.escape(name)
         hit = None
         for sm in HELPER_CALL_SINK_HEAD.finditer(s):
@@ -2153,14 +2176,14 @@ def whole_file_findings(s):
             if j < 0:
                 continue
             span = s[i:j + 1]
-            if re.search(HELPER_CALL_IN_SPAN_TMPL.format(name=name_re), span) \
-                    or re.search(HELPER_BARE_REF_IN_SPAN_TMPL.format(name=name_re), span):
+            if re.search(HELPER_CALL_IN_SPAN_TMPL.format(pre=pre, name=name_re), span) \
+                    or re.search(HELPER_BARE_REF_IN_SPAN_TMPL.format(pre=pre, name=name_re), span):
                 hit = sm
                 break
         if not hit:
-            hit = re.search(r'\bthis\.\w+\s*=\s*(?:await\s+)?' + name_re + r'\s*\(', s)
+            hit = re.search(r'\bthis\.\w+\s*=\s*(?:await\s+)?' + pre + name_re + r'\s*\(', s)
         if not hit:
-            for lm in re.finditer(HELPER_LOCAL_DECL_TMPL.format(name=name_re), s):
+            for lm in re.finditer(HELPER_LOCAL_DECL_TMPL.format(pre=pre, name=name_re), s):
                 local = lm.group(1)
                 if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(local)), s):
                     hit = lm
@@ -2952,6 +2975,31 @@ export function HW() {
   return null;
 }
 TSX
+    # BACKLOG 144 (S-180): a neutrally-named class-method helper, the card's
+    # red shape verbatim, caught by METHOD_HEAD only. The honest twin returns
+    # literal rows from a method that only feeds markup, and calls a
+    # same-named method on ANOTHER object (`obj._cols()`) at a setter: neither
+    # is `this.name(` reaching a sink.
+    cat > "$d/dash/components/HelperReturnClassMethod.js" <<'JS'
+export class HelperReturnClassMethod extends LokiElement {
+  _getRows() { return [{id:1,user:'Admin'}]; }
+  _load() {
+    this._rows = this._getRows();
+  }
+}
+JS
+    cat > "$d/dash/components/HelperReturnClassMethodHonest.js" <<'JS'
+export class HelperReturnClassMethodHonest extends LokiElement {
+  _cols() {
+    if (this._wide) { return [{ key: 'id', label: 'ID' }]; }
+    return [{ key: 'name', label: 'Name' }];
+  }
+  render(obj) {
+    setCols(obj._cols());
+    return this._cols().map((c) => c.label).join('');
+  }
+}
+JS
     cat > "$d/dash/components/HelperReturnAwaitThisSink.js" <<'JS'
 export class HelperReturnAwaitThisSink extends LokiElement {
   async _seed() {
@@ -3761,6 +3809,7 @@ HelperReturnConcise.tsx:2|'getRows' returns fabricated literal rows reaching a d
 HelperReturnTyped.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnAwaitSetter.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnAwaitThisSink.js:3|'getPhases' returns fabricated literal rows reaching a data sink
+HelperReturnClassMethod.js:2|'_getRows' returns fabricated literal rows reaching a data sink
 HelperReturnLazyRef.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnSinkSpread.tsx:2|'buildRowsX' returns fabricated literal rows reaching a data sink
 HelperReturnSinkNestedCall.tsx:2|'buildRowsX' returns fabricated literal rows reaching a data sink
@@ -3804,6 +3853,7 @@ EOF
         HelperReturnFnDecl.tsx:1 HelperReturnArrow.tsx:1 HelperReturnThisSink.js:1 HelperReturnTwoHop.tsx:1 \
         HelperReturnConcise.tsx:1 HelperReturnTyped.tsx:1 \
         HelperReturnAwaitSetter.tsx:1 HelperReturnAwaitThisSink.js:1 HelperReturnLazyRef.tsx:1 \
+        HelperReturnClassMethod.js:1 HelperReturnClassMethodHonest.js:0 \
         HelperReturnSinkSpread.tsx:1 HelperReturnSinkNestedCall.tsx:1 HelperReturnSinkTrailingCall.tsx:1 \
         HelperReturnBareParamArrow.tsx:1 HelperReturnLetVar.tsx:1 HelperReturnUseCallback.tsx:1 \
         HelperReturnUseCallbackBareParam.tsx:1 HelperReturnReactUseCallback.tsx:1 \
