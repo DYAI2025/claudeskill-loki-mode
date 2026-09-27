@@ -59,23 +59,31 @@ expect_not_contains() {
 }
 
 # --- parallel selector cache ------------------------------------------------
-# ponytail: plain background jobs + a job-count throttle, no new dependency
+# ponytail: plain background jobs + a `jobs -pr`-throttle, no new dependency
 # (GNU parallel etc). JOBDIR holds one .in/.out/.err/.launched fileset per
 # distinct invocation; cleaned up on exit like every other test-local temp
 # dir in this suite (see tests/test-agent-readiness.sh's mktemp -d usage).
 JOBDIR="$(mktemp -d)"
 trap 'rm -rf "$JOBDIR"' EXIT
-MAX_PAR="${SELECT_TESTS_MAX_PAR:-4}"
-JOB_COUNT=0
+# Default: 2x the core count (portable macOS/Linux probe), not a number
+# tuned to one machine -- each job is I/O/fork-bound, not CPU-bound, so some
+# oversubscription measurably helps (see the perf note above); override with
+# SELECT_TESTS_MAX_PAR for a slower/shared box.
+MAX_PAR="${SELECT_TESTS_MAX_PAR:-$(( $(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4) * 2 ))}"
 
 cache_key() { printf '%s' "$1" | shasum -a 1 | awk '{print $1}'; }
 
+# Ground truth from the shell's own job table (jobs -pr), not a manually
+# incremented counter -- a counter can drift from reality when jobs finish
+# out of order, which is exactly what MAX_PAR=6 did here during development
+# (wall time collapsed to near-serial with idle CPU, never a hang, but never
+# using its budget either). Called BEFORE backgrounding a new job.
 throttle() {
-    JOB_COUNT=$((JOB_COUNT + 1))
-    if [ "$JOB_COUNT" -ge "$MAX_PAR" ]; then
-        wait -n 2>/dev/null || wait
-        JOB_COUNT=$((JOB_COUNT - 1))
-    fi
+    while [ "$(jobs -pr | wc -l)" -ge "$MAX_PAR" ]; do
+        # bash 3.2 has no `wait -n`; wait on the oldest still-running job's
+        # pid instead (jobs -pr itself is 3.2-safe).
+        wait "$(jobs -pr | head -1)" 2>/dev/null || break
+    done
 }
 
 # files_launch/files_result: a `--files <list>` invocation, keyed by the
@@ -88,8 +96,8 @@ files_launch() {
     [ -e "$JOBDIR/$key.launched" ] && return 0
     : >"$JOBDIR/$key.launched"
     printf '%s' "$content" >"$JOBDIR/$key.in"
-    (bash "$SELECT" --files "$JOBDIR/$key.in" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
     throttle
+    (bash "$SELECT" --files "$JOBDIR/$key.in" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
 }
 
 files_result() {
@@ -114,8 +122,8 @@ args_launch() {
     key="$(cache_key "A:$*")"
     [ -e "$JOBDIR/$key.launched" ] && return 0
     : >"$JOBDIR/$key.launched"
-    (bash "$SELECT" "$@" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
     throttle
+    (bash "$SELECT" "$@" >"$JOBDIR/$key.out" 2>"$JOBDIR/$key.err") &
 }
 
 args_result() {
@@ -132,38 +140,34 @@ args_result() {
 # only its plumbing changed (cache lookup instead of a live process).
 sel() { files_result "$(printf '%s\n' "$1")"; }
 
-# Repro 3's SAMPLE_PY_FILES / py_test_files, hoisted up from their original
-# spot below so their guard-loop candidates can be prefetched here too; the
-# guard loop further down still computes truth itself and calls sel() (now
-# cache-backed) exactly as before.
-SAMPLE_PY_FILES="$(
-    { find "$REPO_ROOT/autonomy/lib" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
-      find "$REPO_ROOT/dashboard" -maxdepth 1 -name '*.py' ! -name '__*__.py' | sort | head -5
-    } | sed "s#^$REPO_ROOT/##"
-)"
+# Guard-loop sample (repro 3): reuse the same 5 real .py files the repro
+# assertions above already exercise (workspace_diff.py, fast_verify.py,
+# api_runs.py, api_keys.py, proof-generator.py), instead of an independent
+# `find | head -5` sample -- each is already a live selector run for this
+# file's own assertions, so the guard loop below needs zero extra selector
+# invocations (its 3 truthy files -- workspace_diff, api_runs, api_keys --
+# read straight from that same cache; fast_verify and proof-generator have
+# their real references in a .sh file, not a .py test, so the guard's
+# .py-only truth check correctly finds none and skips them, same as before).
+SAMPLE_PY_FILES="$(printf '%s\n' \
+    'autonomy/lib/workspace_diff.py' \
+    'autonomy/lib/fast_verify.py' \
+    'dashboard/api_runs.py' \
+    'dashboard/api_keys.py' \
+    'autonomy/lib/proof-generator.py')"
 
 # --- prefetch: queue every distinct selector invocation this file makes ----
 
 # Every `sel 'X'` call below is extracted from this script's own source, so
 # this list can never drift from the actual call sites.
-mapfile -t _SEL_ARGS < <(grep -oE "sel '[^']*'" "$SELF" | sed -E "s/^sel '//; s/'\$//")
-for _arg in "${_SEL_ARGS[@]}"; do
+while IFS= read -r _arg; do
+    [ -n "$_arg" ] || continue
     files_launch "$(printf '%s\n' "$_arg")"
-done
+done < <(grep -oE "sel '[^']*'" "$SELF" | sed -E "s/^sel '//; s/'\$//")
 
-# The guard-loop candidates (repro 3): only prefetch ones the loop below will
-# actually call sel() on (it skips a candidate with no real import anywhere,
-# same truth check as here) -- a live selector call is the expensive part
-# (all_test_files() fans out a grep per candidate test file), so launching one
-# for a candidate the loop would have skipped is pure waste.
-mapfile -t _guard_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
-while IFS= read -r _pyfile; do
-    [ -n "$_pyfile" ] || continue
-    _stem="$(basename "$_pyfile" .py)"
-    _truth="$(grep -lE "^[[:space:]]*(import|from)[[:space:]].*(^|[^A-Za-z0-9_.])${_stem}([^A-Za-z0-9_]|$)" \
-        "${_guard_test_files[@]}" 2>/dev/null)"
-    [ -n "$_truth" ] && files_launch "$(printf '%s\n' "$_pyfile")"
-done <<<"$SAMPLE_PY_FILES"
+# No separate guard-loop prefetch needed: all 5 SAMPLE_PY_FILES above are
+# already `sel 'X'` call sites earlier in this file, so _SEL_ARGS above
+# already queued them.
 
 # The 4 direct (non-sel()) invocations further down.
 files_launch ""
@@ -327,16 +331,20 @@ expect_contains "repro3: dashboard-ui area rule (node_test)" "$out" "$(printf 'R
 expect_contains "repro3: dashboard-ui per-file import match" "$out" "$(printf 'R3\tnode_test\tdashboard-ui/tests/ui-components.test.js')"
 expect_not_contains "repro3: never bash-kinded" "$out" "$(printf 'shell_test\tdashboard-ui/tests/ui-components.test.js')"
 
-# Guard: for a fixed, deterministic sample of 10 real .py files under
-# autonomy/lib and dashboard, every test file that actually imports the
-# module (an "import x" / "from x import" / "from pkg import x" line,
-# independently found on disk here, not by calling into the selector's own
-# matcher) must appear in the selector's output for that file.
-# (SAMPLE_PY_FILES is computed above, prefetch-side, from the same find.)
+# Guard: for a fixed, deterministic sample of 5 real .py files under
+# autonomy/lib and dashboard (SAMPLE_PY_FILES, set above -- the same 5 files
+# the repro assertions already exercise, see the fixture-reuse note there),
+# every test file that actually imports the module (an "import x" /
+# "from x import" / "from pkg import x" line, independently found on disk
+# here, not by calling into the selector's own matcher) must appear in the
+# selector's output for that file.
 
 guard_pass=0
 guard_fail=0
-mapfile -t py_test_files < <(find "$REPO_ROOT/tests" -name '*.py')
+py_test_files=()
+while IFS= read -r _f; do
+    py_test_files+=("$_f")
+done < <(find "$REPO_ROOT/tests" -name '*.py')
 while IFS= read -r pyfile; do
     [ -n "$pyfile" ] || continue
     stem="$(basename "$pyfile" .py)"
@@ -359,10 +367,10 @@ while IFS= read -r pyfile; do
 done <<<"$SAMPLE_PY_FILES"
 if [ "$guard_fail" -eq 0 ] && [ "$guard_pass" -gt 0 ]; then
     PASS=$((PASS + 1))
-    echo "PASS: guard -- $guard_pass real import(s) across the 10-file sample all selected"
+    echo "PASS: guard -- $guard_pass real import(s) across the 5-file sample all selected"
 elif [ "$guard_pass" -eq 0 ]; then
     FAIL=$((FAIL + 1))
-    echo "FAIL: guard -- the 10-file sample found zero real imports to check (sample or grep is broken)"
+    echo "FAIL: guard -- the 5-file sample found zero real imports to check (sample or grep is broken)"
 else
     FAIL=$((FAIL + guard_fail))
 fi
