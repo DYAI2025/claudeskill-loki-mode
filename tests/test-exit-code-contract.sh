@@ -34,8 +34,12 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # Marker for the isolation check at the bottom: anything at REPO_ROOT's
 # provider file OLDER than this predates this test run and is not ours to
 # blame (another suite in the same shared checkout may legitimately write it).
+# The 1s sleep guards the `-nt` comparison below against same-second mtime
+# granularity (measured: without it, bash 3.2's `-nt` can read a marker and a
+# same-second contaminating write as simultaneous and pass vacuously).
 PROBE_START="$SCRATCH/.probe-start"
 touch "$PROBE_START"
+sleep 1
 
 # Statuses the bash ENT-3 arm treats as DETERMINISTIC FAILURES. Re-running the
 # same inputs fails the same way; a human needs to look.
