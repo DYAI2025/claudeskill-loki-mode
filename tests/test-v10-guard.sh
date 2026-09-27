@@ -144,6 +144,26 @@ git -C "$REPO3" commit -q -m "seed board"
 # helper: reset repo3's index+worktree back to this clean HEAD
 board_reset() { git -C "$REPO3" reset -q --hard; }
 
+# A second, unrelated repo with its OWN valid (unmodified) BOARD.md -- used
+# to prove pending-removal tracking is scoped to the repo it was queued
+# against, not global. (REPO2 cannot serve this purpose: it has no
+# docs/v10/BOARD.md at all, so rule3 short-circuits on "no baseline" before
+# ever consulting the pending set, which would pass even without scoping.)
+REPO3B="$LOKI_RUN_TMP/repo-rule3b"
+mkdir -p "$REPO3B/docs/v10"
+git -C "$REPO3B" init -q -b main
+git -C "$REPO3B" config user.email test@example.com
+git -C "$REPO3B" config user.name "Test"
+cat > "$REPO3B/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-9 | ready@2026-09-01T00:00Z | unrelated |
+EOF
+git -C "$REPO3B" add docs/v10/BOARD.md
+git -C "$REPO3B" commit -q -m "seed board"
+
 echo ""
 echo "--- Rule 1: process-kill-by-pattern (pkill/killall/kill-by-pattern) ---"
 assert_blocked "R1 blocked: pkill -f" \
@@ -305,9 +325,49 @@ board_reset
 assert_blocked "R3 blocked: git mv BOARD.md away && git commit (not yet executed)" \
     "git mv docs/v10/BOARD.md docs/v10/OLD.md && git commit -m x" "$REPO3" "RULE3"
 board_reset
-assert_blocked "R3 blocked: git -C <repo> rm BOARD.md && git commit" \
-    "git -C $REPO3 rm docs/v10/BOARD.md && git commit -m x" "$SCRIPT_DIR" "RULE3"
+assert_blocked "R3 blocked: git -C <repo> rm BOARD.md && git -C <same repo> commit" \
+    "git -C $REPO3 rm docs/v10/BOARD.md && git -C $REPO3 commit -m x" "$SCRIPT_DIR" "RULE3"
 board_reset
+# Repo-scoped: a pending removal queued against REPO3 must never block an
+# unrelated commit in a DIFFERENT repo (with its own valid, untouched
+# board) in the same chained command.
+assert_allowed "R3 allowed: pending removal in one repo does not block a commit in a different repo" \
+    "git -C $REPO3 rm docs/v10/BOARD.md && git -C $REPO3B commit -m x" "$SCRIPT_DIR"
+board_reset
+
+echo ""
+echo "--- Rule 3 continued: a BOARD.md write/checkout earlier in the command is also pending ---"
+# Dedicated repo with two commits (older commit has S-1 only, HEAD has
+# S-1+S-2) so `git checkout HEAD~1 -- BOARD.md` genuinely drops a row.
+REPO_WRITE="$LOKI_RUN_TMP/repo-rule3-write"
+mkdir -p "$REPO_WRITE/docs/v10"
+git -C "$REPO_WRITE" init -q -b main
+git -C "$REPO_WRITE" config user.email test@example.com
+git -C "$REPO_WRITE" config user.name "Test"
+cat > "$REPO_WRITE/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+EOF
+git -C "$REPO_WRITE" add docs/v10/BOARD.md
+git -C "$REPO_WRITE" commit -q -m "S-1 only"
+cat > "$REPO_WRITE/docs/v10/BOARD.md" <<'EOF'
+# Board
+
+| Slice | Status | Notes |
+|---|---|---|
+| S-1 | ready@2026-09-01T00:00Z | first |
+| S-2 | ready@2026-09-01T00:00Z | second |
+EOF
+git -C "$REPO_WRITE" commit -q -am "add S-2"
+assert_blocked "R3 blocked: a redirect write to BOARD.md earlier in the command" \
+    ": > docs/v10/BOARD.md && git commit -am x" "$REPO_WRITE" "RULE3"
+assert_blocked "R3 blocked: git checkout <rev> -- BOARD.md earlier in the command" \
+    "git checkout HEAD~1 -- docs/v10/BOARD.md && git commit -m x" "$REPO_WRITE" "RULE3"
+assert_allowed "R3 allowed: a redirect write to an unrelated file" \
+    ": > docs/v10/OTHER.md && git commit -m x" "$REPO_WRITE"
 
 echo ""
 echo "--- Rule 3 continued: allowed cases (no row dropped anywhere) ---"
@@ -364,10 +424,13 @@ assert_blocked "R4 blocked: rm -rf on .claude/worktrees ITSELF (the root, not un
     "rm -rf .claude/worktrees" "$SCRIPT_DIR" "RULE4"
 assert_blocked "R4 blocked: rm -rf on /tmp ITSELF (the root, not under it)" \
     "rm -rf /tmp" "$SCRIPT_DIR" "RULE4"
-assert_blocked "R4 blocked: for d in docs; do rm -rf docs; done (shell keyword prefix)" \
-    "for d in docs; do rm -rf docs; done" "$SCRIPT_DIR" "RULE4"
+# Absolute, clearly-outside-any-root targets below (not SCRIPT_DIR-relative
+# "docs") so these stay correct even when the checkout itself sits under
+# /tmp or $TMPDIR.
+assert_blocked "R4 blocked: for d in x; do rm -rf <outside>; done (shell keyword prefix)" \
+    "for d in x; do rm -rf /nonexistent-v10-guard-test-target-$$; done" "$SCRIPT_DIR" "RULE4"
 assert_blocked "R4 blocked: timeout N rm -rf <outside> (timeout wrapper)" \
-    "timeout 10 rm -rf docs" "$SCRIPT_DIR" "RULE4"
+    "timeout 10 rm -rf /nonexistent-v10-guard-test-target-$$" "$SCRIPT_DIR" "RULE4"
 
 echo ""
 echo "--- Rule 5: writes to VERSION outside scripts/release.sh ---"
@@ -402,6 +465,8 @@ assert_blocked "R6 blocked: git add :/" \
     "git add :/" "$SCRIPT_DIR" "RULE6"
 assert_blocked "R6 blocked: git add -vA (combined short flag)" \
     "git add -vA" "$SCRIPT_DIR" "RULE6"
+assert_blocked "R6 blocked: git add ./ (same as .)" \
+    "git add ./" "$SCRIPT_DIR" "RULE6"
 assert_allowed "R6 allowed: git add <file> (staged individually by name)" \
     "git add scripts/v10-guard.sh" "$SCRIPT_DIR"
 
@@ -415,6 +480,69 @@ assert_allowed "Heredoc allowed: apostrophe in a quoted-delimiter heredoc (commi
     "git commit -F - <<'EOF'
 fix: it's done
 EOF" "$REPO3"
+
+echo ""
+echo "--- Heredocs continued: the OPENER line still runs (round 3) ---"
+assert_blocked "Heredoc opener: commit -F - <<'EOF' && git push --force (opener tail still runs)" \
+    "git commit -F - <<'EOF' && git push --force origin main
+msg
+EOF" "$REPO2" "RULE2"
+assert_blocked "Heredoc opener: cat <<EOF; pkill -f loki (opener tail still runs)" \
+    "cat <<EOF; pkill -f loki
+body
+EOF" "$SCRIPT_DIR" "RULE1"
+assert_blocked "Heredoc opener: cat <<EOF > VERSION (opener's own redirect still checked)" \
+    "cat <<EOF > VERSION
+9.9.9
+EOF" "$SCRIPT_DIR" "RULE5"
+assert_blocked "Heredoc opener: cat > x <<'EOF' && rm -rf <outside> (opener tail still runs)" \
+    "cat > $LOKI_RUN_TMP/x <<'EOF' && rm -rf /nonexistent-v10-guard-test-target-$$
+body
+EOF" "$SCRIPT_DIR" "RULE4"
+assert_allowed "Heredoc opener: a SAFE command chained on the opener line stays allowed" \
+    "cat <<EOF; echo hi
+body
+EOF" "$SCRIPT_DIR"
+# shellcheck disable=SC2016  # literal text passed as the guarded command string, not expanded here
+assert_allowed "Heredoc: arithmetic << is not mistaken for a heredoc marker" \
+    'echo $((1<<2))' "$SCRIPT_DIR"
+
+echo ""
+echo "--- Rule 1 continued: a trailing redirect must not be read as the kill target (round 3) ---"
+assert_allowed "R1 allowed: kill 12345 2>/dev/null" \
+    "kill 12345 2>/dev/null" "$SCRIPT_DIR"
+# shellcheck disable=SC2016
+assert_allowed "R1 allowed: kill \"\$pid\" 2>/dev/null || true" \
+    'kill "$pid" 2>/dev/null || true' "$SCRIPT_DIR"
+assert_allowed "R1 allowed: kill -9 12345 >/dev/null 2>&1" \
+    "kill -9 12345 >/dev/null 2>&1" "$SCRIPT_DIR"
+# shellcheck disable=SC2016
+assert_allowed "R1 allowed: kill -0 \"\$pid\" 2>/dev/null && echo alive" \
+    'kill -0 "$pid" 2>/dev/null && echo alive' "$SCRIPT_DIR"
+assert_blocked "R1 blocked: pkill still caught despite a trailing redirect" \
+    "pkill -f loki 2>/dev/null" "$SCRIPT_DIR" "RULE1"
+
+echo ""
+echo "--- Rule 1 continued: if/while/until were missing from SHELL_KEYWORDS (round 3) ---"
+assert_blocked "R1 blocked: if pkill; then ...; fi" \
+    "if pkill -f loki; then echo ok; fi" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: until pkill; do ...; done" \
+    "until pkill -f loki; do sleep 1; done" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R2 blocked: if git push --force; then ...; fi" \
+    "if git push --force origin main; then :; fi" "$REPO2" "RULE2"
+assert_allowed "Sanity: if/then wrapping a safe command stays allowed" \
+    "if true; then echo ok; fi" "$SCRIPT_DIR"
+
+echo ""
+echo "--- Rule 1 continued: process-search source reaching \$(cat f) / xargs < f (round 3) ---"
+assert_blocked "R1 blocked: pgrep > f; kill \$(cat f) (pgrep earlier in the command)" \
+    "pgrep -f loki > $LOKI_RUN_TMP/pf; kill \$(cat $LOKI_RUN_TMP/pf)" "$SCRIPT_DIR" "RULE1"
+assert_blocked "R1 blocked: pgrep > f; xargs kill < f (pgrep earlier in the command)" \
+    "pgrep -f loki > $LOKI_RUN_TMP/pf; xargs kill < $LOKI_RUN_TMP/pf" "$SCRIPT_DIR" "RULE1"
+assert_allowed "R1 allowed: kill \$(cat f) with no process-search tool anywhere" \
+    "kill \$(cat $LOKI_RUN_TMP/pf)" "$SCRIPT_DIR"
+assert_allowed "R1 allowed: xargs kill < f with no process-search tool anywhere" \
+    "xargs kill < $LOKI_RUN_TMP/pf" "$SCRIPT_DIR"
 
 echo ""
 echo "--- Fail-closed on an internal guard crash (PY_EXIT != 0) ---"

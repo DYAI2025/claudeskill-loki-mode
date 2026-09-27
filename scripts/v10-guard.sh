@@ -114,21 +114,59 @@ cwd = os.environ.get("_V10_CWD") or os.getcwd()
 # Heredoc stripping: an apostrophe (or any shell-special char) inside a
 # heredoc BODY is not shell syntax -- it's payload -- but shlex has no way
 # to know that in advance, so a heredoc containing one breaks tokenizing
-# and produces a false PARSE block. Strip heredoc bodies (any of the
+# and produces a false PARSE block. Strip heredoc BODIES (any of the
 # <<EOF / <<-EOF / <<'EOF' / <<"EOF" forms) before shlex ever sees them;
 # none of our rules need heredoc body content.
+#
+# The opener line (everything up to and including its own newline) is kept
+# verbatim: the shell still runs whatever else is chained on that same
+# line (`<<EOF && rm -rf x`, `<<EOF; pkill -f loki`), and an earlier
+# version of this stripper deleted that trailing content too, silently
+# turning those into no-ops. Only the region from the opener's newline
+# through a line that is EXACTLY the delimiter (leading tabs allowed only
+# for `<<-`) is removed; `EOF anything` is not a terminator.
+#
+# `<<` is also the arithmetic left-shift operator (`$((1<<2))`), which is
+# not a heredoc: an unquoted delimiter immediately followed by `)` is
+# treated as that instead of a heredoc marker.
 # ---------------------------------------------------------------------
-HEREDOC_RE = re.compile(
-    r"<<-?\s*([\"']?)(\w+)\1[^\n]*\n(?:.*?\n)?\2\b[^\n]*(?:\n|$)", re.DOTALL
-)
+HEREDOC_MARKER_RE = re.compile(r"<<(-?)\s*((['\"]?)(\w+)\3)")
 
 
 def strip_heredocs(text):
-    prev = None
-    while prev != text:
-        prev = text
-        text = HEREDOC_RE.sub("\n", text, count=1)
-    return text
+    out = []
+    pos = 0
+    search_from = 0
+    while True:
+        m = HEREDOC_MARKER_RE.search(text, search_from)
+        if not m:
+            out.append(text[pos:])
+            break
+        after = m.end()
+        if not m.group(3) and after < len(text) and text[after] == ")":
+            # Unquoted delimiter immediately closed by ')' -- arithmetic
+            # `<<`, not a heredoc. Leave it untouched and keep scanning.
+            search_from = after
+            continue
+        line_end = text.find("\n", after)
+        if line_end == -1:
+            # No newline after the opener -- nothing to strip a body from.
+            out.append(text[pos:])
+            break
+        delim = m.group(4)
+        indent = r"[ \t]*" if m.group(1) else ""
+        term_re = re.compile(r"^" + indent + re.escape(delim) + r"[ \t]*$", re.MULTILINE)
+        tm = term_re.search(text, line_end + 1)
+        out.append(text[pos:line_end + 1])
+        if tm is None:
+            # Unterminated heredoc -- drop the (unterminated) body, nothing
+            # legitimate follows it to preserve.
+            pos = len(text)
+            break
+        term_line_end = text.find("\n", tm.end())
+        pos = term_line_end + 1 if term_line_end != -1 else len(text)
+        search_from = pos
+    return "".join(out)
 
 
 command = strip_heredocs(command)
@@ -140,7 +178,7 @@ command = command.replace(">|", ">")
 SEPARATORS = {";", "&", "&&", "|", "||", "(", ")"}
 COMPOUND_OPS = {"&&", "||"}
 WRAPPERS = {"command", "env", "exec", "nohup", "time", "sudo", "nice"}
-SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "!"}
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "!", "if", "while", "until"}
 VALUE_FLAGS = {"-u", "-g", "-s", "-k", "-n"}  # flags that consume a following token, across our wrappers
 DURATION_RE = re.compile(r"^[0-9]+(\.[0-9]+)?[smhd]?$")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -193,6 +231,35 @@ def segments_with_seps(tokens):
         out.append(cur)
         seps.append(pending)
     return out, seps
+
+
+# A bare (or fd-numbered) redirect operator token -- `>`, `>>`, `<`, `2>`,
+# `2>&1`, or one of those glued to its target (`2>/dev/null`) since shlex
+# only splits on whitespace/punctuation_chars, not on `<`/`>`. These are
+# NOT command arguments and must not be read as a kill PID or an rm target;
+# rule5 needs them intact (it looks for VERSION among them), so this is
+# applied locally by the rules that would otherwise misread them, not in
+# the shared tokenizer.
+REDIRECT_TOKEN_RE = re.compile(r"^[0-9]*[<>&]")
+REDIRECT_OPERATOR_ONLY_RE = re.compile(r"^[0-9]*(>>?|<<?|&)+$")
+
+
+def strip_redirect_tokens(words):
+    out = []
+    skip_next = False
+    for w in words:
+        if skip_next:
+            skip_next = False
+            continue
+        if REDIRECT_TOKEN_RE.match(w):
+            if REDIRECT_OPERATOR_ONLY_RE.match(w):
+                # A bare operator with no attached target (e.g. "2>" split
+                # off by a following "&1"): its operand, if any, is the
+                # next token and is not a real argument either.
+                skip_next = True
+            continue
+        out.append(w)
+    return out
 
 
 def skip_wrappers(words):
@@ -290,10 +357,10 @@ def rule1_process_kill(i, segs, words, name, idx):
     if name in {"pkill", "killall"}:
         return "RULE1 (process-kill-by-pattern): '{}' kills by name/pattern, not by an exact recorded PID".format(name)
     if name == "kill":
-        args = [w for w in words[idx + 1:] if w != "--"]
+        raw_args = strip_redirect_tokens([w for w in words[idx + 1:] if w != "--"])
         pids = []
         skip_next = False
-        for a in args:
+        for a in raw_args:
             if skip_next:
                 skip_next = False
                 continue
@@ -314,7 +381,13 @@ def rule1_process_kill(i, segs, words, name, idx):
                 continue
             if p == "$":
                 # `$(...)` split apart by the paren-as-separator tokenizer;
-                # the substituted command is the next segment.
+                # the substituted command is the next segment. Even when
+                # that immediate command (e.g. `cat`) is harmless, a
+                # process-search tool ANYWHERE in this command (e.g. an
+                # earlier `pgrep ... > f; kill $(cat f)`) means the file it
+                # read could be PID-sourced from it.
+                if command_has_pid_source_tool:
+                    return "RULE1 (process-kill-by-pattern): kill target is a command substitution, and this command also invokes a process-search tool -- cannot verify it wasn't PID-sourced from it"
                 if i + 1 < len(segs) and segs[i + 1]:
                     inner_name, _ = skip_wrappers(segs[i + 1])
                     if inner_name in PID_SOURCE_TOOLS:
@@ -328,8 +401,11 @@ def rule1_process_kill(i, segs, words, name, idx):
 def rule1_xargs_pipe_kill(i, segs, seps, words, name, idx):
     if name != "xargs":
         return None
-    if not any(w in ("kill", "pkill", "killall") for w in words[idx + 1:]):
+    rest = words[idx + 1:]
+    if not any(w in ("kill", "pkill", "killall") for w in rest):
         return None
+    if command_has_pid_source_tool and any(REDIRECT_TOKEN_RE.match(w) and "<" in w for w in rest):
+        return "RULE1 (process-kill-by-pattern): 'xargs kill' reads its target list from a file while this command also invokes a process-search tool -- cannot verify the file wasn't PID-sourced from it"
     j = i
     while seps[j] == "|":
         j -= 1
@@ -472,7 +548,11 @@ def _covers_board(arg):
     return normalized == BOARD_PATH or BOARD_PATH.startswith(normalized + "/")
 
 
-def rule3_board_drop(words, name, idx, git_info, board_removal_pending):
+def _redirect_target_basenames(text):
+    return [basename(m.group(1)) for m in REDIRECT_TARGET_RE.finditer(text)]
+
+
+def rule3_board_drop(words, name, idx, git_info, board_removal_pending_repos):
     if name != "git" or git_info is None:
         return None
     sub, args_idx, repo_cwd, git_dir_override = git_info
@@ -490,8 +570,8 @@ def rule3_board_drop(words, name, idx, git_info, board_removal_pending):
         # baseline row count, don't claim to have verified anything.
         return None
 
-    if board_removal_pending:
-        return "RULE3 (BOARD.md row drop): a preceding 'git rm'/'git mv' in this command removes BOARD.md from the index before the commit runs"
+    if repo_root in board_removal_pending_repos:
+        return "RULE3 (BOARD.md row drop): a preceding command in this same command targeting this repo (git rm/mv, a redirect write, or a checkout/restore of BOARD.md) changes it before the commit runs"
 
     staged = subprocess.run(
         ["git", "-C", repo_root, "show", ":" + BOARD_PATH],
@@ -536,7 +616,7 @@ def allowed_roots(cwd_now):
 
 
 def is_rm_recursive_force(words, idx):
-    args = words[idx + 1:]
+    args = strip_redirect_tokens(words[idx + 1:])
     has_r = False
     has_f = False
     targets = []
@@ -588,10 +668,7 @@ REDIRECT_TARGET_RE = re.compile(r"\d*>{1,2}\|?\s*([^\s;&|]+)")
 
 
 def redirect_targets_version(text):
-    for m in REDIRECT_TARGET_RE.finditer(text):
-        if basename(m.group(1)) == "VERSION":
-            return True
-    return False
+    return "VERSION" in _redirect_target_basenames(text)
 
 
 def segment_writes_version(words, name, idx, raw_segment_text):
@@ -645,18 +722,20 @@ def rule6_git_add_blanket(words, name, idx, git_info):
             return "RULE6 (git add: blanket staging): '{}' stages everything; stage files individually by name".format(a)
         if a.startswith("-") and not a.startswith("--") and "A" in a[1:]:
             return "RULE6 (git add: blanket staging): combined flag '{}' includes -A; stage files individually by name".format(a)
-        if not a.startswith("-") and a in (".", ":/", "*"):
+        if not a.startswith("-") and a in (".", "./", ":/", "*"):
             return "RULE6 (git add: blanket staging): pathspec '{}' stages everything; stage files individually by name".format(a)
     return None
 
 
 # ---------------------------------------------------------------------
-# Evaluate all rules across all segments, tracking `cd` and a pending
-# BOARD.md removal (git rm/mv) live as we go -- a later `cd` or `git rm`
-# must never affect a segment that runs BEFORE it in the command.
+# Evaluate all rules across all segments, tracking `cd` and a set of repos
+# with a pending BOARD.md change live as we go -- a later `cd`/`git rm`/
+# write must never affect a segment that runs BEFORE it in the command,
+# and a pending change in one repo (e.g. via `git -C`) must never block an
+# unrelated commit in a different repo.
 # ---------------------------------------------------------------------
 effective_cwd = cwd
-board_removal_pending = False
+board_removal_pending_repos = set()
 
 for i, words in enumerate(segs):
     if not words:
@@ -687,19 +766,31 @@ for i, words in enumerate(segs):
     git_info = git_subcommand(words, idx, effective_cwd) if name == "git" else None
 
     if git_info is not None:
-        g_sub, g_args_idx, _gc, _gd = git_info
+        g_sub, g_args_idx, g_repo_cwd, g_git_dir = git_info
         if g_sub in ("rm", "mv"):
             g_args = [w for w in words[g_args_idx:] if not w.startswith("-")]
             check_args = g_args[:1] if g_sub == "mv" else g_args  # mv: only the source arg
             if any(_covers_board(a) for a in check_args):
-                board_removal_pending = True
+                board_removal_pending_repos.add(resolve_repo_root(g_repo_cwd, g_git_dir))
+        elif g_sub in ("checkout", "restore"):
+            # `git checkout <rev> -- BOARD.md` / `git restore ... BOARD.md`
+            # overwrites the working copy from an arbitrary revision before
+            # the commit runs; cannot verify it keeps every row.
+            g_args = [w for w in words[g_args_idx:] if not w.startswith("-")]
+            if any(_covers_board(a) for a in g_args):
+                board_removal_pending_repos.add(resolve_repo_root(g_repo_cwd, g_git_dir))
+    elif "BOARD.md" in _redirect_target_basenames(" ".join(words)):
+        # A non-git write (`: > docs/v10/BOARD.md`, `echo x > .../BOARD.md`)
+        # earlier in the same command also replaces content the working-tree
+        # read below cannot see yet.
+        board_removal_pending_repos.add(resolve_repo_root(effective_cwd, None))
 
     r = rule2_git_force(words, name, idx, git_info)
     if r:
         print(r)
         raise SystemExit(0)
 
-    r = rule3_board_drop(words, name, idx, git_info, board_removal_pending)
+    r = rule3_board_drop(words, name, idx, git_info, board_removal_pending_repos)
     if r:
         print(r)
         raise SystemExit(0)
