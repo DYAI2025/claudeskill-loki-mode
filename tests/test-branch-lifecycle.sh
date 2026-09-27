@@ -1771,7 +1771,12 @@ out68u="$(
     git add notes.txt && git commit -qm "user: track my own notes"
     user_head="$(git rev-parse HEAD)"
     git checkout -q develop
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     resumed="$( [ "$(git rev-parse --abbrev-ref HEAD)" = "$session" ] && echo yes || echo no )"
     blamed="$(printf '%s' "$resume_log" | grep -qi 'agent committed' && echo yes || echo no)"
     printf 'agent 2\n' > work2.js
@@ -1817,7 +1822,12 @@ out68k="$(
     # notes.txt themselves.
     git add notes.txt && git commit -qm "user: track my own notes"
     git checkout -q develop
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     blamed="$(printf '%s' "$resume_log" | grep -qi 'agent committed' && echo yes || echo no)"
     printf 'agent 2\n' > work2.js
     msg="$(commit_session_changes 2>&1)"
@@ -1859,7 +1869,12 @@ out68a="$(
     : > .loki/state/turn-in-flight
     git add notes.txt && git commit -qm "agent checkpoint (includes pre-existing notes.txt)"
     git checkout -q develop
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     printf 'agent 2\n' > work2.js
     msg="$(commit_session_changes 2>&1)"
     disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
@@ -1911,7 +1926,12 @@ out68c="$(
     anchor_past_commit="$( [ "$(cat .loki/state/tracked-since.sha 2>/dev/null)" = "$(git rev-parse HEAD)" ] && echo yes || echo no )"
     # Killed here: no further turn, no commit_session_changes call. Resume on
     # the already-on-loki path (the real pod-loss restart: same branch).
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     printf 'agent 2\n' > work2.js
     msg="$(commit_session_changes 2>&1)"
     disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
@@ -2050,7 +2070,12 @@ out68m="$(
     : > .loki/state/turn-in-flight
     git add notes.txt && git commit -qm "agent turn 2 (includes pre-existing notes.txt)"
     git checkout -q develop
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     printf 'agent 3\n' > work3.js
     msg="$(commit_session_changes 2>&1)"
     disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
@@ -2107,7 +2132,12 @@ out68w="$(
     anchor_unchanged="$([ "$(cat .loki/state/tracked-since.sha 2>/dev/null)" = "$stale_anchor" ] && echo yes || echo no)"
     rmdir .loki/state/tracked-since.sha.tmp 2>/dev/null || true
     git checkout -q develop
-    resume_log="$(setup_agent_branch 2>&1)"
+    # BACKLOG 70: run setup_agent_branch in THIS shell, not a command-
+    # substitution subshell, so its _LOKI_SNAPSHOT_SEAL update sticks (see
+    # the T-interrupt-resume-commits-agent-files comment above for why).
+    setup_agent_branch > .loki/state/.test-resume-log 2>&1
+    resume_log="$(cat .loki/state/.test-resume-log 2>/dev/null)"
+    rm -f .loki/state/.test-resume-log
     printf 'agent 2\n' > work2.js
     msg="$(commit_session_changes 2>&1)"
     disclosed="$(printf '%s' "$msg" | grep 'agent committed your pre-existing' | grep -q 'notes.txt' && echo yes || echo no)"
