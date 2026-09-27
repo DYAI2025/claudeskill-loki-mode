@@ -11,6 +11,7 @@
 # Synthetic credentials only; no network (global insteadOf routes github.com
 # to a local bare repo, gh is a stub on PATH).
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_SH="${LOKI_TEST_RUN_SH:-$ROOT/autonomy/run.sh}"
@@ -21,7 +22,7 @@ bad() { FAIL=$((FAIL + 1)); echo "FAIL: $1"; }
 
 W="$(mktemp -d "${TMPDIR:-/tmp}/loki-default-branch.XXXXXX")" || exit 1
 W="$(cd "$W" && pwd -P)"
-trap 'rm -rf "$W"' EXIT
+trap 'rm -rf "$W" "$ISOLATED_GIT_HOME"' EXIT
 
 awk '
     /^_LOKI_WITHHELD_TOKENS=""$/ { on = 1 }

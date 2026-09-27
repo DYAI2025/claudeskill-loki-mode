@@ -1,141 +1,96 @@
 #!/usr/bin/env bash
-# Test: no test suite may run `git config --global` or write the ambient
-# ~/.gitconfig / $HOME/.gitconfig unless it first isolates HOME or
-# GIT_CONFIG_GLOBAL at the top level of the same file.
+# Test: no test suite may run `git config --global` or touch the ambient
+# ~/.gitconfig unless it sources tests/lib/isolated-git-home.sh first.
 #
 # THE RISK: a test that runs `git config --global` against the real user
 # HOME corrupts the developer's or CI runner's actual git identity/config.
 #
-# FAIL CLOSED. Two earlier versions tried to model shell scope and each
-# ambiguity resolved to "isolated", which a reviewer turned into a bypass.
-# This version accepts exactly one shape and flags everything else:
+# DESIGN: three earlier versions tried to prove isolation from arbitrary
+# shell (scope, quotes, heredocs, case arms) and each lost to a new shape.
+# This one does not parse shell. A file with ANY offending line must open
+# with a prelude of only comments, blank lines and plain `set ...` lines,
+# followed by exactly:
 #
-#   (a) a line at column 0 that is only `export HOME=RHS` or
-#       `export GIT_CONFIG_GLOBAL=RHS` (optionally `|| exit 1`), placed
-#       before the first offending line;
-#   (b) at that line the scanner is at top level: not inside a quote, a
-#       heredoc, a function, a subshell, or an if/for/while/until/case
-#       block, and no unmatched closer (for example a case pattern `a)`)
-#       has been seen before it;
-#   (c) RHS has scratch provenance: it contains `mktemp`, or references only
-#       variables that were themselves assigned at top level from mktemp (or
-#       from such a variable); it never references HOME;
-#   (d) no other assignment or `unset` of that variable appears anywhere
-#       later in the file (a restore, an inline prefix, a subshell write:
-#       all cancel isolation);
-#   (e) a redirect into ~/.gitconfig or $HOME/.gitconfig needs HOME
-#       isolation; GIT_CONFIG_GLOBAL does not redirect a literal path.
+#   . "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1
 #
-# The scan is static: fixtures are read, never executed.
+# (`../lib/` from tests/moat). Nothing that can open a block, a quote, a
+# heredoc or a function may precede it, so it always runs, first, at top
+# level; `|| exit 1` stops the test if the helper is missing. Nothing before
+# it can save the real HOME.
+#
+# Offending line (checked both per physical line and per backslash-joined
+# logical line; on a `#` line only the text from the first `$(`, backtick
+# or double quote on is checked, since such a line inside a string or an
+# unquoted heredoc still runs a command substitution):
+#   - `git ... config ... --gl[obal]` (git accepts any unambiguous prefix);
+#   - `.gitconfig` as a relative path, or `/.gitconfig` on a line that also
+#     mentions `~` or HOME (covers >, >>, --file, -f, tee, cp).
+#
+# ponytail: known ceiling, by design; the lint does not try to prove any of
+# these. After the helper, code that rebuilds the real home (a literal
+# /Users/x path, ~user, a passwd lookup, $PWD or $OLDPWD walked upward) and
+# then unsets or retargets HOME/GIT_CONFIG_GLOBAL escapes it. Not detected
+# at all: a home copied into another variable first (H=$HOME; >"$H/.gitconfig"),
+# an obfuscated call (`git config --glo""bal`, eval of a built string), and a
+# `#` line that closes a single-quoted string.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER="$SCRIPT_DIR/lib/isolated-git-home.sh"
 
 PASS=0
 FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  FAIL: %s\n' "$1"; FAIL=$((FAIL+1)); }
 
-echo "=== no ambient ~/.gitconfig writes without top-level HOME/GIT_CONFIG_GLOBAL isolation ==="
+echo "=== no ambient ~/.gitconfig writes without the isolated-git-home helper ==="
 
-# ponytail: a line lexer, not a shell parser. Its ceiling: a deliberately
-# obfuscated call (`git config --glo""bal`, `eval`, an alias) is not seen.
-# Constructs it cannot place (a case pattern, a stray closer, an unclosed
-# heredoc) resolve to "flagged", not "isolated".
 scan() {
     python3 - "$@" <<'PYEOF'
 import os, re, sys
 
 SELF = "test-no-ambient-gitconfig-writes.sh"
-
-GIT_GLOBAL = re.compile(r'\bgit\b[^#\n]*\bconfig\b[^#\n]*--global\b')
-AMBIENT_REDIRECT = re.compile(r'>{1,2}\s*(?:"?\$\{?HOME\}?"?|~)/\.gitconfig\b')
-ISO_LINE = re.compile(r'^export (HOME|GIT_CONFIG_GLOBAL)=("[^"]*"|[^\s;&|]+)(?: \|\| exit 1)?\s*$')
-TOP_ASSIGN = re.compile(r'^(?:export )?([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
-VAR_REF = re.compile(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)')
-HEREDOC = re.compile(r'(?<!<)<<(-?)\s*[\'"]?([A-Za-z_][A-Za-z0-9_]*)[\'"]?')
-OPEN_KW = {"if", "case", "for", "while", "until", "select"}
-CLOSE_KW = {"fi", "esac", "done"}
-LEAD_KW = {"then", "do", "else", "elif", "!", "time"}
-
-
-def assigns(var):
-    return re.compile(
-        r'(?:^|[\s;&|(`])(?:(?:export|local|readonly|typeset|declare)(?:\s+-\w+)*\s+)?'
-        + var + r'(?:\+)?='
-        r'|\bunset\b[^;&|\n]*\b' + var + r'\b')
+COMMENT = re.compile(r'^\s*#')
+CODE_IN_COMMENT = re.compile(r'\$\(|`|"')
+GIT_GLOBAL = re.compile(r'git.*\bconfig\b.*--gl(?:o(?:b(?:al?)?)?)?\b', re.I)
+REL_GITCONFIG = re.compile(r'(?<![\w./-])\.gitconfig\b')
+ABS_GITCONFIG = re.compile(r'/["\']?\.gitconfig\b')
+PRELUDE_OK = re.compile(r'^(?:#.*|\s*|set(?: [-+][A-Za-z]+(?: [a-z]+)?)+)$')
+HELPER_LINE = re.compile(
+    r'^(?:\.|source) "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/(?:\.\./)?'
+    r'lib/isolated-git-home\.sh" \|\| exit 1$')
 
 
-def join_continuations(raw):
-    out, nos, i = [], [], 0
+def offends(line):
+    if COMMENT.match(line):
+        m = CODE_IN_COMMENT.search(line)
+        if not m:
+            return False
+        line = line[m.start():]
+    return bool(GIT_GLOBAL.search(line) or REL_GITCONFIG.search(line) or
+                (ABS_GITCONFIG.search(line) and ('~' in line or 'HOME' in line)))
+
+
+def logical(raw):
+    out, i = [], 0
     while i < len(raw):
         buf, start = raw[i], i + 1
-        while buf.endswith('\\') and not buf.endswith('\\\\') and i + 1 < len(raw):
+        while buf.endswith('\\') and i + 1 < len(raw):
             i += 1
             buf = buf[:-1] + ' ' + raw[i]
-        out.append(buf)
-        nos.append(start)
+        out.append((start, buf))
         i += 1
-    return out, nos
+    return out
 
 
-def lex(line, state):
-    """Advance quote state and structural depth over one line. Returns the
-    list of heredoc delimiters opened on the line."""
-    code = []
-    i, n = 0, len(line)
-    end = n
-    while i < n:
-        c = line[i]
-        if state["sq"]:
-            if c == "'":
-                state["sq"] = False
-            i += 1
-            continue
-        if c == '\\':
-            i += 2
-            continue
-        if state["dq"]:
-            if c == '"':
-                state["dq"] = False
-            i += 1
-            continue
-        if c == "'":
-            state["sq"] = True
-        elif c == '"':
-            state["dq"] = True
-        elif c == '#' and (i == 0 or line[i - 1] in ' \t;'):
-            end = i
-            break
-        else:
-            code.append(c)
-            if c == '(':
-                state["depth"] += 1
-            elif c == ')':
-                state["depth"] -= 1
-        i += 1
-    text = ''.join(code)
-    # Block keywords count only at command position: the first word of a
-    # segment split on ; & | ( ), after then/do/else/elif/!. `echo done`
-    # is an argument, not a closer.
-    for seg in re.split(r'[;&|()]', text):
-        words = seg.split()
-        while words and words[0] in LEAD_KW:
-            words.pop(0)
-        if not words:
-            continue
-        if words[0] == '{' or words[0] in OPEN_KW:
-            state["depth"] += 1
-        elif words[0] == '}' or words[0] in CLOSE_KW:
-            state["depth"] -= 1
-    if state["depth"] < 0:
-        state["poisoned"] = True
-        state["depth"] = 0
-    # Heredoc detection keeps quotes: `<<'EOF'` is the common form. A `<<`
-    # inside a string opens a spurious heredoc, which only hides later
-    # isolation lines (fail closed); skipped lines are still offender-checked.
-    return HEREDOC.findall(line[:end])
+def has_prelude_helper(raw):
+    for line in raw:
+        if HELPER_LINE.match(line):
+            return True
+        if not PRELUDE_OK.match(line):
+            return False
+    return False
 
 
 def scan_file(path):
@@ -143,94 +98,57 @@ def scan_file(path):
         raw = open(path, encoding="utf-8", errors="replace").read().split("\n")
     except OSError:
         return []
-    lines, nos = join_continuations(raw)
-    state = {"sq": False, "dq": False, "depth": 0, "poisoned": False}
-    scratch = set()
-    iso = {"HOME": False, "GIT_CONFIG_GLOBAL": False}
-    pending_heredocs = []
-    hits = []
-    for line, no in zip(lines, nos):
-        if pending_heredocs:
-            strip_tabs, word = pending_heredocs[0]
-            if (line.lstrip('\t') if strip_tabs else line) == word:
-                pending_heredocs.pop(0)
-            elif GIT_GLOBAL.search(line) or AMBIENT_REDIRECT.search(line):
-                hits.append("%s:%d:%s" % (path, no, line.strip()))
-            continue
-
-        top = (not state["sq"] and not state["dq"] and state["depth"] == 0
-               and not state["poisoned"])
-
-        # Scratch provenance is judged against the variables that were
-        # scratch BEFORE this line, so `W="$(cd "$W" && pwd -P)"` keeps W.
-        prior_scratch = set(scratch)
-
-        def scratch_rhs(rhs):
-            refs = VAR_REF.findall(rhs)
-            return "HOME" not in refs and ("mktemp" in rhs or
-                    (bool(refs) and all(r in prior_scratch for r in refs)))
-
-        # (d) any assignment/unset cancels isolation, and any write to a
-        # scratch variable drops its provenance. The (a)/(c) checks below
-        # re-grant only for a top-level line of the accepted shape.
-        for var in iso:
-            if assigns(var).search(line):
-                iso[var] = False
-        for name in list(scratch):
-            if assigns(name).search(line):
-                scratch.discard(name)
-
-        is_comment = top and line.lstrip().startswith('#')
-        if is_comment:
-            pass
-        elif GIT_GLOBAL.search(line):
-            if not (iso["HOME"] or iso["GIT_CONFIG_GLOBAL"]):
-                hits.append("%s:%d:%s" % (path, no, line.strip()))
-        elif AMBIENT_REDIRECT.search(line):
-            if not iso["HOME"]:
-                hits.append("%s:%d:%s" % (path, no, line.strip()))
-
-        opened = lex(line, state)
-        top_after = top and not state["sq"] and not state["dq"] \
-            and state["depth"] == 0 and not state["poisoned"] and not opened
-
-        if top_after:
-            m = ISO_LINE.match(line)
-            a = TOP_ASSIGN.match(line)
-            if m:
-                if scratch_rhs(m.group(2)):
-                    iso[m.group(1)] = True
-            elif a and a.group(1) not in iso and scratch_rhs(a.group(2)):
-                scratch.add(a.group(1))
-        pending_heredocs.extend((s == '-', w) for s, w in opened)
-    return hits
+    hits = {}
+    for no, line in list(enumerate(raw, 1)) + logical(raw):
+        if offends(line):
+            hits.setdefault(no, line.strip())
+    if not hits or has_prelude_helper(raw):
+        return []
+    return ["%s:%d:%s" % (path, no, hits[no]) for no in sorted(hits)]
 
 
-hits = []
 for directory in sys.argv[1:]:
     if not os.path.isdir(directory):
         continue
     for name in sorted(os.listdir(directory)):
-        if not name.endswith(".sh") or name == SELF:
-            continue
-        hits.extend(scan_file(os.path.join(directory, name)))
-
-for h in hits:
-    print(h)
+        if name.endswith(".sh") and name != SELF:
+            for h in scan_file(os.path.join(directory, name)):
+                print(h)
 PYEOF
 }
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/loki-gitconfig-XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+# ---- the helper really isolates ----------------------------------------
+mkdir -p "$TMP/realhome"
+iso_out="$(env -u GIT_CONFIG_GLOBAL HOME="$TMP/realhome" bash -c '
+    . "$1" || exit 1
+    git config --global s138.probe yes || exit 1
+    printf "%s\n" "$ISOLATED_GIT_HOME" "$HOME" "$GIT_CONFIG_GLOBAL"
+    git config --file "$GIT_CONFIG_GLOBAL" s138.probe
+' _ "$HELPER" 2>&1)"
+iso_dir="$(printf '%s\n' "$iso_out" | sed -n 1p)"
+if [ -n "$iso_dir" ] && [ "$(printf '%s\n' "$iso_out" | sed -n 2p)" = "$iso_dir" ] \
+    && [ "$(printf '%s\n' "$iso_out" | sed -n 3p)" = "$iso_dir/.gitconfig" ] \
+    && [ "$(printf '%s\n' "$iso_out" | sed -n 4p)" = "yes" ] \
+    && [ ! -e "$TMP/realhome/.gitconfig" ]; then
+    ok "helper points HOME and GIT_CONFIG_GLOBAL at a scratch dir; the write lands there"
+else
+    bad "helper did not isolate: $iso_out"
+fi
+case "$iso_dir" in
+    */loki-git-home.*) rm -rf "$iso_dir" ;;
+esac
 
 # ---- REAL: this repo's suites -----------------------------------------
 real_offenders="$(scan "$SCRIPT_DIR" "$SCRIPT_DIR/moat")"
 if [ -z "$real_offenders" ]; then
-    ok "no test writes the ambient gitconfig without top-level isolation first"
+    ok "every test touching the global gitconfig sources the helper first"
 else
-    bad "unisolated ambient gitconfig writes found:"
+    bad "ambient gitconfig writes without the helper prelude:"
     printf '%s\n' "$real_offenders" | sed 's/^/        /' | head -20
 fi
-
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/loki-gitconfig-XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
 
 # expect_flag NAME  -- fixture body on stdin must be flagged
 # expect_clean NAME -- fixture body on stdin must NOT be flagged
@@ -262,32 +180,35 @@ expect_flag no-isolation <<'EOF'
 git config --global user.name "unsafe"
 EOF
 
-expect_clean isolated-mktemp <<'EOF'
-export HOME="$(mktemp -d)"
+expect_clean helper-prelude <<'EOF'
+#!/usr/bin/env bash
+# header comment
+
+set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1
+if true; then
+    git config --global user.name "safe"
+fi
+echo x > ~/.gitconfig
+EOF
+
+expect_clean moat-helper-prelude <<'EOF'
+#!/usr/bin/env bash
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/isolated-git-home.sh" || exit 1
 git config --global user.name "safe"
 EOF
 
-# Real-file shape: helper functions, a multi-line single-quoted awk program,
-# a heredoc, and a provenance chain all precede the isolation line.
-expect_clean real-shape <<'EOF'
-pass() {
-    PASS=$((PASS + 1))
-}
-W="$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")" || exit 1
-W="$(cd "$W" && pwd -P)"
-awk '
-    /^x$/ { on = 1 }
-' in > out
-cat > "$W/pre.sh" <<XEOF
-export HOME="$W"
-XEOF
-export HOME="$W/home"
-f() {
-    git config --global url.a.insteadOf b
-}
+expect_clean no-offender-no-helper <<'EOF'
+printf '[user]\n' > "$L/home/.gitconfig"
+git config user.name local-only
 EOF
 
-# ---- round 1 bypasses (849b655e review) ---------------------------------
+# ---- earlier-round bypasses: an inline `export HOME=` is not the helper ---
+expect_flag isolated-by-hand <<'EOF'
+export HOME="$(mktemp -d)"
+git config --global user.name "unsafe"
+EOF
+
 expect_flag noop-self-reassign <<'EOF'
 export HOME="$HOME"
 git config --global user.name "unsafe"
@@ -303,7 +224,31 @@ expect_flag subshell-only <<'EOF'
 git config --global user.name "unsafe"
 EOF
 
-# ---- fail-closed shapes the scope-tracking versions accepted ------------
+expect_flag review5-case-in-if <<'EOF'
+if false; then
+case y in
+y) : ;;
+esac
+export HOME="$(mktemp -d)"
+fi
+git config --global user.name unsafe
+EOF
+
+expect_flag review5-case-in-while <<'EOF'
+while read -r x; do
+case y in
+y) : ;;
+esac
+export HOME="$(mktemp -d)"
+done < /dev/null
+git config --global user.name unsafe
+EOF
+
+expect_flag redirect-needs-home <<'EOF'
+export GIT_CONFIG_GLOBAL="$(mktemp)"
+printf '[user]\n' >> "$HOME/.gitconfig"
+EOF
+
 expect_flag inside-if-block <<'EOF'
 if false; then
 export HOME="$(mktemp -d)"
@@ -391,9 +336,199 @@ export HOME="$(mktemp -d)"
 git config --global user.name "unsafe"
 EOF
 
-expect_flag redirect-needs-home <<'EOF'
-export GIT_CONFIG_GLOBAL="$(mktemp)"
-printf '[user]\n' >> "$HOME/.gitconfig"
+# ---- the helper line anywhere but the prelude ----------------------------
+H='. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1'
+
+expect_flag helper-inside-if <<EOF
+if false; then
+$H
+fi
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-inside-heredoc <<EOF
+cat > /dev/null <<'XEOF'
+$H
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-inside-unquoted-heredoc <<EOF
+cat > /dev/null <<XEOF
+$H
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-inside-dquoted-heredoc <<EOF
+cat > /dev/null <<"XEOF"
+$H
+XEOF
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-after-closer-word <<EOF
+if true; then
+echo done
+$H
+fi
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-case-arm-nested-if <<EOF
+case x in
+x) if true; then
+$H
+fi ;;
+esac
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-after-top-level-case <<EOF
+case "\$1" in
+a) true ;;
+esac
+$H
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-inside-function <<EOF
+iso() {
+$H
+}
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-case-in-if <<EOF
+if false; then
+case y in
+y) : ;;
+esac
+$H
+fi
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-in-while <<EOF
+while read -r x; do
+case y in
+y) : ;;
+esac
+$H
+done < /dev/null
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-in-multiline-string <<EOF
+echo "text
+$H
+"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-in-subshell <<EOF
+(
+$H
+)
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-after-offender <<EOF
+git config --global user.name "unsafe"
+$H
+EOF
+
+expect_flag helper-after-open-quote <<EOF
+set -u "
+$H
+"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-after-set-continuation <<EOF
+set -u \\
+$H
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-after-saved-home <<EOF
+ORIG_HOME="\$HOME"
+$H
+export HOME="\$ORIG_HOME"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-without-exit <<'EOF'
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh"
+git config --global user.name "unsafe"
+EOF
+
+expect_flag helper-wrong-name <<'EOF'
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh.bak" || exit 1
+git config --global user.name "unsafe"
+EOF
+
+# ---- offender shapes ------------------------------------------------------
+expect_flag abbreviated-glob <<'EOF'
+git config --glob user.name "unsafe"
+EOF
+
+expect_flag abbreviated-gl <<'EOF'
+git config --gl user.name "unsafe"
+EOF
+
+expect_flag hash-in-arg <<'EOF'
+git config url."a#b".insteadOf x --global
+EOF
+
+expect_flag comment-continuation <<'EOF'
+# a comment line ending in a backslash does not continue \
+git config --global user.name "unsafe"
+EOF
+
+expect_flag comment-in-dq-string <<'EOF'
+echo "
+#$(git config --global user.name x)
+"
+EOF
+
+expect_flag comment-in-unquoted-heredoc <<'EOF'
+cat >/dev/null <<XEOF
+# $(git config --global user.name x)
+XEOF
+EOF
+
+expect_flag comment-backtick-in-heredoc <<'EOF'
+cat >/dev/null <<XEOF
+# `printf x >> ~/.gitconfig`
+XEOF
+EOF
+
+expect_flag comment-closes-dq-string <<'EOF'
+echo "
+#"; git config --global user.name x; echo "
+"
+EOF
+
+expect_clean plain-comment-mentions <<'EOF'
+# never run git config --global here; it would touch ~/.gitconfig
+git config user.name local-only
+EOF
+
+expect_flag file-flag-tilde <<'EOF'
+git config --file ~/.gitconfig user.name "unsafe"
+EOF
+
+expect_flag tee-home <<'EOF'
+printf '[user]\n' | tee "${HOME:-x}/.gitconfig"
+EOF
+
+expect_flag cp-tilde <<'EOF'
+cp x ~/.gitconfig
+EOF
+
+expect_flag relative-after-cd <<'EOF'
+cd ~ && printf '[user]\n' >> .gitconfig
 EOF
 
 echo ""

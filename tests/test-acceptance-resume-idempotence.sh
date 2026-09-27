@@ -42,6 +42,7 @@
 #===============================================================================
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -71,7 +72,7 @@ WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/loki-resume-idem.XXXXXX")"
 export GIT_CONFIG_GLOBAL="$WORKROOT/gitconfig"
 : > "$GIT_CONFIG_GLOBAL"
 cleanup() {
-    rm -rf "$WORKROOT" 2>/dev/null || true
+    rm -rf "$WORKROOT" "$ISOLATED_GIT_HOME" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

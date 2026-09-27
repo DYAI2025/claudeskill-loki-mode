@@ -38,6 +38,7 @@
 #===============================================================================
 
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/isolated-git-home.sh" || exit 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -72,7 +73,7 @@ mkdir -p "$FAKE_HOME"
 cleanup() {
     # Restore any chmod'd dir so rm -rf can remove it, then nuke WORKROOT.
     [ -d "$WORKROOT/ent1-ro" ] && chmod u+rwx "$WORKROOT/ent1-ro" 2>/dev/null || true
-    rm -rf "$WORKROOT" 2>/dev/null || true
+    rm -rf "$WORKROOT" "$ISOLATED_GIT_HOME" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
