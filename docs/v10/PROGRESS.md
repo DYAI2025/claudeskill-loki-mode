@@ -1181,3 +1181,9 @@ because the reviewer measured the real board's row shapes instead of
 trusting a first-row-only test. Rule for slice cards touching BOARD.md
 tooling: test against every row of a copy of the real board, not a
 sample.
+
+## Turn 216 drift audit (2026-09-27T14:58Z)
+- Train 1 npm: publish-npm logged `+ loki-mode@9.56.0` and "being processed" at 14:44:51Z; registry still 404 at 14:57 (13 min). Not republishing; per the stale-packument lesson, repeated reads share one CDN cache and are not independent. publish-docker still in_progress (run 36325316189).
+- Pulse NO_RECENT_RELEASE reads npm, so it stays red until 9.56.0 is visible there. That is correct: npm is the channel users install from.
+- Drift caught: two MEDIUM builders (S-87, S-91) ran past 30 min without check-in. The newly merged S-75 pulse flagged them within minutes of landing. Guard 3 works.
+- Train 2 assembled on main: S-71, S-75, S-78, S-80, S-86, S-90 (8 commits). S-81 is held for S-79 (same runner file, and the argmax suite duration decides its packing); S-82 is held for shard times under 10 min.
