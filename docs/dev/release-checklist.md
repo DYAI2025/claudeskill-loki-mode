@@ -13,37 +13,15 @@ pass to remove two items that `docs/v10/DECISIONS.md` D25 and
 
 ## Local CI Before Every Push
 
-**The FAST tier is the release gate. The FULL tier is not a blocker.**
-
-Founder decision 2026-07-31: GitHub CI runs Tests in ~31s and Release in ~2min
-via 4-way sharding. The local FULL tier takes ~27min with no sharding, too
-slow for an hourly-or-faster release cadence.
-
-- **Before push/release: `bash scripts/local-ci.sh`** (fast tier, default).
-- **Do NOT block a release on `LOCAL_CI_TIER=full`.** Ship, let GitHub Actions
-  verify, and fix what it finds in the next release train.
-- Run the FULL tier when diagnosing something specific, or on a quiet cycle,
-  not as a release precondition.
-
-**Why the fast tier and not nothing.** Of seven real defects found on
-2026-07-31, four were caught by the local gate ALONE. The sharpest is dist
-freshness: CI never validates that the committed `loki-ts/dist/loki.js`
-matches src; when that slipped, three releases shipped the wrong version.
-
-**The packaged artifact is the blind spot (2026-08-01).** Everything works
-from a git checkout, so no in-repo test and no GitHub CI job can see:
-- quality-gate detector test files missing from npm's `files[]` (v8.38.0)
-- committed `dist/loki.js` hardcoded to a stale version for 27 releases (v8.40.0)
-- `npm pack` content checks that tolerate losing required artifacts (v9.11.0)
-
-Rules that generalize past packaging:
-1. A check that guards the shipped artifact must run in the FAST tier.
-2. Assert each required thing individually, never a count.
-3. Guard against vacuity (an empty capture that makes every assertion pass;
-   `npm pack`'s listing is on STDERR).
-
-`LOCAL_CI_SHARDS` (default 4) controls local sharding; `LOCAL_CI_SERIAL=1`
-forces serial for diagnosis.
+**Superseded by D27 (`docs/v10/DECISIONS.md`).** The FAST-tier-before-every-push
+mandate that used to live in this section is retired: GitHub CI is the gate.
+Before pushing, run only syntax checks (`bash -n`, `py_compile`) plus the
+slice's own tests, capped at 60 seconds. `.githooks/pre-push` enforces the
+repo-identity check, `bash -n` on `autonomy/run.sh` and `autonomy/loki`, and
+the red-main warning only; a push is not "done" until `git ls-remote origin
+refs/heads/main` matches `git rev-parse HEAD`. `scripts/local-ci.sh` remains
+available for diagnosis on a quiet cycle -- it is no longer a push
+precondition, fast tier or full.
 
 After a release ships, run post-release distribution validation:
 - npm: `npm pack loki-mode@<VERSION>`, untar, run `bash package/bin/loki version`
@@ -57,7 +35,8 @@ Cleanup after every local-ci run and post-release validation uses
 
 ## Release Workflow
 
-**Step 0 (always first): `bash scripts/local-ci.sh`** -- pre-push gate.
+**Step 0 (always first, D27): syntax checks + the slice's own tests, 60s cap.**
+See "Local CI Before Every Push" above.
 
 ### 1. Version Bump - ALL Files
 
