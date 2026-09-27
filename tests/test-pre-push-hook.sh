@@ -153,6 +153,8 @@ done
 expect_refused() {
     local label="$1" pat="$2" dir="$3"; shift 3
     local rc
+    # Args are KEY=VALUE pairs, so export "$@" exports each one (SC2163 false positive).
+    # shellcheck disable=SC2163
     rc="$( [[ $# -gt 0 ]] && export "$@"; run_hook "$dir" )"
     if [[ "$rc" == "RC=0" ]]; then
         ko "$label" "hook exited 0; out: $(cat "$dir/hook.out")"
