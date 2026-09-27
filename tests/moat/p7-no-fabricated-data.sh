@@ -702,6 +702,19 @@ def literal_rows(arr):
     """arr is an array literal's text; True when it holds object rows, all literal."""
     parts = split_top(arr[1:-1])
     return any(p.startswith('{') for p in parts) and all(is_literal(p) for p in parts)
+# ABSENT/is_exempting_sibling: shared with S-30 (BACKLOG 125 B-6)'s ternary-
+# against-null fix. Defined here (rather than only at the pre-existing TERNARY
+# call sites S-30 owns) so this arm's own null-ternary handling routes through
+# the SAME predicate instead of growing a second, divergently-named copy of
+# the same exclusion -- see the MODULE_TABLE_FALLBACK ponytail/dedup note
+# above. If S-30 lands first, this definition must be deleted here and the one
+# import kept; the two are written byte-identical to make that merge a no-op.
+ABSENT = re.compile(r"^(?:null|undefined|''|\"\")$")
+def is_exempting_sibling(v):
+    """True when v is a genuine data-shaped literal for the both-branches-
+    literal ternary exemption: is_literal() minus the bare absence markers."""
+    v = re.sub(r'\s+as\s+const\s*$', '', v.strip())
+    return is_literal(v) and not ABSENT.match(v)
 line_of = lambda s, i: s.count('\n', 0, i) + 1
 SETTER = re.compile(r'\b(set[A-Z]\w*|useState)\s*(?=[(<])')
 CATCH = re.compile(r'\bcatch\s*(?:\([^()]*\))?\s*\{|\.catch\s*\(')
@@ -770,6 +783,50 @@ def ternary_colon_of(s, q):
 #     on): a named module-level table (DEFAULT_PROVIDERS, DEFAULT_PERMISSIONS,
 #     COLUMNS, GALLERY, TABS) is a negative control even when it seeds
 #     useState, matching how the reviewer scoped this arm to "a local".
+#   MODULE_TABLE_FALLBACK: closes one instance of the gap below (BACKLOG 125
+#     B-5). A column-0 `const NAME = [rows]` is a negative control for
+#     ASSIGN_ARR (a named module-level table is normally static UI config), but
+#     that same exemption let a fabricated table through when NAME is later
+#     used as the value-arm of `x || NAME` / `x ?? NAME` or of a ternary,
+#     because FALLBACK_ARR and TERNARY above only look at the literal array
+#     written inline, never at a name that resolves to one. This arm resolves
+#     NAME back to its module-level initializer and applies the SAME
+#     literal_rows() test FALLBACK_ARR/TERNARY already apply inline, so a
+#     `FALLBACK_ROWS`/`DEFAULT_ROWS`/`BACKUP_DATA`-named table is caught by
+#     STRUCTURE (module-level literal array of object rows, used as a
+#     fallback), never by NAME -- rules 5 and 7's keyword list is not involved.
+#     Two SEPARATE rules apply to a `||`/`??`/ternary operand naming a table,
+#     and they intentionally accept different things:
+#     (a) DETECTION (does this operand carry the table's fabricated rows
+#     forward, so the fallback/ternary itself should be flagged): a bare
+#     `NAME`, or NAME followed by a CHAIN of zero or more array-returning
+#     calls (`.slice(...)`, `.concat(...)`, `.filter(...)`, `.map(...)`,
+#     `.flat(...)`, `.flatMap(...)`, `.sort(...)`, `.reverse(...)`,
+#     `.toSorted(...)`, `.toReversed(...)`), each argument list matched by ITS
+#     OWN balanced parens (chain_end/resolves_to_table_read) so an arrow-
+#     function argument (`.filter((r) => r.ok)`) or a multi-call chain
+#     (`.slice(0).reverse()`) both resolve all the way through -- an ADDITIVE
+#     or unbounded derivation (`NAME.concat(...)`, an open-ended
+#     `NAME.slice(k)`) DOES count as "carries the table's data" here and gets
+#     flagged; this is deliberately broader than (b) below. A scalar/element
+#     read (`.length`, `.find(...)`, a bare `[<int>]`) is NOT an array-
+#     returning call and stops the chain, so the whole operand is left
+#     unresolved rather than misread as "table used as a fallback".
+#     (b) THE TERNARY SIBLING EXEMPTION (is_narrowing_self_derivation, used
+#     only to decide whether the OTHER branch of a ternary is also exempt):
+#     far narrower, an ALLOWLIST of exactly two BOUNDED NARROWING shapes,
+#     `NAME.slice(<int>, <int>)` (both indices required) and `NAME[<int>]`.
+#     `NAME.concat(...)` and an open-ended `.slice(k)` do NOT qualify here,
+#     even though they DO qualify for (a): picking how much of one static
+#     list to show (ChangelogWidget's `RECENT_CHANGES.slice(0, 2)`) is UI
+#     truncation, but appending to it or copying it whole is not "just a
+#     narrower read of the same list". The other branch of a ternary is
+#     exempted when it is also a literal (`[rows]`, excluding
+#     null/undefined/''/"" -- an absent value is not "also a literal table",
+#     matching S-30/BACKLOG 125 B-6's is_exempting_sibling) or also resolves
+#     to a module-level literal table, mirroring the advisorOpts/two-table
+#     negative control, OR when it is one of these two bounded narrowing
+#     reads of the SAME table the flagged branch names.
 #   ponytail: three structural gaps this arm cannot see, all pre-existing at
 #   HEAD: a render-local literal list fed straight to .map() with no setter in
 #   between (TABS/filters/severities-style UI config has the same shape); an
@@ -781,12 +838,49 @@ def ternary_colon_of(s, q):
 #   alone, and a content heuristic (flag rows shaped like activity/audit
 #   entries) is a keyword list a future case will break. Rules 5 and 7 still
 #   catch a sample/mock/demo/fake/placeholder NAME in any of these. Upgrade
-#   only if review finds a real instance, not preemptively.
+#   only if review finds a real instance, not preemptively. The
+#   module-level-table object-fallback case (rule 8's shape, but via a named
+#   table instead of an inline literal) is closed below too, reusing rule 8's
+#   own STAT_KEY/NUMVAL test on the resolved initializer.
+#   Additional named ceilings from the S-29 rework (BACKLOG 125 B-5, 2/2
+#   CONCERN closed): an ALIAS of a fabricated table (`const X = FALLBACK_ROWS;
+#   ... rows || X`) is not resolved back to FALLBACK_ROWS -- only the
+#   originally-declared name is in module_tables, never a second binding that
+#   copies the reference; `Array.from(TABLE)` and `structuredClone(TABLE)`
+#   read the whole table exactly like a bare reference, but are NOT CAUGHT:
+#   the operand `Array.from(TABLE)`/`structuredClone(TABLE)` does not start
+#   with the table's own name (it starts with `Array`/`structuredClone`), so
+#   resolves_to_table_read never matches it at all, and it is scanned as its
+#   own (non-table) operand, which for a bare call expression with no
+#   array/object literal in it currently finds nothing; a same-file wrapper
+#   function that returns a table unchanged (`function getBackup() { return
+#   FALLBACK_ROWS; }`) is invisible to a purely lexical/regex scanner; and a
+#   deliberately narrow one from resolves_to_table_read's DETECTION side
+#   (never widen this to close it -- see the two-rule split above): reading
+#   exactly ONE fabricated row back out of a table (`TABLE[i]`, `TABLE.find(
+#   ...)`, `TABLE.at(i)`) is NOT caught, matching the honest
+#   ElementIndexReadHonest/FindReadHonest shapes -- a single invented row
+#   rendered on its own is the same class of gap as the useState-seed and
+#   render-local-.map() gaps below, not a new one this rework should close
+#   preemptively. Two more from the two-rule split's own narrowness, real
+#   today, both failing LOUD (a P7 FAIL on this file) rather than silently:
+#   the ternary SIBLING exemption (is_narrowing_self_derivation) accepts only
+#   `.slice(a, b)`/`[i]`, so `showAll ? T : T.filter(p => !p.archived)` is
+#   FLAGGED even though it is an honest narrowing-by-filter of the same
+#   table, not a live-vs-fabricated choice; and DETECTION's own chain walk
+#   will flag an HONEST config table used behind an array-returning method
+#   (`selected ?? TABS.map(t => t.id)`) exactly the same as a fabricated one,
+#   since table_is_fabricated_rows is structural, never content-aware beyond
+#   "is every row hand-typed". Neither is exercised anywhere in the real repo
+#   today (moat run confirms P7 clean on this arm); upgrade the sibling
+#   allowlist or add a config-table carve-out only if review finds a real
+#   instance, matching the standing rule above.
 FALLBACK_ARR = re.compile(r'(?:\|\||\?\?)\s*\[')
 TIMER_LIKE = re.compile(r'^(?:setTimeout|setInterval|setImmediate|setAttribute|setItem|setProperty)$')
 ARRAY_OF = re.compile(r'\bArray\.(of|from)\s*\(')
 MODULE_DECL = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:const|let|var)\s', re.M)
 DECL_ARR = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
+DECL_MODULE_INIT = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*([\[{])')
 THIS_ARR = re.compile(r'\bthis\.([A-Za-z_$][\w$]*)\s*(?::[^=;{}]*)?=(?![=>])\s*\[')
 FLOWS_TO_STATE_TMPL = (r'\b(?:set[A-Z]\w*|useState)\s*(?:<[^()]*?>)?\s*\(\s*(?:\(\s*\)\s*=>\s*)?'
                        r'{name}\s*[,)]|\bthis\.\w+\s*=\s*{name}\b')
@@ -808,11 +902,71 @@ def obj_pairs(o):
 def whole_file_findings(s):
     """(line, message) for rules 6-9; nested arrays inside a hit are not re-reported."""
     out, spans = [], []
-    def add_rows(i, msg):
+    # Built once, up front, so the FALLBACK_ARR/TERNARY inline-array checks
+    # below (not only the later module-table-fallback block) can resolve a
+    # `[...NAME]` spread element back to a known column-0 table's own
+    # fabrication status (BACKLOG 125 B-5 rework, reviewer 1 finding 4:
+    # `rows || [...BACKUP_ROWS3]` -- a spread inside a literal array failed
+    # plain is_literal() and was silently skipped).
+    module_tables = {}
+    for m in DECL_MODULE_INIT.finditer(s):
+        name, opener = m.group(1), m.group(2)
+        line_start = s.rfind('\n', 0, m.start()) + 1
+        if not MODULE_DECL.match(s, line_start):
+            continue
+        j = close_of(s, m.end() - 1)
+        if j < 0:
+            continue
+        module_tables[name] = (opener, m.end() - 1, j)
+
+    def table_is_fabricated_rows(name):
+        opener, i, j = module_tables[name]
+        return opener == '[' and literal_rows(s[i:j + 1])
+
+    def literal_rows_resolved(arr):
+        """Like literal_rows(arr), but a spread element that names a known
+        column-0 table (`[...FALLBACK_ROWS]`, `[...FALLBACK_ROWS, extra]` --
+        `extra` itself must still be a plain literal element for the array to
+        qualify, exactly like any other element in literal_rows()) resolves
+        to THAT table's own fabrication status instead of failing
+        is_literal() outright and being silently skipped: every element must
+        be a hand-typed literal OR a spread of a column-0 table whose OWN
+        content is fabricated rows (table_is_fabricated_rows -- the same
+        structural test MODULE_TABLE_FALLBACK already applies to a bare
+        `x || NAME`). This is purely structural, by table CONTENT, never by
+        NAME containing sample/mock/demo/fake/placeholder: `x || [...
+        DEFAULT_PROVIDERS]` DOES qualify (and is flagged) exactly because
+        DEFAULT_PROVIDERS' own rows are hand-typed literals, the identical
+        reasoning a bare `x || DEFAULT_PROVIDERS` already uses.
+        This function MUST stay gated to the fallback/ternary call sites
+        below (via add_rows(..., spread=True)), never applied at every
+        add_rows call site: doing so unconditionally would ALSO fire inside
+        the useState/setter/catch/decl arms, wrongly flagging the ordinary,
+        non-fallback shape `useState([...DEFAULT_PROVIDERS])` (a named
+        module-level table is a negative control when it seeds useState,
+        spread or not, matching the existing ASSIGN_ARR/DECL_ARR exemption
+        for a bare `useState(DEFAULT_PROVIDERS)`). See
+        DefaultProvidersSpreadHonest.tsx below, the fixture pinning this. The
+        distinction is NOT about whether the table is honest -- it is about
+        whether the call
+        site is itself a fallback/ternary carrying live-vs-static-data
+        semantics, which useState-seeding is not."""
+        parts = split_top(arr[1:-1])
+        if not any(p.startswith('{') or p.startswith('...') for p in parts):
+            return False
+        for p in parts:
+            if p.startswith('...'):
+                name = p[3:].strip()
+                if not (name in module_tables and table_is_fabricated_rows(name)):
+                    return False
+            elif not is_literal(p):
+                return False
+        return True
+    def add_rows(i, msg, spread=False):
         j = close_of(s, i)
         if j < 0 or any(a <= i <= b for a, b in spans):
             return
-        if literal_rows(s[i:j + 1]):
+        if literal_rows(s[i:j + 1]) or (spread and literal_rows_resolved(s[i:j + 1])):
             spans.append((i, j)); out.append((line_of(s, i), msg))
     def add_rows_call(i, j, msg):
         """Like add_rows, but (i, j) is a paren span already known to be
@@ -875,7 +1029,7 @@ def whole_file_findings(s):
     #     catch body. Added after the arms above so their messages and spans
     #     win the dedupe in add_rows() when both match the same array.
     for m in FALLBACK_ARR.finditer(s):
-        add_rows(m.end() - 1, 'literal sample rows used as a ||/?? fallback')
+        add_rows(m.end() - 1, 'literal sample rows used as a ||/?? fallback', spread=True)
     for m in re.finditer(r'(?<!\?)\?(?![.?:])', s):
         c = ternary_colon_of(s, m.start())
         if c < 0:
@@ -887,9 +1041,9 @@ def whole_file_findings(s):
         colon_branch_strip = colon_raw.lstrip()
         cstart = c + 1 + (len(colon_raw) - len(colon_branch_strip))
         if e < len(s) and s[e] == '[' and not is_literal(colon_raw[:expr_end(colon_raw)]):
-            add_rows(e, 'literal sample rows in a ternary branch')
+            add_rows(e, 'literal sample rows in a ternary branch', spread=True)
         if cstart < len(s) and s[cstart] == '[' and not is_literal(q_branch):
-            add_rows(cstart, 'literal sample rows in a ternary branch')
+            add_rows(cstart, 'literal sample rows in a ternary branch', spread=True)
     for m in DECL_ARR.finditer(s):
         name = m.group(1)
         line_start = s.rfind('\n', 0, m.start()) + 1
@@ -897,6 +1051,243 @@ def whole_file_findings(s):
             continue  # named module-level table (DEFAULT_PROVIDERS et al.), a negative control
         if re.search(FLOWS_TO_STATE_TMPL.format(name=re.escape(name)), s):
             add_rows(m.end() - 1, 'literal sample rows assigned to ' + name)
+    # --- module-level table used as a ||/??/ternary fallback (BACKLOG 125 B-5)
+    # The ASSIGN_ARR exemption above treats every column-0 `const NAME = [...]`
+    # as static UI config. That is right for a table that is just referenced
+    # (DEFAULT_PROVIDERS passed to useState), but a table used as the FALLBACK
+    # arm of `x || NAME` / `x ?? NAME` or a ternary is structurally identical to
+    # the inline `x || [rows]` / `a ? x : [rows]` shapes FALLBACK_ARR and
+    # TERNARY already flag -- only the literal moved behind a name. Resolve
+    # each column-0 name to its initializer and apply the SAME literal-rows (or,
+    # for an object, rule 8's invented-stats) test the inline arms use, so
+    # catching this never depends on the name containing sample/mock/demo/fake/
+    # placeholder: a `FALLBACK_ROWS`/`DEFAULT_ROWS`/`BACKUP_DATA` table is
+    # caught the same way a `SAMPLE_ROWS` one already is.
+    # (module_tables and table_is_fabricated_rows are built once, at the top
+    # of whole_file_findings, and reused here -- see the comment there.)
+
+    # A bounded narrowing read: `NAME.slice(<start>, <end>)` (BOTH indices
+    # required -- a one-argument `.slice(k)` is a full, unbounded copy from k
+    # to the end, the exact defensive-copy shape this must NOT exempt) or
+    # `NAME[<int>]`, anchored end to end (fullmatch). An allowlist, not a
+    # blacklist on `.concat`/spread: a blacklist would still miss
+    # `.map(() => fake)` or `.flat()`, so only these two provably-narrowing
+    # shapes qualify. Reviewer 1's four bypasses were exactly the shapes a
+    # prefix-test-plus-blacklist missed (`.concat()`, an open-ended
+    # `.slice(k)`, `[...NAME]`); this allowlist has no additive or unbounded
+    # member to miss. BOTH slice indices are required for exactly this
+    # reason: an optional end index would silently re-admit `.slice(k)` as
+    # "narrowing", though it has no end index and a two-argument
+    # `.slice(start, end)` is the only bounded form -- see
+    # UnboundedSliceFallback.tsx below, the fixture pinning this.
+    NARROW_SUFFIX = re.compile(
+        r'^\.slice\(\s*-?\d+\s*,\s*-?\d+\s*\)$'
+        r'|^\[\s*-?\d+\s*\]$'
+    )
+    def is_narrowing_self_derivation(branch, name):
+        """True when branch is exactly `name` followed by one bounded
+        narrowing suffix (`RECENT_CHANGES.slice(0, 2)`, `TABLE[0]`) -- never a
+        bare prefix test, so `NAME.concat(...)`, `NAME.slice(k)` (no end
+        index) and any other suffix are NOT self-derivation and fall through
+        to being scanned as their own fallback/ternary operand."""
+        b = branch.strip()
+        if b == name:
+            return True
+        if not (b.startswith(name) and len(b) > len(name)):
+            return False
+        return bool(NARROW_SUFFIX.match(b[len(name):]))
+
+    def resolved_is_literal(branch, other_name=None):
+        """Like is_exempting_sibling(branch) (S-30's null/undefined/''-excluding
+        literal test, not bare is_literal -- so this arm never reintroduces
+        S-30's exact ternary-against-null bypass at its OWN new call site), but
+        a bare reference to a known column-0 table counts as literal too
+        (mirrors advisorOpts: choosing between two static tables is UI config,
+        not a live-vs-fabricated fallback), and so does a BOUNDED NARROWING
+        read of the SAME table the other branch names (`expanded ?
+        RECENT_CHANGES : RECENT_CHANGES.slice(0, 2)` picks how much of one
+        static list to show, never a live-vs-fabricated fallback) -- an
+        additive or unbounded derivation of that same table does NOT qualify
+        here, matching is_narrowing_self_derivation exactly."""
+        b = branch.strip()
+        if b in module_tables:
+            return True
+        if other_name and is_narrowing_self_derivation(b, other_name):
+            return True
+        return is_exempting_sibling(b)
+
+    def table_is_invented_stats(name):
+        opener, i, j = module_tables[name]
+        if opener != '{':
+            return False
+        pairs = obj_pairs(s[i:j + 1])
+        if pairs and any(STAT_KEY.match(k) and NUMVAL.match(v) for k, v in pairs):
+            return True
+        if pairs and len(pairs) >= 2:
+            rows = [obj_pairs(v) if v.startswith('{') and close_of(v, 0) == len(v) - 1 else None for _, v in pairs]
+            if all(r and all(STAT_KEY.match(k) and NUMVAL.match(v) for k, v in r) for r in rows):
+                return True
+        return False
+
+    def flag_table_fallback(name, where):
+        if name not in module_tables or any(a <= where <= b for a, b in spans):
+            return
+        if table_is_fabricated_rows(name):
+            spans.append((where, where))
+            out.append((line_of(s, where), f"module-level table '{name}' (fabricated rows) used as a fallback"))
+        elif table_is_invented_stats(name):
+            spans.append((where, where))
+            out.append((line_of(s, where), f"module-level table '{name}' (invented stats) used as a fallback"))
+
+    if module_tables:
+        name_alt = '|'.join(re.escape(n) for n in sorted(module_tables, key=len, reverse=True))
+        # After the name, the REST of the operand must still carry the
+        # table's row data, not merely read a scalar or one element out of it
+        # -- `PERMS.length`, `TABS[0]`, `OPTS.find(o => o.on)` all resolve to
+        # a NUMBER, ONE ROW or ONE ROW-OR-UNDEFINED, never the fabricated
+        # array, and must not read as "the table used as a fallback". A
+        # WALKER (not a single regex) consumes zero or more `.method(...)`/
+        # `?.method(...)` calls whose method name is array-returning
+        # (ARRAY_METHODS), each with its own BALANCED parens via close_of --
+        # a single `[^()]*` class inside one regex cannot express "balanced",
+        # so it silently stopped at the first nested `(` in an arrow-function
+        # argument (`.filter((r) => r.ok)`) or after the first call in a
+        # chain (`.slice(0).reverse()`), UNDER-matching and leaving both
+        # shapes unresolved -- reviewer-class bypass, the same "spelling of
+        # the read defeats detection" this whole arm exists to close.
+        # `[<int>]` deliberately does NOT chain-walk here: a bare index read
+        # (`sel || TABS[0]`) is picking ONE row, honest and common (the same
+        # reasoning FindReadHonest/ElementIndexReadHonest use for `.find()`/
+        # `[i].x`), so `[<int>]` is NOT accepted by this walker at all -- it
+        # only ever exempts as a bounded NARROWING inside
+        # is_narrowing_self_derivation (the ternary-sibling test), never as a
+        # "the operand carries the table's data" read here. A scalar/property
+        # suffix (`.length`, `?.length`, `.find(...)`, a mismatched longer
+        # identifier like `PERMSET`) does not chain-walk either, so text like
+        # `PERMS.length` or `PERMSET` never resolves to a table at all.
+        ARRAY_METHODS = frozenset((
+            'slice', 'concat', 'filter', 'map', 'flat', 'flatMap',
+            'sort', 'reverse', 'toSorted', 'toReversed',
+        ))
+        CHAIN_CALL = re.compile(r'\s*(\??\.)\s*([A-Za-z_$][\w$]*)\s*\(')
+        def chain_end(t, i):
+            """t[i:] follows a resolved table name. Consume zero or more
+            `.method(...)`/`?.method(...)` calls whose method is array-
+            returning, each argument list matched by its own balanced-paren
+            span (close_of), and return the index just past the LAST such
+            call (i itself if there is none). Returns -1 the first time a
+            call name is NOT in ARRAY_METHODS -- that call could return
+            anything (a scalar, one row, undefined), so the walk stops and
+            the caller must treat the whole operand as unresolved, never as
+            "resolves to the table only up to here"."""
+            while True:
+                m = CHAIN_CALL.match(t, i)
+                if not m:
+                    return i
+                if m.group(2) not in ARRAY_METHODS:
+                    return -1
+                paren = m.end() - 1
+                j = close_of(t, paren)
+                if j < 0:
+                    return -1
+                i = j + 1
+        def resolves_to_table_read(text):
+            """True when text is a known table name followed by a chain of
+            zero or more array-returning calls and NOTHING else (chain_end
+            must land exactly at len(text)) -- the broad "does this operand
+            carry the table's data" test used at the ||/?? and ternary match
+            sites. Returns the matched name or None."""
+            m = re.match(r'^(' + name_alt + r')(?![\w$])', text)
+            if not m:
+                return None
+            end = chain_end(text, m.end())
+            return m.group(1) if end == len(text) else None
+        def unwrap(text):
+            """Strip one layer of surrounding parens and a trailing
+            `as <Type>`, so `(BACKUP_ROWS)` and `(BACKUP_ROWS as Row[])`
+            resolve to the table the same as a bare `BACKUP_ROWS` -- reviewer-
+            class bypass: parenthesizing or type-asserting a fallback operand
+            must not be a way to dodge detection. Only ONE layer: matches
+            is_literal's own `as const` handling in spirit, and a
+            double-wrapped `((NAME))` is already vanishingly unlikely."""
+            t = text.strip()
+            t = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', t).strip()
+            if t[:1] == '(' and close_of(t, 0) == len(t) - 1:
+                t = t[1:-1].strip()
+                t = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', t).strip()
+            return t
+        # `||`/`??` operand: find every occurrence of a known table name right
+        # after the operator (optionally parenthesized), reject it outright
+        # via an inline name-boundary lookahead if it is really a longer
+        # identifier, walk its call chain with chain_end, and resolve to the
+        # table ONLY when that chain lands exactly on an operand boundary --
+        # end of string, a closing bracket/brace/paren/comma/semicolon, or
+        # another `||`/`??`/`&&`/`?` (ternary/logical continuation). This is
+        # an ALLOWLIST of terminators, not a blacklist of what must not
+        # follow. Two independent guards, each sufficient alone, reject
+        # `PERMS.length`/`PERMS?.length`/`PERMSET`: the inline name-boundary
+        # lookahead `(?![\w$])` right below never lets `PERMS` match as a
+        # prefix of the longer identifier `PERMSET` in the first place; and
+        # even where the name DOES match cleanly (`PERMS.length`,
+        # `PERMS?.length`), chain_end sees `.`/`?.` with no following `(`,
+        # so it returns i UNCHANGED (not -1 -- there is no call to reject,
+        # only nothing to consume), and TERMINATOR then refuses to match at
+        # that position because the character right there is `.`/`?`, not a
+        # boundary. `rows ?? BACKUP_X.filter((r) => r.ok)` and
+        # `rows ?? BACKUP_Y.slice(0).reverse()` both resolve, because
+        # chain_end's balanced-paren walk consumes the whole call (arrow
+        # function body and all) and the chained second call in turn, landing
+        # exactly on the closing `)`/`;` that TERMINATOR accepts.
+        # [ \t]*, not \s*: \s* also matches a NEWLINE, so it would swallow a
+        # missing-semicolon line break and let `$` match nothing right after
+        # it (there is no re.M flag here) -- `const data = rows || BACKUP_Q`
+        # on its own line, with more code below and no semicolon, would then
+        # resolve as "ends the operand" when it does not. The explicit
+        # `\r?\n(?!\s*(?:\??\.|\[))` alternative treats a newline as a
+        # terminator ONLY when nothing that continues the chain follows it
+        # (a bare newline ends the operand; `\n  .slice(0)` continues it, so
+        # chain_end must get the chance to consume that line first).
+        TERMINATOR = re.compile(r'[ \t]*(?:[)\]},;:]|\|\||\?\?|&&|\?(?![.?])|\bas\b|\r?\n(?!\s*(?:\??\.|\[))|$)')
+        for m in re.finditer(r'(?:\|\||\?\?)\s*(\(*)(' + name_alt + r')', s):
+            start = m.start(2)
+            name_m = re.match(r'^(' + name_alt + r')(?![\w$])', s[start:])
+            if not name_m:
+                continue
+            end = chain_end(s, start + name_m.end())
+            if end < 0 or not TERMINATOR.match(s, end):
+                continue
+            flag_table_fallback(name_m.group(1), start)
+        for m in re.finditer(r'(?<!\?)\?(?![.?:])', s):
+            c = ternary_colon_of(s, m.start())
+            if c < 0:
+                continue
+            q_raw = s[m.end():c]
+            q_branch = unwrap(q_raw)
+            colon_raw = s[c + 1:]
+            colon_branch_strip = colon_raw.lstrip()
+            colon_branch = unwrap(colon_branch_strip[:expr_end(colon_branch_strip)])
+            cstart = c + 1 + (len(colon_raw) - len(colon_branch_strip))
+            q_off = m.end() + (len(q_raw) - len(q_raw.lstrip()))
+            # Resolve each branch back to a table name even with a trailing
+            # array-returning call chain (`live ? live : BACKUP_ROWS2.slice(0)`,
+            # `live ? live : BACKUP_X.filter((r) => r.ok)` -- reviewer 1's
+            # bypass of the old `^NAME$`-only match, and the round-3 chain gap)
+            # or parens/`as Type` (unwrap() above) -- but NOT a scalar/element
+            # read (`live ? live : TABS[0]`, `live ? live : TABS.length`),
+            # which resolves_to_table_read rejects because chain_end cannot
+            # reach the end of the (already extracted, whole) branch text.
+            # is_narrowing_self_derivation still decides, inside
+            # resolved_is_literal, whether a SUFFIXED form on the OTHER
+            # branch is exempt; here we only need to find which table the
+            # flagged branch names. q_off/cstart still point at the RAW
+            # (unstripped) offsets, since that is where the finding is
+            # reported and where flag_table_fallback's span-dedupe operates.
+            q_name = resolves_to_table_read(q_branch)
+            if q_name and not resolved_is_literal(colon_branch, q_name):
+                flag_table_fallback(q_name, q_off)
+            colon_name = resolves_to_table_read(colon_branch)
+            if colon_name and not resolved_is_literal(q_branch, colon_name):
+                flag_table_fallback(colon_name, cstart)
     for m in THIS_ARR.finditer(s):
         add_rows(m.end() - 1, 'literal sample rows assigned to this.' + m.group(1))
     for m in SETTER.finditer(s):
@@ -1253,6 +1644,320 @@ export function DL() {
   return null;
 }
 TSX
+    # BACKLOG 125 B-5: a module-level named table used as a ||/ternary fallback
+    # bypassed the ASSIGN_ARR module-level exemption as long as its name avoided
+    # sample/mock/demo/fake/placeholder. FALLBACK_ROWS, DEFAULT_ROWS and
+    # BACKUP_DATA are exactly such names; none matches rules 5/7's keyword list,
+    # so this must be caught by structure (a module-level literal array of
+    # object rows used as a fallback), not by name.
+    cat > "$d/src/components/ModuleTableFallback.tsx" <<'TSX'
+const FALLBACK_ROWS = [
+  { id: 'a1', action: 'Deployed to production', user: 'Team Admin', timestamp: '2 hours ago' },
+  { id: 'a2', action: 'Invited viewer@example.com', user: 'Team Admin', timestamp: '1 day ago' },
+];
+
+export function MF({ live }) {
+  const data = live ? live : FALLBACK_ROWS;
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/ModuleTableOrFallback.tsx" <<'TSX'
+const BACKUP_DATA = [
+  { id: 'a1', action: 'Deployed to production', user: 'Team Admin', timestamp: '2 hours ago' },
+];
+
+export function MO({ rows }) {
+  const data = rows || BACKUP_DATA;
+  return <b>{data.length}</b>;
+}
+TSX
+    # BACKLOG 125 B-5 REWORK (S-29 2/2 CONCERN): reviewer 1's four live
+    # bypasses of the first round's MODULE_TABLE_FALLBACK arm, each isolated
+    # to exactly one gap so deleting any one fix flips exactly its own
+    # fixture. Names avoid sample/mock/demo/fake/placeholder on purpose --
+    # rules 5/7's keyword list must never be why these are caught.
+    #   1. .concat() is additive, not a narrowing read: branch_derives_from's
+    #      old bare prefix test wrongly treated it as "just resolves to the
+    #      table" and skipped it entirely.
+    cat > "$d/src/components/ConcatDerivedFallback.tsx" <<'TSX'
+const RECENT = [
+  { id: 'r1', name: 'Real Row' },
+];
+
+export function CC({ expanded }) {
+  const data = expanded ? RECENT : RECENT.concat([{ id: 'f1', name: 'Invented Row' }]);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   2. the old ||/?? regex's lookahead `(?!\s*[.\[(])` excluded ANY name
+    #      followed by `.`, so a suffixed read never reached detection at all.
+    cat > "$d/src/components/OrFallbackWithMethod.tsx" <<'TSX'
+const BACKUP_ROWS = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function OM({ rows }) {
+  const data = rows ?? BACKUP_ROWS.slice();
+  return <b>{data.length}</b>;
+}
+TSX
+    #   3. the ternary arm's old `^NAME$`-only match missed any suffix, so a
+    #      defensive-copy `.slice(0)` on the fallback branch defeated it.
+    cat > "$d/src/components/TernarySliceCopyFallback.tsx" <<'TSX'
+const BACKUP_ROWS2 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function TS({ live }) {
+  const data = live ? live : BACKUP_ROWS2.slice(0);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   4. a spread element inside an array literal failed plain is_literal()
+    #      (spread is never hand-typed data) and was silently skipped, even
+    #      when the spread names a table that is itself fabricated rows.
+    cat > "$d/src/components/SpreadOfTableFallback.tsx" <<'TSX'
+const BACKUP_ROWS3 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function SO({ rows }) {
+  const data = rows || [...BACKUP_ROWS3];
+  return <b>{data.length}</b>;
+}
+TSX
+    # Same gap (a spread of a fabricated table inside an array literal), but
+    # at the TERNARY add_rows() call sites instead of the ||/?? one -- both
+    # sites pass spread=True and must independently exercise it; without this
+    # fixture, dropping spread=True from only the ternary calls would not be
+    # caught by any RED here.
+    cat > "$d/src/components/SpreadOfTableTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS3B = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function ST({ live }) {
+  const data = live ? live : [...BACKUP_ROWS3B];
+  return <b>{data.length}</b>;
+}
+TSX
+    # Reviewer 2's null-ternary finding: this arm's OWN new resolved_is_literal
+    # fell through to plain is_literal() for the null branch instead of
+    # routing through is_exempting_sibling (S-30/BACKLOG 125 B-6's
+    # null/undefined/''-excluding helper) -- a third live copy of S-30's exact
+    # bug, at a new call site S-30 never touches.
+    cat > "$d/src/components/NullTernaryTableFallback.tsx" <<'TSX'
+const BACKUP_ROWS4 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function NU({ loading }) {
+  const data = loading ? null : BACKUP_ROWS4;
+  return <b>{data ? data.length : 0}</b>;
+}
+TSX
+    # BACKLOG 125 B-5 REWORK ROUND 2: three more gaps, each in a fix that was
+    # supposed to close a reviewer-1 bypass but left its own narrower version
+    # of the same class open.
+    #   1. NARROW_SUFFIX originally made .slice()'s end index OPTIONAL, so a
+    #      one-argument `.slice(0)` (a full, unbounded defensive copy) wrongly
+    #      counted as "bounded narrowing" and was exempted. Only a required
+    #      two-argument slice may exempt; this one-argument form must still
+    #      be caught as its own fallback operand.
+    cat > "$d/src/components/UnboundedSliceFallback.tsx" <<'TSX'
+const BACKUP_T = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function UT({ expanded }) {
+  const data = expanded ? BACKUP_T : BACKUP_T.slice(0);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   2. a `(`-wrapped or `as Type`-asserted fallback/ternary operand
+    #      (`rows ?? (BACKUP_ROWS5)`) was not resolved to the table at all --
+    #      the ||/?? regex required the name immediately after the operator,
+    #      and the ternary branches were never unwrapped before matching.
+    cat > "$d/src/components/ParenWrappedFallback.tsx" <<'TSX'
+const BACKUP_ROWS5 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PF({ rows }) {
+  const data = rows ?? (BACKUP_ROWS5);
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/ParenAsTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS6 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PT({ live }) {
+  const data = live ? live : (BACKUP_ROWS6 as Row[]);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   3. a single-regex suffix match cannot express "balanced parens", so
+    #      it under-matches an arrow-function call argument and a multi-call
+    #      chain, leaving both unresolved. chain_end (a real walker, not a
+    #      regex) fixes this.
+    cat > "$d/src/components/ArrowFilterChainFallback.tsx" <<'TSX'
+const BACKUP_X = [
+  { id: 'b1', ok: true },
+];
+
+export function AF({ rows }) {
+  const data = rows ?? BACKUP_X.filter((r) => r.ok);
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/SliceReverseChainFallback.tsx" <<'TSX'
+const BACKUP_Y = [
+  { id: 'b1', ok: true },
+];
+
+export function SR({ rows }) {
+  const data = rows ?? BACKUP_Y.slice(0).reverse();
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/ArrowFilterChainTernaryFallback.tsx" <<'TSX'
+const BACKUP_Z = [
+  { id: 'b1', ok: true },
+];
+
+export function AT({ live }) {
+  const data = live ? live : BACKUP_Z.filter((r) => r.ok);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   4. TERMINATOR's original `\s*` also matches a newline, so a missing-
+    #      semicolon fallback statement (ASI, valid JS) followed by more code
+    #      on the next line falsely resolved as ending the operand right
+    #      there. `[ \t]*` plus an explicit newline-terminator alternative
+    #      (only when nothing that continues the chain follows the newline)
+    #      fixes this without breaking a real multi-line `.slice(0)\n
+    #      .reverse()` chain.
+    cat > "$d/src/components/NewlineNoSemicolonFallback.tsx" <<'TSX'
+const BACKUP_Q = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function NL({ rows }) {
+  const data = rows || BACKUP_Q
+  const other = 1
+  return <b>{data.length}{other}</b>;
+}
+TSX
+    # Negative control for the round-1 rework's own bug: the spread-of-table
+    # resolution added to add_rows() was applied UNCONDITIONALLY (every call
+    # site: useState/setter/catch/decl, not only the fallback/ternary sites),
+    # so a spread of an HONEST named table (DEFAULT_PROVIDERS -- the same
+    # shape as DefaultProvidersHonest.tsx above, just spread instead of
+    # passed bare) was wrongly flagged. Fixed by gating the spread-resolution
+    # on a `spread=True` flag passed only at FALLBACK_ARR and the two inline
+    # ternary add_rows() call sites.
+    cat > "$d/src/components/DefaultProvidersSpreadHonest.tsx" <<'TSX'
+const DEFAULT_PROVIDERS2 = [
+  { id: 'claude', name: 'Claude', secretKey: 'ANTHROPIC_API_KEY', model: 'claude-opus-4-7', fallbackOrder: 1, enabled: true },
+];
+
+export function SP() {
+  const [providers] = useState([...DEFAULT_PROVIDERS2]);
+  return providers;
+}
+TSX
+    # Negative controls for resolves_to_table_read's DETECTION rule: a
+    # scalar/element read off a column-0 table must NOT read as "table used
+    # as a fallback" -- only a read that carries the table's actual row data
+    # forward (a bare reference or a chain of array-returning calls) may.
+    # `.length` is a number, `[0]`/`[0].id` is one row (or one field of it),
+    # `.find(...)` is one row or undefined; none of these is "the fabricated
+    # array", so all four must stay clean even though each names a table
+    # whose OWN rows are fabricated.
+    cat > "$d/src/components/ScalarLengthReadHonest.tsx" <<'TSX'
+const PERMS = [
+  { id: 'project.create', label: 'Create Projects', description: 'Create new projects' },
+  { id: 'project.edit', label: 'Edit Projects', description: 'Modify project files and settings' },
+];
+
+export function PL({ count }) {
+  const n = count || PERMS.length;
+  return <b>{n}</b>;
+}
+TSX
+    cat > "$d/src/components/ElementIndexReadHonest.tsx" <<'TSX'
+const TABS2 = [
+  { id: 'a', label: 'A' },
+  { id: 'b', label: 'B' },
+];
+
+export function EI({ sel }) {
+  const id = sel || TABS2[0].id;
+  return <b>{id}</b>;
+}
+TSX
+    # A BARE index read (no further .field access) is the same one-row read
+    # as TABS2[0].id above and must stay just as clean: `[<int>]` is
+    # deliberately excluded from resolves_to_table_read's DETECTION allowlist
+    # entirely (it is a bounded-narrowing exemption ONLY, inside
+    # is_narrowing_self_derivation, never a "carries the table's data" read).
+    cat > "$d/src/components/BareIndexPickHonest.tsx" <<'TSX'
+const TABS3 = [
+  { id: 'a', label: 'A' },
+  { id: 'b', label: 'B' },
+];
+
+export function IP({ sel }) {
+  const active = sel || TABS3[0];
+  return <b>{active.id}</b>;
+}
+TSX
+    cat > "$d/src/components/FindReadHonest.tsx" <<'TSX'
+const OPTS = [
+  { id: 'a', on: true },
+  { id: 'b', on: false },
+];
+
+export function FR({ pick }) {
+  const d = pick ? pick : OPTS.find(o => o.on);
+  return <b>{d}</b>;
+}
+TSX
+    # Negative controls for the ||/?? match site: a DIFFERENT, longer
+    # identifier that happens to start with a table's name must never be
+    # mistaken for that table, and an optional-chained scalar read
+    # (`?.length`) must stay just as clean as the plain `.length` read above
+    # (`?.` is not a valid terminator; a bare `?` alone is, as the ternary
+    # operator). PERMSET must share PERMS's exact name for this fixture to
+    # test anything at all -- an unrelated table name here would pass
+    # regardless of whether the boundary check exists, since a name match
+    # never starts. Both the inline name-boundary lookahead (rejects PERMSET
+    # from ever matching as PERMS) and the TERMINATOR check (rejects `.`/`?.`
+    # right after a genuine match) independently refuse this fixture;
+    # removing either ALONE leaves the other still catching it, only
+    # removing BOTH flips this to a false positive.
+    cat > "$d/src/components/DifferentIdentifierPrefixHonest.tsx" <<'TSX'
+const PERMS = [
+  { id: 'p1', label: 'A' },
+];
+
+export function DP({ x, PERMSET }) {
+  const data = x || PERMSET;
+  return <b>{data}</b>;
+}
+TSX
+    cat > "$d/src/components/OptionalChainLengthHonest.tsx" <<'TSX'
+const PERMS3 = [
+  { id: 'p1', label: 'A' },
+];
+
+export function OC({ x }) {
+  const data = x || PERMS3?.length;
+  return <b>{data}</b>;
+}
+TSX
     # Negative controls for the rule 6 extension: a ternary between two
     # literals (advisorOpts, real shape at loki-session-control.js:471), a
     # render-local literal list mapped straight into markup with no setter, a
@@ -1329,6 +2034,31 @@ export function TM() {
   return null;
 }
 TSX
+    # BACKLOG 125 B-5 negative controls: a real named module-level table used
+    # to pick how much of ITSELF to show (real shape at
+    # web-app/src/components/ChangelogWidget.tsx:43) is UI truncation, not a
+    # live-vs-fabricated fallback, and must stay clean; a named config-defaults
+    # object used as a ||-fallback is the honest twin of HonestRows' inline
+    # `opts || { retries: 3, timeout: 30 }` and must stay clean too.
+    cat > "$d/src/components/ModuleTableSelfDerivedHonest.tsx" <<'TSX'
+const RECENT_CHANGES = [
+  { version: '1.0', date: 'x', features: ['a'] },
+];
+
+export function CW() {
+  const [expanded] = useState(false);
+  const visible = expanded ? RECENT_CHANGES : RECENT_CHANGES.slice(0, 2);
+  return <b>{visible.length}</b>;
+}
+TSX
+    cat > "$d/src/components/ModuleTableDefaultOptsHonest.tsx" <<'TSX'
+const DEFAULT_OPTS = { retries: 3, timeout: 30 };
+
+export function DO({ opts }) {
+  const o = opts || DEFAULT_OPTS;
+  return <b>{o.retries}</b>;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -1364,6 +2094,21 @@ ArrayFromOnly.js:3|literal sample rows via Array.from()
 DeclPlainSetter.tsx:2|literal sample rows assigned to rows
 ThisFlowOnly.js:3|literal sample rows assigned to rows
 DeclLazyUseState.tsx:2|literal sample rows assigned to items
+ModuleTableFallback.tsx:7|module-level table 'FALLBACK_ROWS' (fabricated rows) used as a fallback
+ModuleTableOrFallback.tsx:6|module-level table 'BACKUP_DATA' (fabricated rows) used as a fallback
+ConcatDerivedFallback.tsx:6|module-level table 'RECENT' (fabricated rows) used as a fallback
+OrFallbackWithMethod.tsx:6|module-level table 'BACKUP_ROWS' (fabricated rows) used as a fallback
+TernarySliceCopyFallback.tsx:6|module-level table 'BACKUP_ROWS2' (fabricated rows) used as a fallback
+SpreadOfTableFallback.tsx:6|literal sample rows used as a ||/?? fallback
+SpreadOfTableTernaryFallback.tsx:6|literal sample rows in a ternary branch
+NullTernaryTableFallback.tsx:6|module-level table 'BACKUP_ROWS4' (fabricated rows) used as a fallback
+UnboundedSliceFallback.tsx:6|module-level table 'BACKUP_T' (fabricated rows) used as a fallback
+ParenWrappedFallback.tsx:6|module-level table 'BACKUP_ROWS5' (fabricated rows) used as a fallback
+ParenAsTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS6' (fabricated rows) used as a fallback
+ArrowFilterChainFallback.tsx:6|module-level table 'BACKUP_X' (fabricated rows) used as a fallback
+SliceReverseChainFallback.tsx:6|module-level table 'BACKUP_Y' (fabricated rows) used as a fallback
+ArrowFilterChainTernaryFallback.tsx:6|module-level table 'BACKUP_Z' (fabricated rows) used as a fallback
+NewlineNoSemicolonFallback.tsx:6|module-level table 'BACKUP_Q' (fabricated rows) used as a fallback
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -1372,8 +2117,19 @@ EOF
         TernaryQBranch.tsx:1 DeclFlowsToState.tsx:1 DeclGenericUseState.tsx:1 \
         ThisArrOnly.js:1 SetterSpanOnly.tsx:1 ArrayFromOnly.js:1 DeclPlainSetter.tsx:1 \
         ThisFlowOnly.js:1 DeclLazyUseState.tsx:1 \
+        ModuleTableFallback.tsx:1 ModuleTableOrFallback.tsx:1 \
+        ConcatDerivedFallback.tsx:1 OrFallbackWithMethod.tsx:1 TernarySliceCopyFallback.tsx:1 \
+        SpreadOfTableFallback.tsx:1 NullTernaryTableFallback.tsx:1 \
+        UnboundedSliceFallback.tsx:1 ParenWrappedFallback.tsx:1 ParenAsTernaryFallback.tsx:1 \
+        SpreadOfTableTernaryFallback.tsx:1 \
+        ArrowFilterChainFallback.tsx:1 SliceReverseChainFallback.tsx:1 ArrowFilterChainTernaryFallback.tsx:1 \
+        NewlineNoSemicolonFallback.tsx:1 \
+        DefaultProvidersSpreadHonest.tsx:0 \
+        ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
+        BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
         AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
-        ModuleTablesHonest.tsx:0 TimerHonest.tsx:0; do
+        ModuleTablesHonest.tsx:0 TimerHonest.tsx:0 \
+        ModuleTableSelfDerivedHonest.tsx:0 ModuleTableDefaultOptsHonest.tsx:0; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
