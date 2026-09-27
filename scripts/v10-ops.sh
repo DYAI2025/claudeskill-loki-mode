@@ -53,12 +53,19 @@ Subcommands:
       tokens (ready building review review-blocked approved merged released
       blocked rejected parked) -- rejected before the file is touched, exit 2,
       so it can never carry an "@", "|", whitespace, or a newline into the
-      table. Reads and writes the file with no newline translation, so a
-      CRLF board keeps CRLF. Writes atomically (temp file + fsync + rename)
-      so a kill mid-write cannot leave BOARD.md empty. After the replace,
-      re-reads the file from disk and verifies every non-target line plus
-      the total line count are byte-identical to the pre-image; on any
-      mismatch it restores the original content and exits 3. A directory
+      table. The Status column is found by walking up to the nearest table
+      header and matching its "Status" label, never by scanning cell shapes
+      (a Branch/SHA cell like "main@abc123" can look just like
+      "<token>@<timestamp>"); the existing cell must already match
+      <known-token>@YYYY-MM-DDTHH:MMZ or the flip is refused, exit 2. Reads
+      and writes the file with no newline translation, so a CRLF board keeps
+      CRLF. Writes atomically (temp file + fsync + rename, permission bits
+      preserved) so a kill mid-write cannot leave BOARD.md empty, and
+      resolves symlinks first so a symlinked board edits its real target,
+      not the link. After the replace, re-reads the file from disk and
+      verifies every non-target line, the total line count, and that the
+      target row changed in exactly its Status cell, are all as expected; on
+      any mismatch it restores the original content and exits 3. A directory
       that refuses new files (a read-only board) is reported as a clean
       error, not a traceback. Default board-md-path: docs/v10/BOARD.md.
 
@@ -148,9 +155,16 @@ cmd_board_row_status() {
         return 2
     fi
     python3 -E -S -c '
-import sys, os, re, tempfile, datetime
+import sys, os, re, shutil, tempfile, datetime
 
 board, slice_id, new_token = sys.argv[1], sys.argv[2], sys.argv[3]
+known_tokens = sys.argv[4].split()
+
+# Resolve symlinks/relative components up front. Without this, replacing a
+# symlinked board.md would swap the LINK for a plain file and leave the real
+# target untouched, while every path used below (including the post-write
+# disk re-read) still reads the same resolved file and reports success.
+board = os.path.realpath(board)
 
 # newline="" disables newline translation on both read and write, so a CRLF
 # board keeps its CRLF bytes untouched instead of every line getting
@@ -180,22 +194,54 @@ if len(matches) > 1:
     sys.exit(2)
 
 idx = matches[0]
-row = lines[idx]
-cells = row.split("|")
 
-# Find the Status cell: the one matching "<token>@<timestamp>" (or, for a
-# never-yet-timestamped cell, just a bare lifecycle-token word). Never
-# assume a fixed column index -- column count varies by table (grandfathered
-# vs numbered slices).
-status_re = re.compile(r"^\s*[A-Za-z][A-Za-z_-]*(?:@\S+)?\s*$")
+# Locate the Status column via the nearest preceding markdown table header,
+# never by scanning cell SHAPES. A Branch/SHA cell can read "main@abc123"
+# (no space) -- indistinguishable by shape from "<token>@<timestamp>" -- so
+# shape-matching risks silently editing the wrong column. Column count and
+# order vary across the table layouts in BOARD.md, so the header is read fresh
+# for every call rather than assuming a fixed index.
+sep_re = re.compile(r"^\s*\|(?:\s*:?-+:?\s*\|)+\s*$")
+header_idx = None
+for i in range(idx - 1, -1, -1):
+    if i > 0 and sep_re.match(lines[i]):
+        header_idx = i - 1
+        break
+if header_idx is None:
+    print("board-row-status: could not locate a table header above the row "
+          "for " + slice_id, file=sys.stderr)
+    sys.exit(2)
+
+header_cells = lines[header_idx].split("|")
 status_idx = None
-for i, cell in enumerate(cells):
-    if "@" in cell and status_re.match(cell):
+for i, cell in enumerate(header_cells):
+    if cell.strip().lower() == "status":
         status_idx = i
         break
 if status_idx is None:
-    print("board-row-status: could not locate a Status cell (token@timestamp) "
-          "in row for " + slice_id, file=sys.stderr)
+    print("board-row-status: the table header above " + slice_id
+          + " has no Status column", file=sys.stderr)
+    sys.exit(2)
+
+row = lines[idx]
+cells = row.split("|")
+if status_idx >= len(cells):
+    print("board-row-status: row for " + slice_id + " has fewer columns "
+          "than its header -- refusing to guess", file=sys.stderr)
+    sys.exit(2)
+
+# The existing cell must already be exactly "<known-token>@<UTC timestamp>"
+# (the documented Status format in docs/v10/BOARD.md). Refusing anything else --
+# a bare word, a SHA-shaped cell that slipped past the header lookup, a row
+# that predates the format -- means an unexpected cell is never overwritten.
+current_status_re = re.compile(
+    r"^\s*(" + "|".join(re.escape(t) for t in known_tokens)
+    + r")@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\s*$"
+)
+if not current_status_re.match(cells[status_idx]):
+    print("board-row-status: the Status cell for " + slice_id
+          + " does not match <token>@YYYY-MM-DDTHH:MMZ -- refusing to edit "
+          "an unexpected cell: " + cells[status_idx].strip(), file=sys.stderr)
     sys.exit(2)
 
 timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
@@ -222,22 +268,33 @@ if os.environ.get("V10_OPS_TEST_CORRUPT_WRITE") == "1" and after_count > 1:
 # an empty BOARD.md. Writing to a fresh temp file also means a read-only
 # board.md itself is not what stands in the way; only a non-writable
 # directory is, and that is reported cleanly below instead of a traceback.
-board_dir = os.path.dirname(os.path.abspath(board)) or "."
-tmp_path = None
+board_dir = os.path.dirname(board) or "."
+
+def _atomic_write(content, prefix):
+    # mkstemp creates the temp file 0600 regardless of the board file real
+    # mode, and os.replace carries that mode straight onto the board -- so
+    # without copymode a 644 board.md silently becomes 600 on every write,
+    # including a restore. Shared by the main write and the restore path
+    # below so both preserve the actual permission bits of the board file.
+    fd, tmp_path = tempfile.mkstemp(prefix=prefix, dir=board_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.writelines(content)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copymode(board, tmp_path)
+        os.replace(tmp_path, board)
+    except OSError:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
 try:
-    fd, tmp_path = tempfile.mkstemp(prefix=".v10-ops-board-", dir=board_dir)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, board)
-    tmp_path = None
+    _atomic_write(lines, ".v10-ops-board-")
 except OSError as e:
-    if tmp_path is not None and os.path.exists(tmp_path):
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
     print("board-row-status: cannot write " + board + ": " + str(e), file=sys.stderr)
     sys.exit(2)
 
@@ -253,38 +310,53 @@ try:
 except OSError as e:
     print("board-row-status: FATAL cannot re-read " + board + " after write: "
           + str(e), file=sys.stderr)
+    try:
+        _atomic_write(before_lines, ".v10-ops-board-restore-")
+        print("board-row-status: original content restored", file=sys.stderr)
+    except OSError as e2:
+        print("board-row-status: FATAL restore also failed (" + str(e2)
+              + ") -- restore " + board + " from git immediately", file=sys.stderr)
     sys.exit(3)
 
 corrupted = len(disk_lines) != before_count
 if not corrupted:
+    before_row_cells = before_lines[idx].split("|")
     for i in range(before_count):
-        expected = lines[idx] if i == idx else before_lines[i]
-        if disk_lines[i] != expected:
+        if i != idx:
+            if disk_lines[i] != before_lines[i]:
+                corrupted = True
+                break
+            continue
+        # The target row itself: must have changed in EXACTLY the Status
+        # cell, column-for-column identical everywhere else.
+        disk_row_cells = disk_lines[i].split("|")
+        if len(disk_row_cells) != len(before_row_cells):
+            corrupted = True
+            break
+        for j in range(len(before_row_cells)):
+            if j != status_idx and disk_row_cells[j] != before_row_cells[j]:
+                corrupted = True
+                break
+        if corrupted:
+            break
+        if disk_row_cells[status_idx] != cells[status_idx]:
             corrupted = True
             break
 
 if corrupted:
-    restore_ok = True
     try:
-        rfd, rtmp = tempfile.mkstemp(prefix=".v10-ops-board-restore-", dir=board_dir)
-        with os.fdopen(rfd, "w", encoding="utf-8", newline="") as f:
-            f.writelines(before_lines)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(rtmp, board)
-    except OSError as e:
-        restore_ok = False
-        print("board-row-status: FATAL post-write verification failed AND restore "
-              "failed (" + str(e) + ") -- restore " + board + " from git immediately",
-              file=sys.stderr)
-    if restore_ok:
+        _atomic_write(before_lines, ".v10-ops-board-restore-")
         print("board-row-status: FATAL post-write verification failed for " + slice_id
               + " -- disk content diverged from the expected write, original restored",
+              file=sys.stderr)
+    except OSError as e:
+        print("board-row-status: FATAL post-write verification failed AND restore "
+              "failed (" + str(e) + ") -- restore " + board + " from git immediately",
               file=sys.stderr)
     sys.exit(3)
 
 print("board-row-status: " + slice_id + " -> " + new_token + "@" + timestamp)
-' "$board" "$slice_id" "$new_token"
+' "$board" "$slice_id" "$new_token" "$V10_OPS_BOARD_TOKENS"
 }
 
 cmd_version_check() {

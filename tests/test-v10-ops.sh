@@ -321,6 +321,201 @@ else
     bad "board-row-status did not restore original content after corruption"
 fi
 
+# --- board-row-status: file mode is preserved, not clobbered by mkstemp ----
+# Round 3 regression: tempfile.mkstemp creates 0600, and os.replace carries
+# that mode onto the board, so an unguarded atomic write silently turns a
+# 644 board.md into 600. Must hold for both the normal write and a
+# corruption-triggered restore.
+
+echo "== board-row-status: a 644 board stays 644 after a flip =="
+BOARD_MODE="$WORK/BOARD-mode.md"
+cat > "$BOARD_MODE" <<'EOF'
+# Board
+
+| ID | Owner | Notes | Status |
+|---|---|---|---|
+| S-60 | ivy | first row | ready@2026-09-27T00:00Z |
+EOF
+chmod 644 "$BOARD_MODE"
+bash "$OPS_SH" board-row-status "S-60" "merged" "$BOARD_MODE" >/dev/null 2>&1
+mode_after=$(stat -c '%a' "$BOARD_MODE" 2>/dev/null || stat -f '%Lp' "$BOARD_MODE" 2>/dev/null)
+if [ "$mode_after" = "644" ]; then
+    ok "board-row-status preserves 644 mode across a normal flip"
+else
+    bad "board-row-status mode after flip: expected 644, got $mode_after"
+fi
+
+echo "== board-row-status: a 644 board stays 644 after a corruption restore =="
+BOARD_MODE_FAULT="$WORK/BOARD-mode-fault.md"
+cat > "$BOARD_MODE_FAULT" <<'EOF'
+# Board
+
+| ID | Owner | Notes | Status |
+|---|---|---|---|
+| S-61 | jay | first row | ready@2026-09-27T00:00Z |
+| S-62 | kim | second row | building@2026-09-27T01:00Z |
+EOF
+chmod 644 "$BOARD_MODE_FAULT"
+V10_OPS_TEST_CORRUPT_WRITE=1 bash "$OPS_SH" board-row-status "S-62" "merged" "$BOARD_MODE_FAULT" >/dev/null 2>&1
+mode_after=$(stat -c '%a' "$BOARD_MODE_FAULT" 2>/dev/null || stat -f '%Lp' "$BOARD_MODE_FAULT" 2>/dev/null)
+if [ "$mode_after" = "644" ]; then
+    ok "board-row-status preserves 644 mode across a corruption-triggered restore"
+else
+    bad "board-row-status mode after restore: expected 644, got $mode_after"
+fi
+
+# --- board-row-status: symlinked board resolves to the real target --------
+# Round 3 regression: os.replace over a symlink replaces the LINK with a
+# plain file and leaves the real target unedited, while still reporting
+# success because the disk re-read follows the same (now-broken) link path.
+
+echo "== board-row-status: a symlinked board edits the real target, not the link =="
+BOARD_REAL="$WORK/BOARD-real.md"
+cat > "$BOARD_REAL" <<'EOF'
+# Board
+
+| ID | Owner | Notes | Status |
+|---|---|---|---|
+| S-65 | leo | first row | ready@2026-09-27T00:00Z |
+EOF
+BOARD_LINK="$WORK/BOARD-link.md"
+ln -s "$BOARD_REAL" "$BOARD_LINK"
+out="$(bash "$OPS_SH" board-row-status "S-65" "merged" "$BOARD_LINK" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "S-65 -> merged@"; then
+    ok "board-row-status succeeds through a symlinked board path"
+else
+    bad "board-row-status symlink case: rc=$rc out=$out"
+fi
+if [ -L "$BOARD_LINK" ]; then
+    ok "the board path is still a symlink after the flip"
+else
+    bad "the symlink was replaced by a plain file"
+fi
+if grep -q "^| S-65 " "$BOARD_REAL" && grep "^| S-65 " "$BOARD_REAL" | grep -q "merged@[0-9]"; then
+    ok "the real target file was actually edited (merged@<timestamp>)"
+else
+    bad "the real target was not edited: $(cat "$BOARD_REAL")"
+fi
+
+# --- board-row-status: Status column found by header, not by cell shape ----
+# Round 3 regression (re-review 2): the old scanner picked the first cell
+# SHAPED like "<word>@<something>", so a Branch/SHA cell such as
+# "main@779c50e5" (no space -- plausible drift from today's "main @ SHA")
+# matched before the real Status cell and got silently rewritten instead.
+
+echo "== board-row-status: a decoy Branch@SHA cell is not mistaken for Status =="
+BOARD_DECOY="$WORK/BOARD-decoy.md"
+cat > "$BOARD_DECOY" <<'EOF'
+# Board
+
+| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| X-1 | owner | main@779c50e5 | files | HIGH | ready@2026-09-27T10:00Z | notes |
+EOF
+out="$(bash "$OPS_SH" board-row-status "X-1" "merged" "$BOARD_DECOY" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "X-1 -> merged@"; then
+    ok "board-row-status succeeds despite the decoy Branch@SHA cell"
+else
+    bad "board-row-status decoy-branch case: rc=$rc out=$out"
+fi
+row_after=$(grep "^| X-1 " "$BOARD_DECOY")
+if printf '%s' "$row_after" | grep -q "main@779c50e5"; then
+    ok "the decoy Branch cell is untouched"
+else
+    bad "the decoy Branch cell was modified: $row_after"
+fi
+if printf '%s' "$row_after" | grep -q "merged@[0-9]"; then
+    ok "the real Status cell was updated to merged@<timestamp>"
+else
+    bad "the real Status cell was not updated: $row_after"
+fi
+if printf '%s' "$row_after" | grep -q "ready@2026-09-27T10:00Z"; then
+    bad "the old Status value is still present alongside the new one: $row_after"
+else
+    ok "the old Status value was replaced, not left behind"
+fi
+
+echo "== board-row-status: refuses to edit a Status cell not shaped <token>@<timestamp> =="
+BOARD_BADCELL="$WORK/BOARD-badcell.md"
+cat > "$BOARD_BADCELL" <<'EOF'
+# Board
+
+| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| X-2 | owner | main @ abcdef | files | HIGH | in progress | notes |
+EOF
+cp "$BOARD_BADCELL" "$WORK/BOARD-badcell.before.md"
+out="$(bash "$OPS_SH" board-row-status "X-2" "merged" "$BOARD_BADCELL" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "does not match"; then
+    ok "board-row-status refuses a Status cell that is not <token>@<timestamp>"
+else
+    bad "board-row-status malformed-status-cell case: rc=$rc out=$out"
+fi
+if diff -q "$WORK/BOARD-badcell.before.md" "$BOARD_BADCELL" >/dev/null 2>&1; then
+    ok "the malformed-status-cell refusal left the file untouched"
+else
+    bad "the malformed-status-cell refusal modified the file"
+fi
+
+# --- board-row-status: pins all 4 real BOARD.md table layouts --------------
+# Runs against a COPY of the real docs/v10/BOARD.md (never the file itself)
+# to prove the header-lookup approach works against every layout actually in
+# use, not just the synthetic 4-column fixtures above.
+
+echo "== board-row-status: flips one row from each real BOARD.md table layout =="
+REAL_BOARD_HASH_BEFORE=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
+[ -n "$REAL_BOARD_HASH_BEFORE" ] || REAL_BOARD_HASH_BEFORE=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
+BOARD_REAL_COPY="$WORK/BOARD-real-copy.md"
+cp "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_REAL_COPY"
+
+real_layout_headers=(
+    "| ID | Owner | Branch @ SHA | File set (summary) | Tier | Status | Notes |"
+    "| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |"
+    "| ID | Owner | File set | Tier | Acceptance checks (Wall) | Status | Notes |"
+    "| ID | Owner | Branch | File set | Tier | Status | Notes |"
+)
+layout_n=0
+for header in "${real_layout_headers[@]}"; do
+    layout_n=$((layout_n + 1))
+    header_line=$(grep -n -F -x "$header" "$BOARD_REAL_COPY" | head -1 | cut -d: -f1)
+    if [ -z "$header_line" ]; then
+        bad "real-layout $layout_n: header not found in docs/v10/BOARD.md (layout drift -- update this test)"
+        continue
+    fi
+    data_line=$((header_line + 2))
+    row_text=$(sed -n "${data_line}p" "$BOARD_REAL_COPY")
+    row_id=$(printf '%s' "$row_text" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+    if [ -z "$row_id" ]; then
+        bad "real-layout $layout_n: could not extract a row ID under the header"
+        continue
+    fi
+    out="$(bash "$OPS_SH" board-row-status "$row_id" "merged" "$BOARD_REAL_COPY" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- "-> merged@"; then
+        ok "real-layout $layout_n ($row_id) flips cleanly"
+    else
+        bad "real-layout $layout_n ($row_id): rc=$rc out=$out"
+    fi
+    row_after=$(grep "^| $row_id " "$BOARD_REAL_COPY")
+    if printf '%s' "$row_after" | grep -q "merged@[0-9]"; then
+        ok "real-layout $layout_n ($row_id) Status cell updated"
+    else
+        bad "real-layout $layout_n ($row_id) Status cell not updated: $row_after"
+    fi
+done
+# The real board itself must never be touched by this test.
+REAL_BOARD_HASH_AFTER=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
+[ -n "$REAL_BOARD_HASH_AFTER" ] || REAL_BOARD_HASH_AFTER=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
+if [ -n "$REAL_BOARD_HASH_BEFORE" ] && [ "$REAL_BOARD_HASH_BEFORE" = "$REAL_BOARD_HASH_AFTER" ]; then
+    ok "the real docs/v10/BOARD.md is byte-identical before and after this test run"
+else
+    bad "the real docs/v10/BOARD.md changed during this test run: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
+fi
+if ! diff -q "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_REAL_COPY" >/dev/null 2>&1; then
+    ok "the scratch copy diverged from the real file, confirming the flips actually ran"
+else
+    bad "real-layout test: the copy is identical to the source -- no flip actually happened"
+fi
+
 # --- version-check / ci-status: PATH shadowing -----------------------------
 # A minimal PATH containing only the external binaries each subcommand
 # genuinely needs, so `command -v npm` / `command -v gh` reliably fail
