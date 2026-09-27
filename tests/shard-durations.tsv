@@ -22,28 +22,12 @@
 # The prior deliberate override for "CI JSON payloads via temp file/stdin, not
 # exported env vars (BACKLOG 25)" no longer applies: its fixture-shrink fix
 # landed and this run measured it directly at 12s.
-# S-81: measured per-suite durations, one row per tests/run-all-tests.sh
-# `run_test "<name>" ...` registration. Format: name<TAB>seconds. Lines
-# starting with # and blank lines are ignored by the loader in run-all-tests.sh.
-#
-# Source: real GitHub Actions run 36319020918 (2026-09-27, shell-tests shards
-# 0-3/4, job ids 108619169907/108619169914/108619169920/108619169945),
-# START/END suite timing added by S-44. All 496 suites registered at this
-# commit had a measured row in that run; none used the default duration.
-#
-# One deliberate override, not a measurement: "CI JSON payloads via temp
-# file/stdin, not exported env vars (BACKLOG 25)" (test-ci-json-argmax.sh)
-# measured 1186s in that run, but a parallel slice (BACKLOG 25 follow-up) is
-# shrinking its fixture; this table assumes it lands near 60s post-fix and
-# uses 60 here rather than the stale 1186s figure. If that fix slips, this row
-# understates the suite and should be re-measured.
 #
 # Re-generate by re-running the extraction against a fresh Tests run's shard
 # job logs (`gh run view --job <id> --log`, grep `END: `) once these numbers
 # drift meaningfully; nothing here is recomputed automatically.
 Bootstrap Tests	0
 Task Queue Tests	0
-Task Queue Tests	1
 Circuit Breaker Tests	1
 Timeout & Stuck Process Tests	7
 State Recovery Tests	0
@@ -51,8 +35,6 @@ Wrapper Script Tests	0
 Memory Engine Tests	1
 Memory Retrieval Tests	2
 Memory Layers Tests	2
-Memory Retrieval Tests	1
-Memory Layers Tests	1
 Memory CLI Tests	3
 Event Bus Tests	1
 Event Bus Exact-Id Match (bus.ts)	2
@@ -92,35 +74,12 @@ Orphan Wrapper Reaper (#92 liveness predicate)	6
 Mock Detector (Gate #8)	2
 Mock Detector source-import false positive (subprocess E2E)	1
 start-SHA empty-repo capture (council empty_diff blocker)	1
-Review deadline, requirements, and speculative assurance tail	153
-Council Threshold Tests	0
-Healing Test Gate Tests	0
-RARV mode-aware + PARALLEL_TOOL_CALLS build_prompt (rank 16+8)	6
-Mergeability reviewer + quality score (rank 9 run_code_review)	2
-Code-review gitignore filter + oversized-diff loud-fail (client fix)	0
-Code-review compact lockfile context and explicit size rejection	3
-Code-review size caps derive from PROVIDER_CONTEXT_WINDOW	1
-Council Convergence Floor (rank 15 no-claim early check)	0
-Acceptance-oracle source-grounded (rank 2 routes/LSP-symbols/invariant)	2
-Verify scope record (rank 10 locality, advisory-first)	0
-Verify setup-recipe writer (rank 7, env NAMES not values)	0
-node --test detection (run.sh + verify.sh, task #79 false-negative)	7
-LOKI_DIR double-.loki path guard (#80 COMPLETED marker)	0
-zero-test-file inconclusive (run.sh + verify.sh + council, #82 fake-green)	6
-Heal Assess Readiness Triage Tests (rank 13)	1
-Process Supervisor Tests	6
-Supervised Signal Finalization and Honest Proof	1
-Orphan Wrapper Reaper (#92 liveness predicate)	5
-Mock Detector (Gate #8)	2
-Mock Detector source-import false positive (subprocess E2E)	1
-start-SHA empty-repo capture (council empty_diff blocker)	0
 stat portability (GNU-first ordering)	0
 alt-provider model-alias warning (OpenRouter/Ollama/LiteLLM)	0
 bash 3.2 parse compatibility (macOS /bin/bash)	0
 greenfield diff-stat (report what was built)	0
 PAUSED.md states the pause reason	0
 per-outcome next-step guidance	1
-per-outcome next-step guidance	0
 Evidence Receipt run-level baseline (signed diff stat)	0
 no hardcoded home-directory paths in tests	0
 loki why honest reporting (gate named, diff re-derived)	1
@@ -142,22 +101,6 @@ pre-edit snapshot separates agent from human rescue	0
 server.json tracks VERSION (MCP registry not stale)	0
 MCP registry entry is not stale (published vs shipped)	0
 plugin.json tracks VERSION (plugin updates not stale)	1
-emit.sh self-reaper caps every path (no 10-hour orphans)	7
-dashboard venv teardown is serialized (concurrent runs keep an importable venv)	2
-verification runs air-gapped (enterprise perimeter, honest scope)	0
-doctor names what blocks you (first-run funnel)	3
-first-run funnel covers the walls users hit	0
-a completion claim must name work in the diff	0
-decision records surface a model swap and leak nothing	1
-failure memory learns from measured events only	0
-agent readiness is measured, not judged	0
-the verification-cost page stays honest	0
-outcome ledger anchors before it measures	0
-intent ledger detects spec-drifted-from-intent	0
-pre-edit snapshot separates agent from human rescue	0
-server.json tracks VERSION (MCP registry not stale)	0
-MCP registry entry is not stale (published vs shipped)	8
-plugin.json tracks VERSION (plugin updates not stale)	0
 subagent fleet capacity is explicit (CC 2.1.217 defaults)	0
 build wall-clock is attributable (boot/teardown timed)	0
 README has no hand-maintained version (drifts by default)	0
@@ -184,22 +127,6 @@ CI Sentrux Coverage	0
 Sentrux Iteration Wireup (Dev1)	1
 Sentrux Init-Rules (Dev3)	42
 Doctor JSON Sentrux Parity (Dev4)	3
-model catalog: no Claude defaults on non-Claude providers	0
-Evidence Receipt names the blocking gate (facts, not assessment)	0
-Evidence Receipt splits exogenous vs advisory verification	1
-Evidence Receipt reports model provenance (decision trail)	0
-project-graph bash/bun parity (members discovery default)	1
-opencode provider (model-agnostic route, 75+ providers)	0
-opencode start routing and main-loop dispatch	0
-fast_verify: millisecond deterministic verification	0
-provider_invoke_argv timeout seam (judges keep their timeout)	2
-Test Mutation Detector (Gate #9)	2
-Harness False-Green Regression and Mutation	1
-Sentrux Gate Unit Tests	1
-CI Sentrux Coverage	0
-Sentrux Iteration Wireup (Dev1)	0
-Sentrux Init-Rules (Dev3)	40
-Doctor JSON Sentrux Parity (Dev4)	2
 Receipt Signing Discoverability	3
 Dashboard Nav UAT (Dev5)	0
 dashboard bundle stays within its measured budget	0
@@ -226,28 +153,12 @@ local receipt attestation	5
 Pytest Gate Timeout (Dev6)	2
 Go/Cargo Gate Timeout	12
 Quality Architecture Endpoint (Dev2 pytest)	2
-remote receipt attestation verdict (JWKS)	2
-proof verify --jwks (third-party offline)	23
-verify-path python3 hardening (canary verify, proof share/show)	0
-worker autoscaling on queue depth	4
-helm receipt signing (receiver only)	3
-compose receipt signing (opt-in, default intact)	1
-head-to-head corpus honesty	0
-receipt metrics exposed to monitoring	4
-A/B analysis honesty (tiny-n statistics)	0
-webapp receipt panel renders (real browser)	3
-webapp admin, templates and teams render honestly (real browser)	1
-local receipt attestation	5
-Pytest Gate Timeout (Dev6)	13
-Go/Cargo Gate Timeout	24
-Quality Architecture Endpoint (Dev2 pytest)	1
 Episode Load Resilience (Dev7 pytest)	1
 Crash Reporting CLI Tests	5
 Crash Scrubber Redaction Tests (Python)	0
 Effort Estimator (Rank 6 proof.json hours)	1
 Evidence Gate (verified completion)	7
 No-mock data-render classification	19
-No-mock data-render classification	24
 State Baseline Lifecycle (run 2+ freshness)	2
 Completion-route Evidence Gate (default path)	0
 Completion-promise Gating (signal vs legacy grep)	0
@@ -266,18 +177,6 @@ No Deprecated Codex Flag (v7.52 --full-auto guard)	1
 Uncertainty Escalation (2-of-3 proxies)	3
 AGENTS.md Doc Walker (precedence + fallback)	1
 AGENTS.md build_prompt Instruction (all blocks)	4
-Council DA Veto (anti-sycophancy forces CONTINUE)	0
-Build applicability (unrecognized build stays a gap, not fake N/A)	2
-Python test detection (root test_*.py + unittest fallback, no fake-green)	1
-Human Intervention Signals (STOP/HUMAN_INPUT security)	0
-Coverage Artifact Default-Off (v7.51 measured:false)	2
-Evidence-Gate-Details Consumer (v7.51 P1-1)	0
-Approval Phase-Gate (v7.51 P3-3)	0
-Semantic Gate Bash Route (v7.53 P1-3)	0
-No Deprecated Codex Flag (v7.52 --full-auto guard)	2
-Uncertainty Escalation (2-of-3 proxies)	5
-AGENTS.md Doc Walker (precedence + fallback)	0
-AGENTS.md build_prompt Instruction (all blocks)	5
 AGENTS.md Instruction Parity (bash vs Bun)	0
 Run-owned temp cleanup scope	1
 DOC_SCOPE build_prompt Instruction (tier-conditional)	8
@@ -295,17 +194,6 @@ Telemetry Disclosure PTY (TTY signal + no covert egress)	1
 Build Analytics Opt-In (strict gate + allowlist, no leak)	2
 Deploy advisory (print-only, CI/CD precedence)	2
 Deploy receipt gate (--execute authorization)	7
-Plan JSON Smoke (--json unbound-var regression guard)	0
-Dynamic Session Concurrency (effective_session_cap)	2
-Delegate Notify (all terminal states)	4
-Hybrid Codebase Search (manifest + RRF + budget + fallback)	1
-Live Build HUD (TTY gate + degrade + parity)	1
-Public Preview Tunnel (--public consent + tunnel wrap)	5
-Branch Lifecycle (default-on, base!=main, commit, advisory no-push)	14
-Telemetry Disclosure PTY (TTY signal + no covert egress)	1
-Build Analytics Opt-In (strict gate + allowlist, no leak)	2
-Deploy advisory (print-only, CI/CD precedence)	1
-Deploy receipt gate (--execute authorization)	4
 Unified config-file (--config precedence + formats)	4
 Config validate unknown-key detection (JSON/YAML parity)	6
 Enforcement claims in buyer-facing docs are scoped	0
@@ -320,12 +208,6 @@ dashboard unmeasured cost never renders as zero (node --test)	0
 dashboard panels render unmeasured as unknown (node --test)	0
 dashboard UI component utilities match shipped code (node --test)	0
 dashboard overview issue-to-PR journey (node --test)	1
-web-app workspace panels surface fetch failures (node --test)	1
-web-app chat completion never says Done. for a silent failure (node --test)	1
-dashboard checkpoint viewer shows a failed read, not empty (node --test)	0
-dashboard council transcripts show a failed hook-events read (node --test)	0
-dashboard task board keeps a server load error visible (node --test)	1
-dashboard API keys load error hides the empty state (node --test)	0
 shipped agent roles reach the review pool	0
 policy present but unevaluable refuses fail-closed	0
 audit entries attribute an actor honestly	0
@@ -334,18 +216,6 @@ loki proof chain fronts the buyer verifier	1
 workflow RC handlers are reachable under bash -e	0
 issue-to-PR action and workflow ship, gate and split agent from publish	0
 no shipped action runs the agent in a step holding a GitHub token	0
-audit subsystem Node suites (witness, manifest, crosslink)	3
-dashboard unmeasured cost never renders as zero (node --test)	0
-dashboard panels render unmeasured as unknown (node --test)	0
-dashboard UI component utilities match shipped code (node --test)	1
-dashboard overview issue-to-PR journey (node --test)	0
-shipped agent roles reach the review pool	0
-policy present but unevaluable refuses fail-closed	0
-audit entries attribute an actor honestly	0
-shipped modules have a recorded reachability verdict	94
-loki proof chain fronts the buyer verifier	1
-workflow RC handlers are reachable under bash -e	0
-issue-to-PR action and workflow ship, gate and split agent from publish	0
 model substitutions are visible and attributable	0
 the completion council reports its duration	0
 a gate that scanned nothing is not a pass	1
@@ -358,28 +228,17 @@ ALLOWED_PATHS partial enforcement (A5: sandbox mount + command)	0
 ALLOWED_PATHS sandbox workspace mount (V3: fail-closed refuse)	0
 Multi-build state isolation (A6: LOKI_SESSION_ID namespacing)	1
 loki why (B5: failure/outcome diagnosis)	1
-Cross-project learning surface	1
-Cross-provider auto-failover	1
-Config-map no-yq YAML fallback (nested-path + quote handling)	1
-validate_yaml_value injection guard (#691 security fix)	0
-ALLOWED_PATHS partial enforcement (A5: sandbox mount + command)	0
-ALLOWED_PATHS sandbox workspace mount (V3: fail-closed refuse)	0
-Multi-build state isolation (A6: LOKI_SESSION_ID namespacing)	0
-loki why (B5: failure/outcome diagnosis)	2
 loki next (forward-motion resolver)	0
 loki ship review scope (branch range on clean loki branch)	1
 CLI flag guards (budget/plan-json/memory/temp-prd/flag-value)	1
 Rate-limit detection (no false-positive on agent output)	0
 Checkpoint worktree-bundle sync (V2: refs/loki/cp via git bundle)	1
 Queue-consumer (V5: redis/file backend + flag-injection guard)	3
-Checkpoint worktree-bundle sync (V2: refs/loki/cp via git bundle)	0
-Queue-consumer (V5: redis/file backend + flag-injection guard)	4
 loki bench honest degrade (L4: packaged-install UX)	0
 Emit JSON Escape (C0 control chars + UTF-8)	0
 Codex Model Trusted (LOKI_CODEX_MODEL verbatim)	0
 Provider Invocation (argv construction, all providers)	0
 Provider Degraded Mode (capability flags)	1
-Provider Degraded Mode (capability flags)	0
 Provider Loader (contract + tier mapping)	1
 Audit Chain Multiprocess (cross-process flock + tip re-read)	3
 Coverage Gate Fail-Open (node-test detector)	3
@@ -430,52 +289,6 @@ cleanup-test-processes.sh scoped to LISTEN + this uid, --aggressive gated	1
 Runtime Gate port reclaims scoped to LISTEN + cwd ownership	2
 Bun Parity disk.available_gb tolerance (BACKLOG 26)	0
 council_augment_from_managed_memory never falls back to cwd for PROJECT_DIR (BACKLOG 63)	1
-Anthropic Base URL (override AND-gate, bash)	2
-Secret Gate False Positives (templates vs real leaks)	0
-Council Contrarian Transcript Fields	0
-Bugfix Audit (CLI regressions)	0
-CLAUDE.md Walker (project graph layers)	1
-CI Command (--fail-on thresholds)	4
-CI report body via stdin, not argv (BACKLOG 25)	0
-CI JSON payloads via temp file/stdin, not exported env vars (BACKLOG 25)	60
-Report Command	1
-Review Allowlist 167	0
-Review Command	3
-Review Severity Calibration	0
-Run Sh Quoting	0
-Run Start Estimate	1
-Runtime Gate	16
-Sandbox Bughunt W4	0
-Scaffold Hook	1
-Sentrux Setup Hints	1
-Share Command	1
-Admin Quote Injection	1
-Aider Cloud	0
-Api Server	2
-App Runner Compose	24
-App Runner Injection	0
-App Runner Nextjs Standalone	0
-App Runner Port Reconcile	7
-App Runner Static Site	1
-App Runner Token Lifecycle	2
-App Runner Tree Stop	7
-App Runner Watchdog Health	1
-App Runner Wave5 W5	2
-Apprunner Dockerfile Exec Wave8	1
-Assumption Gate Brief Mode	0
-Auto Wiki	1
-Backend Floor	3
-Backend Floor port scoping (kill by recorded PID, never by port)	4
-cmd_web_stop/start use a real process identity check (D14/D15 class)	9
-cmd_web_start port-conflict path scoped by identity	1
-autonomy/verify.sh runtime teardown scoped to LISTEN + ownership	5
-Marketplace action Cleanup step scoped to this job's own loki run	1
-Dashboard fresh-repo/evidence harnesses kill only their own recorded PID	1
-Dashboard API smoke cleanup kills only its own recorded PID	1
-cleanup-test-processes.sh scoped to LISTEN + this uid, --aggressive gated	0
-Runtime Gate port reclaims scoped to LISTEN + cwd ownership	1
-Bun Parity disk.available_gb tolerance (BACKLOG 26)	0
-council_augment_from_managed_memory never falls back to cwd for PROJECT_DIR (BACKLOG 63)	0
 council_should_stop's shadow-write never falls back to cwd for PROJECT_DIR (BACKLOG 63/127)	11
 Bench Haschanges	0
 Benchmarks Resume Atomic	0
@@ -488,21 +301,12 @@ Checkpoint Ref Prune Wave9	1
 Claude Flags	0
 Claude Login State	0
 Cli Allow Haiku Flag	0
-Build Profile	0
-Caveman Loki Coverage	0
-Checkpoint Cli	4
-Checkpoint Prune Sort	0
-Checkpoint Ref Prune Wave9	1
-Claude Flags	1
-Claude Login State	0
-Cli Allow Haiku Flag	1
 Cli Provider Flag	0
 Cluster Id Injection Wave10	0
 Cockpit Cmd	1
 Cockpit Follow	0
 Cockpit Keys	0
 Code Review Json Rematerialize	1
-Code Review Json Rematerialize	0
 Code Review Verdict Parse Wave8	0
 Codex Max Tier Normalize	0
 Completion Council Affirmative Evidence	1
@@ -515,13 +319,6 @@ Concurrent Sessions	0
 Config Spawn Deprecated Wave10	1
 Context Optimization	1
 Contract Scaffold	11
-Completion Signal Consume	0
-Complexity Proportional Review	0
-Compound Cli	2
-Concurrent Sessions	1
-Config Spawn Deprecated Wave10	0
-Context Optimization	1
-Contract Scaffold	9
 Council Convergence On Claim	0
 Council Force Stop Wave7	0
 Council Healing Audit Fixes	0
@@ -548,22 +345,6 @@ Empty Args No Prd	0
 Enterprise Resilience	3
 Events Jsonl Concurrency	0
 Evidence Proof Axes	11
-Da Veto	1
-Dashboard Identity	0
-Dashboard Json Guards	2
-Dashboard Memory Endpoints	16
-Dashboard Multiproject	27
-Design System	4
-Docker Helpers W4	0
-Docker Run	0
-Doctor Ux	1
-E2e Features	72
-Embeddings	0
-Emit Jsonl	0
-Empty Args No Prd	0
-Enterprise Resilience	2
-Events Jsonl Concurrency	0
-Evidence Proof Axes	12
 Expectation Ledger	1
 F3 Port Detection	0
 Hard Deadline Confinement	19
@@ -571,7 +352,6 @@ Honest Gate Status	2
 Human Input Directive	0
 Isolation Dial	0
 Iteration Card Plain	0
-Iteration Card Plain	1
 Iteration Complete Accuracy	0
 Json Prd	0
 License Audit Pinned Version	0
@@ -580,7 +360,6 @@ Loki Stop Byid Reap Wave8	2
 Lsp Diagnostics Regression	10
 Lsp Proxy Http	2
 Lsp Proxy	2
-Lsp Proxy	1
 Magic	1
 Mcp Config	1
 Mcp Http Auth	2
@@ -592,12 +371,6 @@ Memory Replay	1
 Memory Speed Privacy	1
 Memory Wake Dead Code	1
 Metrics Command	1
-Memory Economics Endpoint	0
-Memory Error Log	2
-Memory Replay	1
-Memory Speed Privacy	2
-Memory Wake Dead Code	2
-Metrics Command	0
 Migration Post Edit Revert	0
 Migration V2	3
 Model And Port	0
@@ -611,14 +384,6 @@ Prd Checklist Interval W4	0
 Prd Directive Envelope	0
 Prd Reuse Bash W4	1
 Proof Forgery Defense	1
-Openspec Sentinel	0
-Parity Mcp Config	0
-Platform Infra	1
-Policy Failclosed	1
-Prd Checklist Interval W4	0
-Prd Directive Envelope	1
-Prd Reuse Bash W4	1
-Proof Forgery Defense	0
 Provider Degraded Reasons Honesty	0
 Provider Flags	0
 Provider Source Cli	1
@@ -633,13 +398,6 @@ Proven PR Detached Path (cmd_run --pr/--ship -d carries receipt)	0
 Build-time HOME isolation (in-build app exec sandbox)	0
 Reuse done-recognition gate (no-PRD reuse: done/incomplete/inconclusive)	2
 Issue providers (GitHub/GitLab/Jira/Azure detect+parse+normalize)	1
-Proven PR Receipt (PR-body honesty + no false green)	2
-Proven PR Check-Run (advisory, opt-in, cannot block merge)	1
-Proven PR Installed-Layout (verify-yourself works on shipped routes)	8
-Proven PR Detached Path (cmd_run --pr/--ship -d carries receipt)	0
-Build-time HOME isolation (in-build app exec sandbox)	0
-Reuse done-recognition gate (no-PRD reuse: done/incomplete/inconclusive)	3
-Issue providers (GitHub/GitLab/Jira/Azure detect+parse+normalize)	0
 prepared PR publishes only with explicit consent, exact body, and rollback	1
 local-ci tiers (fast never green-washes full; trust core always kept)	0
 parent checkout core.bare detection self-heals without green-washing	0
@@ -674,40 +432,12 @@ doctor is CI-gateable (nonzero on missing required dep)	3
 completion coverage (every real command in both shells)	30
 dry-run paths work and are discoverable from start --help	0
 exit codes documented and matching the source	0
-shards partition the suite list (no silently dropped suite)	0
-quickstart scorer works on macOS bash 3.2 (first-run path)	1
-first-run path works on macOS bash 3.2 (welcome, tour, quickstart)	0
-competitor verify surface (head-to-head, locally reproducible)	1
-efficiency baseline pipeline (writer + collector, honest zero)	1
-time-to-first-preview reaches the user (not just disk)	3
-per-stage timing reaches the user (where the time went)	2
-iteration attribution (progress vs rework, honest null)	0
-receipt attributes cost to progress vs rework	0
-silence report (longest in-build gap, idle excluded)	0
-free on-ramp stays wired (codex, zero API spend)	0
-argv seam model flags (all providers; codex effort, max-tier clamp)	1
-helm values schema rejects bad values by name	1
-helm worker scaling knob and tenancy invariant	2
-helm test hook proves the release serves	2
-ECS/Fargate module structure + Helm parity	0
-audit PVC can outlive the release (compliance)	0
-worker grace period honours mid-build shutdown	0
-k8s sizing says what was measured and what was not	1
-air-gapped k8s install is honest about scope	0
-enterprise smoke script contract (offline)	0
-image provenance: signing and SBOM in the publish job	0
-doctor is CI-gateable (nonzero on missing required dep)	2
-completion coverage (every real command in both shells)	30
-dry-run paths work and are discoverable from start --help	0
-exit codes documented and matching the source	1
 Exit-code contract is discoverable from --help	0
 log verbosity (--quiet / LOKI_LOG_LEVEL, errors never hidden)	0
 verify --json emits pipeable evidence on stdout	1
 documented env vars exist in the source	0
 generic tiers (small|medium|high) resolve for every provider	2
 wall-clock cap (LOKI_MAX_DURATION) fires and is terminal	0
-generic tiers (small|medium|high) resolve for every provider	1
-wall-clock cap (LOKI_MAX_DURATION) fires and is terminal	1
 startup preflight blocks a doomed build, stays advisory where optional	0
 magic debate gate (Gate 12) can actually block	1
 review council cap trims the tail, never the mandate	0
@@ -731,28 +461,11 @@ a stuck gate aborts instead of grinding	1
 iteration 1 names the gates that will judge it	0
 iteration cap is bounded without truncating real runs	0
 codex usage and cost are recovered, unknown never zero	0
-gate detectors ship in the npm package	5
-runtime python libs ship in the npm package	7
-npm artifacts have portable permissions	11
-packaged MCP server exposes the exact tool surface	9
-MCP contract guard rejects rename/deletion/missing prereqs	14
-npm SBOM is attached to the GitHub Release	0
-loki why maps each error class to an action	2
-loki start surfaces a stale install	0
-loki help does not recurse into itself	1
-no test uses a platform-divergent construct	7
-doctor detects an incomplete install	2
-findings injection degrades loudly, never silently	0
-a stuck gate aborts instead of grinding	0
-iteration 1 names the gates that will judge it	0
-iteration cap is bounded without truncating real runs	0
-codex usage and cost are recovered, unknown never zero	1
 cache-stable prompt prefix stays free of volatile values	0
 no raw shell error when .loki/config is a directory	0
 startup is instrumented, never a silent gap	0
 every handled gate escalates its findings	0
 cost honesty holds across every surface	0
-a partly priced run renders as at least, never a total	1
 the agent call reports its own prompt size	0
 per-turn context growth is measured	0
 provider auto-detection is wired	0
@@ -774,18 +487,6 @@ model catalog: no tier points at a superseded flagship	0
 model catalog staleness is advisory in doctor	3
 doctor blocker parity (both routes name blockers + offer loki tour)	2
 stale skill link for an optional provider does not block doctor	1
-proof verify --human explains a failure	0
-the verification demo runs the real tools	1
-cost and estimate are reachable from the CLI	1
-quickstart names the provider that will run	1
-explicit provider preflight	1
-doctor shows provider availability	3
-interrupted runs surface how to resume	1
-install integrity is checked on both doctor routes	1
-model catalog: no tier points at a superseded flagship	0
-model catalog staleness is advisory in doctor	3
-doctor blocker parity (both routes name blockers + offer loki tour)	1
-stale skill link for an optional provider does not block doctor	3
 first_run_blocked signal (opt-out silent, enum-clamped)	3
 a green doctor never recommends a command that exits 2	0
 analytics opt-in has a writer (the funnel can fire)	0
@@ -812,28 +513,6 @@ all reporting surfaces agree about one run	2
 recorded exit codes match the failure contract	2
 the receipt shows disabled gates	0
 the public HTML receipt shows disabled gates	1
-assess runtime detection (declared, never guessed)	1
-provider model scoping (global tier var must not leak)	1
-model catalog is a single source of truth	2
-MiniMax model catalog and compatible endpoints	0
-model catalog staleness is advisory and route-consistent	3
-pre-push pytest is scoped without failing open	0
-loki help <command> and the daily log cap	2
-model picker is provider-aware (no claude models on codex)	2
-codex capability tiers resolve to distinct real models	0
-scoped issue fix skips greenfield-only phases	6
-a force-stop reports failure, not success	0
-the iteration cap considers evidence but stays a cap	5
-the user sees the rework split, not just the agent	1
-the token report counts cache tokens	1
-a terminal outcome names the next step	3
-loki why is rework-aware on the iteration cap	0
-loki why --json carries the rework split	1
-loki cost --json exposes the token breakdown	1
-all reporting surfaces agree about one run	3
-recorded exit codes match the failure contract	3
-the receipt shows disabled gates	0
-the public HTML receipt shows disabled gates	0
 the founder-decisions document is accurate	0
 entry-document pointers resolve	0
 a pause needs no TTY, and a run names its receipt	6
@@ -850,7 +529,6 @@ air-gapped read-only path (egress severed)	0
 doctor --airgap judges OLLAMA_HOST locality from the host, not a substring match	0
 proof phases CLI/API parity (one reader, two surfaces)	4
 web-app has no orphaned modules (reachable from main.tsx)	0
-web-app CommandPalette file-search failure is not no-results (node --test)	1
 the moat runner enforces every ratchet rule	13
 v10-pulse anti-drift status/violation reporter	14
 v10 drift-audit turn counter (every-6th-turn signal)	0
@@ -914,21 +592,15 @@ shard-durations.tsv drift detector (S-134)	2
 version-bump-only push skips heavy Tests jobs (S-132)	3
 council gate readers use the resolved -I -S interpreter (S-141)	3
 Metrics JSON Unmeasured	1
-the build's learnings are visible	0
-the spend-cap state is visible	0
+web-app workspace panels surface fetch failures (node --test)	1
+web-app chat completion never says Done. for a silent failure (node --test)	1
+dashboard checkpoint viewer shows a failed read, not empty (node --test)	0
+dashboard council transcripts show a failed hook-events read (node --test)	0
+dashboard task board keeps a server load error visible (node --test)	1
+dashboard API keys load error hides the empty state (node --test)	0
+a partly priced run renders as at least, never a total	1
+web-app CommandPalette file-search failure is not no-results (node --test)	1
 the Cost page budget banner has its own id	1
-trust-core tests detect their regressions	149
-a user-installed reviewer takes part in a run	1
-skill docs match source (gate flags, providers, tiers, index routing, seam)	1
-proof md (paste-able receipt, one renderer)	1
-air-gapped read-only path (egress severed)	1
-doctor --airgap judges OLLAMA_HOST locality from the host, not a substring match	0
-proof phases CLI/API parity (one reader, two surfaces)	4
-web-app has no orphaned modules (reachable from main.tsx)	0
-the moat runner enforces every ratchet rule	10
-v10-pulse anti-drift status/violation reporter	10
-v10 drift-audit turn counter (every-6th-turn signal)	0
-ShellCheck Linting	133
 prune-worktrees treats cherry-picked branches as merged (S-154)	2
 auto-capture shadow-write skips empty PROJECT_DIR and never splices importance (S-156)	32
 web-app NLSearch failed request is not no-results (S-159)	1
