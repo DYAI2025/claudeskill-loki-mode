@@ -5,6 +5,15 @@ incident, root cause with evidence, the guard, and the test that proves it
 fires. A guard with no checked-in test is marked PENDING with the slice ID
 that owns building it -- never claimed as done. Newest last.
 
+MERGED status is judged by whether the change is reachable from main,
+INCLUDING a patch-equivalent cherry-pick under a different SHA -- never by
+whether the original commit SHA is literally an ancestor of main. Check
+both: `git merge-base --is-ancestor <sha> main` for a direct ancestor, and
+`git cherry main <sha>` (a `-` line means an equivalent patch already
+exists on main) or `git log main --grep 'cherry picked from commit <sha>'`
+for a cherry-pick. A stale re-verification using only the ancestor check
+previously mismarked two merged guards (S-16, S-74) as PENDING.
+
 ## 1. Unscoped `pkill` terminated unrelated sessions (D14, D15)
 
 - **Incident:** an unscoped `pkill -f` pattern match, in a test and
@@ -62,18 +71,20 @@ that owns building it -- never claimed as done. Newest last.
   shows only deletions with no matching insertions (DECISIONS.md D18).
   Mechanical enforcement at commit time -- a PreToolUse hook blocking a
   BOARD.md commit that drops existing rows (D26 guard 1) -- is
-  `scripts/v10-guard.sh`, **PENDING (S-73)**: as of this writing it is on its
-  third review round, having needed 12 reproduced gaps closed in an earlier
-  round. A narrower mechanical guard for one specific write path
-  (`board-row-status` in `scripts/v10-ops.sh`, which verifies the target row
-  changed in exactly its Status cell and restores the original on any other
-  mismatch) is also **PENDING (S-74)**.
+  `scripts/v10-guard.sh`, **MERGED (S-73)**: `db51311a`..`e9170698` are all
+  direct ancestors of main (`git merge-base --is-ancestor <sha> main`),
+  landing in release train 2 (v9.57.0, commit `5332bfc3`). A narrower
+  mechanical guard for one specific write path (`board-row-status` in
+  `scripts/v10-ops.sh`, which verifies the target row changed in exactly its
+  Status cell and restores the original on any other mismatch) is also
+  **MERGED (S-74)**, via cherry-pick `8fbbbb31` (verified below, section 7).
 - **The test that proves it fires:** none checked in for the general Read
   then Edit discipline -- it is a process rule, not code, so there is
   nothing to unit-test. `scripts/v10-guard.sh`'s BOARD.md-row-drop block and
-  its test are **PENDING (S-73)**. `board-row-status`'s byte-for-byte
+  its test are **MERGED (S-73)**: `tests/test-v10-guard.sh` is present on
+  main (925/640-line files respectively). `board-row-status`'s byte-for-byte
   post-write verification and its tests in `tests/test-v10-ops.sh` are
-  **PENDING (S-74)**.
+  **MERGED (S-74)** (same `8fbbbb31` cherry-pick).
 
 ## 3. CI self-cancellation on every push to main (D25)
 
@@ -206,32 +217,43 @@ that owns building it -- never claimed as done. Newest last.
   bits, so the commit itself looks unchanged while the working tree's real
   permissions quietly regress (S-16 fix commit `254c3c85`; S-74 fix commit
   `e5dc3d28`, same underlying mechanism).
-- **The guard:** S-16, commit `254c3c85`, **PENDING** -- re-verified against
-  main with `git merge-base --is-ancestor 254c3c85 main` (non-zero, not an
-  ancestor): that commit lives only on branch `s16-rework-permission-fix`.
-  Main's `scripts/release.sh` has no `apply_sed`/`bump_all_version_files`
-  function at all today, so the described fix (`cp -p "$file" "$tmp"`
-  immediately after `mktemp`, before the `sed -E ... > "$tmp"` redirect --
-  `cp -p` copies the original's mode onto the temp file, and the subsequent
-  `>` redirect truncates that inode's content in place rather than
-  recreating it, so the copied mode survives) is not present on main. This
-  entry previously read "merged"; that was false. S-74 (commit `e5dc3d28`,
-  **PENDING**, not yet merged either -- same `git merge-base` check):
+- **The guard:** S-16, originally commit `254c3c85`, is **MERGED** -- re-
+  verified against CURRENT main (this entry had gone stale: an earlier
+  re-verification found `254c3c85` not an ancestor and `apply_sed` absent
+  from main, which was true of main AT THAT TIME but is no longer true).
+  `git log main --grep 254c3c85` finds `c681a726` ("fix(release): preserve
+  file permissions in apply_sed (BACKLOG 22, S-16 rework)"), a rebase of the
+  same fix, and `scripts/release.sh` on main today has `apply_sed()` with
+  `cp -p "$file" "$tmp"` immediately after `mktemp`, before the
+  `sed -E ... > "$tmp"` redirect (verified by reading main's
+  `scripts/release.sh` directly, lines 144-153) -- `cp -p` copies the
+  original's mode onto the temp file, and the subsequent `>` redirect
+  truncates that inode's content in place rather than recreating it, so the
+  copied mode survives. Judged correctly this time by whether the change
+  (not the original SHA) is on main. S-74 (originally commit
+  `e5dc3d28`) is **MERGED** -- landed on main as cherry-pick `8fbbbb31`
+  (`git log main --grep 'cherry picked from commit e5dc3d28'` finds it, and
+  `git cherry main e5dc3d28` reports it patch-equivalent, "-"): status must
+  be judged by whether the change is on main INCLUDING patch-equivalent
+  cherry-picks, not by whether the original SHA is literally an ancestor --
+  `254c3c85` above genuinely has neither, `e5dc3d28` has the cherry-pick.
   `shutil.copymode(board, tmp_path)` before EACH `os.replace` call (the main
   write and the corruption-restore path), shared through one
-  `_atomic_write()` helper so both preserve the real board file's mode.
-- **The test that proves it fires:** S-16 -- none checked in; the fix was
-  verified manually only (an isolated 644-in/600-out-without-the-fix repro,
-  plus a full `bump_all_version_files` run against a scratch git-archive
-  copy showing all 14 files retained distinctive non-default modes 640/664
-  across two consecutive runs), per commit `254c3c85`'s own message. That
-  manual verification ran against the `s16-rework-permission-fix` branch,
-  not main. This gap is exactly why the S-74 recurrence was not caught
-  sooner by a regression suite. **PENDING (S-16)** until `254c3c85` (or an
-  equivalent fix) actually merges to main. S-74 -- `tests/test-v10-ops.sh`'s
+  `_atomic_write()` helper so both preserve the real board file's mode, is
+  live in `scripts/v10-ops.sh` on main today (`grep -c shutil.copymode` ->
+  2).
+- **The test that proves it fires:** S-16 -- `tests/test-release-sh.sh` is
+  checked in on main and wired into `tests/run-all-tests.sh`
+  ("release.sh version-bump preserves file mode (BACKLOG 22)", line 1180),
+  added in commit `00a9425c`. **MERGED (S-16).** The manual-only
+  verification this entry previously described (an isolated 644-in/600-out
+  repro against the `s16-rework-permission-fix` branch, not main) is
+  superseded by that checked-in test now running on every main commit --
+  this is exactly the regression-suite gap the S-74 recurrence exposed,
+  now closed. S-74 -- `tests/test-v10-ops.sh`'s
   "a 644 board stays 644 after a flip" and "...after a corruption-triggered
-  restore" cases (commit `e5dc3d28`); **PENDING (S-74)** until that slice
-  merges.
+  restore" cases; **MERGED (S-74)** via `8fbbbb31`, same cherry-pick
+  verification as above.
 
 ## 8. BOARD cell located by header index broke on short/long rows (S-74)
 
@@ -250,17 +272,161 @@ that owns building it -- never claimed as done. Newest last.
   cell count that does not match their header's (30 missing the Acceptance
   checks column, 2 with an extra cell from an embedded `|` inside Notes), so
   a fixed header-column index is invalid on those rows.
-- **The guard:** commit `9f8389b9` (**PENDING**, stacked on `e5dc3d28`, not
-  yet merged) keeps the header-index lookup as the primary path only when
-  the row's cell count equals its header's; when the counts differ, it
-  falls back to locating the Status cell as the one cell matching a KNOWN
+- **The guard:** commit `9f8389b9` (originally stacked on `e5dc3d28`) is
+  **MERGED** -- its diff is patch-equivalent to what shipped on main
+  (`git cherry main 9f8389b9` reports it "-"): `8fbbbb31`'s own commit
+  message (section C) describes this exact header-lookup fallback as part
+  of the same squashed cherry-pick that landed `e5dc3d28`'s mode-preservation
+  fix, so both original SHAs are represented by the one `8fbbbb31` commit on
+  main. It keeps the header-index lookup as the primary path only when the
+  row's cell count equals its header's; when the counts differ, it falls
+  back to locating the Status cell as the one cell matching a KNOWN
   lifecycle token plus a full UTC timestamp (never a loose shape scan), and
   refuses (exit 2) if zero or more than one cell matches either path.
 - **The test that proves it fires:** `tests/test-v10-ops.sh`'s sweep over
   all 79 real slice rows in `docs/v10/BOARD.md` (each on a fresh copy,
   asserting exactly one line and exactly one cell changed per flip,
   independent of the tool's own internal verification), plus isolated
-  short-row and embedded-pipe-in-notes reproductions (commit `9f8389b9`).
-  Full suite 48/48; a mutation forcing the fallback path always
-  (`if len(cells) == len(header_cells): -> if True:`) sent 34 tests red.
-  **PENDING (S-74)** until that slice merges.
+  short-row and embedded-pipe-in-notes reproductions (originally commit
+  `9f8389b9`, now part of `8fbbbb31` on main). Full suite 52/52 per
+  `8fbbbb31`'s own message; a mutation forcing the fallback path always
+  (`if len(cells) == len(header_cells): -> if True:`) sent tests red.
+  **MERGED (S-74)** via `8fbbbb31`.
+
+## 9. Push reported success through a pipe while the remote held the old SHA (D27)
+
+- **Incident:** train 2's first push attempt was killed by its own 10-minute
+  command timeout. The second attempt reported success -- piped through a
+  filter, exit code read 0 -- while `git ls-remote origin refs/heads/main`
+  still showed the PRIOR head `b651b98d`, not the pushed SHA (DECISIONS.md
+  D27 context). A push can read green while the remote never moved.
+- **Root cause with evidence:** the push command's real exit status was
+  taken from the pipeline's last stage (the filter it was piped through),
+  not from `git push` itself -- the same exit-code-through-a-pipe class this
+  repo's own memory already names (`feedback-pipefail-sigpipe-inverts-probe`,
+  `feedback-i-cancelled-my-own-release`): a pipe silently discards the
+  left-hand command's real exit code unless `pipefail` is set and checked.
+  D27's own fix direction is explicit: "never pipe git push."
+- **The guard:** D27 (Loki-approved) mandates (1) never pipe `git push`, and
+  (2) a push counts as done only when `git ls-remote origin refs/heads/main`
+  equals `git rev-parse HEAD`, recorded as evidence and mechanically
+  enforced by a push helper in `scripts/v10-ops.sh` -- cut as slice **S-98
+  push-main** (D27 items 3 and 6), `ready@2026-09-27T15:53Z` on BOARD.md as
+  of this writing, not yet built. The train-2 and release pushes that
+  followed D27 were manually verified this way instead (D27's own evidence
+  line: `git rev-parse HEAD` = `git ls-remote origin refs/heads/main` =
+  `89e350bd...` at 15:48:18Z, and `= 5332bfc3...` at 15:50:09Z), which is the
+  discipline S-98 is meant to make structural instead of manual.
+- **The test that proves it fires:** none checked in yet. **PENDING (S-98)**
+  -- the slice card's own acceptance check specifies "the push helper
+  returns non-zero when the remote does not match."
+
+## 10. Local CI's fast tier exceeded the 10-minute command cap under swarm load (D27)
+
+- **Incident:** the "Local CI Before Every Push" fast-tier gate (mandated
+  2026-07-31) took more than 10 minutes to run under swarm load -- 90 of 173
+  checks hit the 600-second cap and reported `EXIT=124` -- and the
+  `.githooks/pre-push` hook's own serial `pytest` run alone exceeded 10
+  minutes by itself. Train 2 sat unpushed for more than 89 minutes waiting
+  on a gate that could not finish inside the timeout budget every command in
+  this repo is bound to.
+- **Root cause with evidence:** the fast tier's own justification (this
+  file's CLAUDE.md predecessor, "Local CI Before Every Push," 2026-07-31)
+  was sized against a much smaller swarm; DECISIONS.md D27's own context
+  line states both measurements directly ("90 of 173 checks at the 600s
+  cap, EXIT=124" and "the pre-push hook's serial pytest alone exceeded 10
+  minutes"). A gate that cannot finish inside the hard command cap is not a
+  fast pre-push gate, it is a second full CI run duplicating GitHub Actions'
+  own Tier B.
+- **The guard:** D27 (Loki-approved) retires the local-ci fast-tier mandate
+  outright: before a push, only syntax checks (`bash -n`, `py_compile`) plus
+  the slice's own tests, capped at 60 seconds, run locally; GitHub CI (Tier
+  B) becomes the sole release gate. The mandate's retraction is already in
+  force per DECISIONS.md D27 (choice 1). The corresponding hook change --
+  `.githooks/pre-push` reduced to identity check + `bash -n` + a red-main
+  warning only, no `pytest`, target under 5 seconds -- is cut as slice
+  **S-97** (D27 item 2), `ready@2026-09-27T15:53Z` on BOARD.md as of this
+  writing, not yet built.
+- **The test that proves it fires:** none checked in yet. **PENDING (S-97)**
+  -- the slice card's own acceptance check specifies "the hook finishes
+  under 5s on this repo (timed 3x); a wrong identity and a bash -n error
+  still block; no pytest invocation remains."
+
+## 11. A builder's glob `rm -f` ran in the shared scratchpad root (S-18)
+
+- **Incident:** during the S-18 build (Rule-of-Two SSH/credential hardening),
+  a builder ran a glob-matched `rm -f` directly against the shared
+  scratchpad root instead of a run-owned subdirectory, risking deletion of
+  other concurrent agents' files in that same shared root. Disclosed inline
+  on BOARD.md's S-18 row ("Incidents during the build: a glob rm in the
+  shared scratchpad root ... (removed)").
+  This is the same incident class this repo's own memory already names
+  (`feedback-tmp-cleanup-glob-deleted-worktree`: `rm -rf /tmp/loki-*` matched
+  and deleted an unrelated worktree) recurring in a different shared
+  location.
+- **Root cause with evidence:** a glob pattern scoped only to a shared root
+  directory (not to a single mkdir-created, ownership-marked, permission-
+  narrowed subdirectory) matches every sibling file or directory any other
+  concurrent agent has placed there at the same moment -- there is no
+  per-run isolation boundary for the glob to respect. This repo's own
+  `loki_run_tmp_create`/`loki_run_tmp_cleanup` convention (CLAUDE.md, "Test
+  and Resource Cleanup") exists precisely to close this class for `/tmp`;
+  the scratchpad root had no equivalent discipline applied at the time of
+  this incident.
+- **The guard:** none yet. No slice has been cut to extend the
+  `loki_run_tmp_create`/`loki_run_tmp_cleanup` discipline (or an equivalent
+  per-agent-subdirectory convention) to the shared scratchpad root, and no
+  mechanical guard (for example, a `scripts/v10-guard.sh` PreToolUse rule
+  blocking an unscoped `rm -f`/`rm -rf` with a glob directly under a shared
+  root) exists today. **PENDING, no slice cut.**
+- **The test that proves it fires:** none. **PENDING, no slice cut.**
+
+## 12. A test fixture wrote synthetic `insteadOf` lines to the real `~/.gitconfig` (S-18)
+
+- **Incident:** during the same S-18 build, a test/fixture for the P9
+  Rule-of-Two credential work wrote 4 synthetic `insteadOf` lines directly
+  into the operator's real `~/.gitconfig` instead of an isolated config file
+  scoped to the test. Disclosed and remediated inline on BOARD.md's S-18 row
+  ("4 synthetic insteadOf lines written to the real ~/.gitconfig (removed;
+  grep of ~/.gitconfig for loki-test/insteadOf found none at 15:40)").
+- **Root cause with evidence:** a git-credential/URL-rewrite fixture used
+  the ambient `$HOME` (and therefore the real `~/.gitconfig`) as its target
+  instead of pointing git at an isolated config via `GIT_CONFIG_GLOBAL` or a
+  scratch `HOME` override -- the exact hazard this session's own current
+  task instructions explicitly call out ("Never touch the real
+  `~/.gitconfig`; scratch files only in your own subdirectory"), confirming
+  this is a known, recurring risk class for any test that touches git
+  config, not a one-off.
+- **The guard:** none yet. No slice has been cut to enforce, mechanically,
+  that a test writing git config (`insteadOf`, `url.*.insteadOf`,
+  credential helpers, or similar) must set `GIT_CONFIG_GLOBAL`/`HOME` to a
+  scratch path before writing rather than touching the ambient one. **NO
+  GUARD.**
+- **The test that proves it fires:** none. **PENDING, no slice cut.**
+
+## 13. Slices marked released before `publish-npm` had actually succeeded (D27)
+
+- **Incident:** 11 BOARD.md rows (S-67, S-68, S-71, S-73, S-74, S-75, S-78,
+  S-80, S-86, S-87, S-90) were each written as `released@2026-09-27T15:54Z`
+  immediately after train 2's push landed and was `ls-remote`-verified, then
+  each row's own Notes cell carries the identical self-correction:
+  "Correction 15:54: I had marked this released too early." "Pushed and
+  verified on the remote" was conflated with "released," before the
+  `publish-npm` CI job had actually completed.
+- **Root cause with evidence:** DECISIONS.md D27 (choice 5) defines
+  "released" precisely: "a train counts as released when publish-npm
+  succeeds. The next train opens immediately, without waiting for npm's
+  availability lag, Docker or Homebrew." At the moment those 11 rows were
+  stamped `released`, only the push itself (verified via `ls-remote`) had
+  happened -- a necessary but not sufficient condition under D27's own
+  definition. Nothing mechanically checked `publish-npm`'s CI conclusion
+  before the BOARD.md write, so a human (or agent) stamping the row could
+  and did jump the gun on all 11 rows in the same train.
+- **The guard:** D27's own definition is the standing rule; enforcing it
+  mechanically (for example, a `board-row-status` precondition, or a pulse
+  check, that refuses/flags a `released` write unless the corresponding
+  `publish-npm` GitHub Actions run for that train's SHA has `conclusion:
+  success`) has not been built. **PENDING, no slice cut** for the
+  mechanical check; the manual self-correction on all 11 rows is the only
+  remediation applied so far.
+- **The test that proves it fires:** none. **PENDING, no slice cut.**
