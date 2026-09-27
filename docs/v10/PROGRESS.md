@@ -691,3 +691,38 @@ per-suite instrumentation task genuinely this large, or is the builder
 stuck on something) rather than continuing to wait passively -- check
 its actual diff-in-progress via Read, not just its transcript
 timestamp, to confirm real forward progress on the deliverable itself.
+
+### Drift audit (turn 90, 6-hour window)
+
+**Matched CONTROL.md:** the turn-84 correction (verify S-44's real
+diff-in-progress, not just its transcript timestamp) was followed
+before this audit even fired -- checked `git diff --stat` in its
+worktree and found genuine, substantial progress (463 lines across
+the shard-runner script and a dist rebuild). Priority order held under
+a real test: S-18's builder found a genuine, live, exploitable
+credential-exfiltration vulnerability (GH CLI's hosts.yml, unprotected
+by the existing env-var-only withhold) mid-build, correctly stopped
+before choosing a fix mechanism rather than shipping a guess, and it
+was immediately escalated to HIGH tier and dispatched under standing
+autonomous authority -- moat/security work correctly jumped the queue
+ahead of routine P7-scanner rework and the release-blocker chase.
+
+**Drifted:** S-44 is STILL not merged after over 1.5 hours -- now the
+longest single build of this entire session, well past the point
+turn-84's own correction said to investigate. Real progress is
+confirmed (not stalled), but the SCOPE may be larger than a single
+MEDIUM-tier slice should carry (per-suite timeout instrumentation
+across 323 suites, synthetic hang verification, and apparently a
+dist rebuild suggesting Bun-side changes too, which seems out of
+scope for a bash-shard-runner fix). NO_RECENT_RELEASE has now stood
+for over 6 hours.
+
+**Correction for the next 6 hours:** when S-44 reports back, check
+whether its diff genuinely stayed scoped to the shard-runner shell
+script as assigned, or scope-crept into unrelated areas (the dist
+rebuild is a red flag worth investigating first). If NO_RECENT_RELEASE
+is still standing at the next audit (turn 96) with S-44 STILL not
+merged, treat continuing to wait for it as itself the wrong call --
+consider whether a smaller, faster mitigation (e.g., just increasing
+the job-level timeout-minutes as an interim workaround) would unblock
+the release sooner while S-44's fuller fix continues in the background.
