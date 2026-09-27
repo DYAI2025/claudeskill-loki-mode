@@ -952,6 +952,67 @@ def whole_file_findings(s):
             arg0 = split_top(s[p + 1:j])
             if arg0 and arg0[0].startswith('['):
                 add_rows(p + 1 + s[p + 1:j].index('['), 'literal sample rows via Array.from()')
+    # --- Array.from({length:N}, generator) fabrication bypass (BACKLOG 125 B-8) -
+    # the arm above only sees a literal FIRST argument, so a generator callback
+    # that fabricates static string fields per row (`(_, i) => ({ id: i,
+    # action: 'Deployed', user: 'Admin' })`) was invisible. Scoped narrowly:
+    #   - arg0 must be exactly `{ length: N }` (a real iterable argument, e.g.
+    #     `Array.from(items, ...)`, is untouched -- that is real iteration, not
+    #     invented rows).
+    #   - arg1 must be a concise-body arrow returning an object literal.
+    #   - the arrow's own parameters (the index, conventionally `i`) are
+    #     substituted with `0` before reusing is_literal, since an index is a
+    #     counter, not invented data -- `(_, i) => ({ id: i })` stays GREEN.
+    #   - at least one field must still be a literal STRING after that
+    #     substitution: the fabrication signal this arm targets (an
+    #     index/derived-only row has none and stays GREEN).
+    # ponytail: does not see [...Array(n)].map, new Array(n).fill().map,
+    # Array.from({length:n}).map((_, i) => ({...})) (the chained form), a
+    # typed param list (`(_: unknown, i: number) =>`, since ARROW_HEAD has no
+    # `:` in its class), `{ length }` shorthand (obj_pairs returns None with
+    # no colon), block-bodied `=> { return {...} }` callbacks, function
+    # callbacks, or a templated id (`` `row-${i}` ``, already rejected by
+    # is_literal's backtick-`${` check). Upgrade only if review finds a real
+    # instance.
+    ARROW_HEAD = re.compile(r'^\(?\s*([\w$,\s]*)\s*\)?\s*=>\s*')
+    for m in ARRAY_OF.finditer(s):
+        if m.group(1) != 'from':
+            continue
+        p = m.end() - 1
+        j = close_of(s, p)
+        if j < 0:
+            continue
+        args = split_top(s[p + 1:j])
+        if len(args) != 2:
+            continue
+        arg0, arg1 = args[0].strip(), args[1].strip()
+        pairs0 = obj_pairs(arg0) if arg0.startswith('{') and close_of(arg0, 0) == len(arg0) - 1 else None
+        if pairs0 is None or [k for k, _ in pairs0] != ['length']:
+            continue
+        head = ARROW_HEAD.match(arg1)
+        if not head:
+            continue
+        body = arg1[head.end():].strip()
+        if not (body.startswith('(') and close_of(body, 0) == len(body) - 1):
+            continue
+        inner = body[1:-1].strip()
+        if not inner.startswith('{'):
+            continue
+        params = {pn.strip() for pn in head.group(1).split(',') if pn.strip()}
+        subbed = inner
+        for pname in params:
+            subbed = re.sub(r'(?<![\w$])' + re.escape(pname) + r'(?![\w$])', '0', subbed)
+        if not is_literal(subbed):
+            continue
+        gen_pairs = obj_pairs(inner)
+        if not gen_pairs or not any(STR.fullmatch(v.strip()) for _, v in gen_pairs):
+            continue
+        idx = s.index(inner, p)
+        end = idx + len(inner) - 1
+        if any(a <= idx <= b for a, b in spans):
+            continue
+        spans.append((idx, end))
+        out.append((line_of(s, idx), 'fabricated static fields via Array.from() generator callback'))
     return sorted(set(out))
 DEF = re.compile(r'^(?:export\s+(?:default\s+)?)?(?:function\s+([A-Z]\w*)|const\s+([A-Z]\w*)\s*[:=])', re.M)
 TAG = re.compile(r'<([A-Z]\w*)[\s/>]')
@@ -1380,6 +1441,30 @@ export function TM() {
   return null;
 }
 TSX
+    # BACKLOG 125 B-8 (S-32): Array.from({length:N}, generator) fabrication.
+    # Positive: a generator callback inventing static string fields per row
+    # (no sample/mock/demo/fake/placeholder name, not in a catch, no `[`
+    # anywhere so the setter-span and Array.of()/Array.from()-literal-arg arms
+    # cannot claim it -- only the new arm can).
+    cat > "$d/src/components/ArrayFromGenFabricated.tsx" <<'TSX'
+export function AG() {
+  const rows = Array.from({ length: 3 }, (_, i) => ({ id: i, action: 'Deployed', user: 'Admin' }));
+  return rows.length;
+}
+TSX
+    # Negative look-alikes: bare index, derived-only fields (id only), a real
+    # iterable source with a static tag (not a {length} generator, so out of
+    # this arm's narrow scope), and a {length} generator reading real data by
+    # index (no static string field, only a passthrough value).
+    cat > "$d/src/components/ArrayFromGenHonest.tsx" <<'TSX'
+export function AH({ items, data }) {
+  const ids = Array.from({ length: 3 }, (_, i) => i);
+  const idOnly = Array.from({ length: 3 }, (_, i) => ({ id: i }));
+  const tagged = Array.from(items, (x) => ({ id: x.id, kind: 'row' }));
+  const fromData = Array.from({ length: data.length }, (_, i) => ({ id: i, value: data[i] }));
+  return ids.length + idOnly.length + tagged.length + fromData.length;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -1427,6 +1512,17 @@ EOF
         ReassignFallback.tsx:1 ReassignHonest.tsx:0 \
         AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
         ModuleTablesHonest.tsx:0 TimerHonest.tsx:0; do
+        f="${want%%:*}"
+        got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
+        [ "$got" = "${want##*:}" ] \
+            || { echo "$f has $got finding(s), want ${want##*:}: $(grep "^FINDING.*$f:" <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    done
+    # BACKLOG 125 B-8 (S-32) own check, kept separate from the shared loops
+    # above to stay additive against S-29/S-30/S-31 editing this same
+    # function concurrently.
+    grep -q "^FINDING [a-z/]*ArrayFromGenFabricated.tsx:2 fabricated static fields via Array.from() generator callback" <<<"$out" \
+        || { echo "missed ArrayFromGenFabricated.tsx:2 fabricated static fields via Array.from() generator callback: $(grep '^FINDING.*ArrayFromGenFabricated' <<<"$out" | tr '\n' ' ' | head -c 200)"; return 1; }
+    for want in ArrayFromGenFabricated.tsx:1 ArrayFromGenHonest.tsx:0; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
