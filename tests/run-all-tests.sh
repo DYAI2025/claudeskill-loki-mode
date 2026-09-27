@@ -840,6 +840,7 @@ run_test "shipped modules have a recorded reachability verdict" "$SCRIPT_DIR/tes
 run_test "loki proof chain fronts the buyer verifier" "$SCRIPT_DIR/test-proof-chain-command.sh"
 run_test "workflow RC handlers are reachable under bash -e" "$SCRIPT_DIR/test-workflow-rc-capture.sh"
 run_test "issue-to-PR action and workflow ship, gate and split agent from publish" "$SCRIPT_DIR/test-issue-to-pr-action.sh"
+run_test "no shipped action runs the agent in a step holding a GitHub token" "$SCRIPT_DIR/test-action-agent-step-no-token.sh"
 run_test "model substitutions are visible and attributable" "$SCRIPT_DIR/test-model-substitution-visible.sh"
 run_test "the completion council reports its duration" "$SCRIPT_DIR/test-council-stage-timing.sh"
 run_test "a gate that scanned nothing is not a pass" "$SCRIPT_DIR/test-static-analysis-noop-not-pass.sh"
