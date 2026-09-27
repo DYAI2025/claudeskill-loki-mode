@@ -5463,11 +5463,32 @@ except Exception:
 # (or absence), the real GIT_CONFIG_COUNT/KEY/VALUE state (or absence), and
 # the real SSH_AUTH_SOCK/GIT_SSH_COMMAND state (or absence) around the one
 # trusted command, then re-apply the withhold afterward -- this repo's own
-# trusted git operations (create_session_pr, on_run_complete's git push,
-# proof-check.sh) use whatever `origin` is configured as, which is not
-# hardcoded to HTTPS, so an SSH-origin user's Loki-initiated push must still
-# work; the SSH sentinel needs the same re-grant path as the token vars, not
-# a simpler one.
+# trusted git operations (create_session_pr, on_run_complete's push,
+# proof-check.sh) push to an https or ssh GitHub origin, so an SSH-origin
+# user's Loki-initiated push must still work; the SSH sentinel needs the same
+# re-grant path as the token vars, not a simpler one.
+#
+# Restoring credentials is only safe if the credentialed process does not
+# also load code the agent controls (round 5). Until round 5 it did: the
+# trusted push was a `git push` inside the agent's working tree, so the
+# agent's repo config (.git/hooks, core.hooksPath, core.sshCommand, a
+# repo-local credential.helper, core.fsmonitor, url.*insteadOf, include/
+# includeIf) ran holding every restored credential. Now the push goes through
+# _loki_trusted_push (fresh Loki-owned repo, origin URL read as data and
+# accepted only as a github.com https/ssh URL) and every trusted gh call runs
+# from / with GH_REPO (_loki_run_neutral), so no credentialed git or gh process
+# loads the agent's repo config. What the trusted step still trusts:
+#   - the operator's GLOBAL and SYSTEM git config (they carry the real
+#     credential helper). An agent that writes ~/.gitconfig, /etc/gitconfig or
+#     an included file there gets the same code execution back; this is the
+#     same-user filesystem class as editing ~/.ssh or a shell rc file.
+#   - the branch contents, which are the agent's work by design (Loki pushes
+#     them for review; nothing in them executes during the push).
+#   - the origin OWNER/REPO the agent's config names: the agent can point the
+#     push at another github.com repository. GitHub still enforces the
+#     operator token's permissions there.
+# A non-GitHub origin is no longer pushed at all (LOKI_AUTO_PR=1 used to push
+# to any origin).
 #
 # This is hygiene against a naive injection, not an isolation boundary: code
 # running as the same user can still read the parent's environment block
@@ -5696,7 +5717,14 @@ _loki_gh_apply() {
     export GIT_SSH_COMMAND=false
     _LOKI_SSH_WITHHELD=1
     if command -v gh >/dev/null 2>&1; then
-        gh() { _loki_with_github_tokens command gh "$@"; }
+        # Repo read as data BEFORE the credentials come back; gh then runs
+        # from / (round 5: gh's own git calls must not load the agent's repo
+        # config while holding the real credentials).
+        gh() {
+            local _gh_repo
+            _gh_repo="$(_loki_trusted_repo)"
+            _loki_with_github_tokens _loki_run_neutral "$_gh_repo" command gh "$@"
+        }
     fi
 }
 
@@ -5754,6 +5782,100 @@ _loki_with_github_tokens() {
     if [ "$_outermost" -eq 1 ] && [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
         _loki_gh_apply
     fi
+    return "$_rc"
+}
+
+#-------------------------------------------------------------------------------
+# BACKLOG 149 round 5: a credentialed git or gh process never loads the agent's
+# repo config.
+#
+# _loki_with_github_tokens hands the real credentials back for one command. If
+# that command is `git push` run inside the agent's working tree, git loads the
+# agent-writable repo config first: .git/hooks/pre-push, core.hooksPath,
+# core.sshCommand, a repo-local credential.helper, core.fsmonitor,
+# url.insteadOf/pushInsteadOf, include/includeIf. Two reviewers reproduced a
+# planted pre-push hook reading the real GH_TOKEN and SSH_AUTH_SOCK, and
+# `git credential fill` returning the operator's password. `-c
+# core.hooksPath=/dev/null` alone does not stop core.sshCommand, and a list of
+# per-key overrides would have to stay complete forever.
+#
+# So the credentialed step never runs with that config loaded:
+#   - push: read remote.origin.url as DATA (no credentials), accept only a
+#     github.com https/ssh URL, fetch the branch into a fresh Loki-owned repo
+#     (the fetch runs upload-pack in the agent repo WITHOUT credentials), then
+#     push from that repo with the credentials restored.
+#   - gh: run from / with GH_REPO set to the validated origin, so gh's own git
+#     calls find no repository. An explicit --repo/-R still overrides GH_REPO.
+# The operator's global/system git config still loads (it holds the real
+# credential helper); an agent that can write ~/.gitconfig is a same-user
+# filesystem residual, disclosed in the header above.
+#-------------------------------------------------------------------------------
+
+# Echo OWNER/REPO for a github.com origin URL, else fail. Accepted forms:
+# https://github.com/O/R[.git], git@github.com:O/R[.git],
+# ssh://git@github.com/O/R[.git]. Anything else (other hosts, embedded
+# credentials, extra path segments, odd characters) is rejected.
+_loki_github_repo_from_url() {
+    local _u="${1:-}" _p
+    case "$_u" in
+        https://github.com/*) _p="${_u#https://github.com/}" ;;
+        git@github.com:*) _p="${_u#git@github.com:}" ;;
+        ssh://git@github.com/*) _p="${_u#ssh://git@github.com/}" ;;
+        *) return 1 ;;
+    esac
+    _p="${_p%.git}"
+    case "$_p" in
+        */*/* | /* | */ | */.* | .* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
+        ?*/?*) printf '%s\n' "$_p" ;;
+        *) return 1 ;;
+    esac
+}
+
+# OWNER/REPO of TARGET_DIR's origin, read as data, or nothing.
+_loki_trusted_repo() {
+    _loki_github_repo_from_url "$(git -C "${TARGET_DIR:-.}" config --get remote.origin.url 2>/dev/null)" 2>/dev/null || true
+}
+
+# _loki_run_neutral <owner/repo|""> <cmd...>: run cmd from / so no repository
+# (and so no repo config) is discovered, with GH_REPO naming the repo for gh.
+# A subshell, so functions stay callable; callers pass `command gh` to reach
+# the binary.
+_loki_run_neutral() {
+    local _repo="$1"
+    shift
+    (
+        cd / || exit 1
+        unset GIT_DIR GIT_WORK_TREE
+        if [ -n "$_repo" ] && [ -z "${GH_REPO:-}" ]; then
+            export GH_REPO="$_repo"
+        fi
+        "$@"
+    )
+}
+
+# _loki_trusted_push <runner> <repo-dir> <branch>: push <branch> of the agent
+# repo to its github.com origin without loading the agent repo's config in
+# the credentialed process. <runner> is the credential re-grant wrapper
+# (_loki_with_github_tokens, or on_run_complete's timed _loki_net). The agent
+# repo's branch gets no upstream set (it did with `push -u`); nothing reads it.
+_loki_trusted_push() {
+    local _runner="$1" _dir="$2" _branch="$3" _url _tmp _rc=1
+    _dir="$(cd "$_dir" 2>/dev/null && pwd -P)" || return 1
+    git check-ref-format --branch "$_branch" >/dev/null 2>&1 || return 1
+    _url="$(git -C "$_dir" config --get remote.origin.url 2>/dev/null)" || return 1
+    if ! _loki_github_repo_from_url "$_url" >/dev/null; then
+        log_warn "Not pushing: origin is not a github.com https/ssh URL (Loki pushes only to a validated GitHub origin)."
+        return 1
+    fi
+    _tmp="$(mktemp -d "${TMPDIR:-/tmp}/loki-push.XXXXXX")" || return 1
+    if git init -q --template= "$_tmp" >/dev/null 2>&1 \
+        && git -C "$_tmp" fetch -q --no-tags "$_dir" "+refs/heads/$_branch:refs/heads/$_branch" >/dev/null 2>&1; then
+        _rc=0
+        # `-C "$_tmp"`: git starts repository discovery in the fresh repo, so
+        # the agent repo is never found, whatever the caller's cwd.
+        "$_runner" git -C "$_tmp" push -q "$_url" "refs/heads/$_branch:refs/heads/$_branch" || _rc=$?
+    fi
+    rm -rf "$_tmp"
     return "$_rc"
 }
 
@@ -5865,11 +5987,16 @@ on_run_complete() {
     # The push and gh calls below are the trusted post-session step, so they
     # get the withheld GitHub token back (a plain `timeout 30 gh` would exec
     # the binary and bypass the gh() wrapper).
+    # Round 5: every call runs from / (_loki_run_neutral) with GH_REPO read as
+    # data first, so neither gh nor git loads the agent's repo config while
+    # holding the credentials; the push goes through _loki_trusted_push.
     _loki_net() {
+        local _net_repo
+        _net_repo="$(_loki_trusted_repo)"
         if command -v timeout >/dev/null 2>&1; then
-            _loki_with_github_tokens timeout 30 "$@"
+            _loki_with_github_tokens _loki_run_neutral "$_net_repo" timeout 30 "$@"
         else
-            _loki_with_github_tokens "$@"
+            _loki_with_github_tokens _loki_run_neutral "$_net_repo" "$@"
         fi
     }
     # Require gh + auth.
@@ -5895,7 +6022,7 @@ on_run_complete() {
     log_info "LOKI_DELEGATE_PR=1: opening a local pull request for branch '$branch'..."
     # Push, then create. Non-interactive (no tty in --bg). Best-effort, each
     # network call bounded by the timeout guard above.
-    (cd "${TARGET_DIR:-.}" && _loki_net git push -u origin "$branch") >/dev/null 2>&1 || true
+    _loki_trusted_push _loki_net "${TARGET_DIR:-.}" "$branch" >/dev/null 2>&1 || true
     local pr_title
     pr_title="Loki Mode: ${branch}"
     local pr_url=""
@@ -11014,7 +11141,10 @@ create_session_pr() {
 
     # OPT-IN (LOKI_AUTO_PR=1): legacy auto push + PR, now with the correct base.
     log_info "Pushing agent branch: $branch_name"
-    if ! git push -u origin "$branch_name" 2>/dev/null; then
+    # Round 5: never a credentialed `git push` inside the agent's repo (its
+    # config -- hooks, sshCommand, credential.helper -- would run holding the
+    # operator's credentials). See _loki_trusted_push.
+    if ! _loki_trusted_push _loki_with_github_tokens . "$branch_name" 2>/dev/null; then
         log_warn "Failed to push agent branch: $branch_name"
         return 1
     fi
@@ -29013,9 +29143,12 @@ main() {
     # then advise the user how to open a PR. Both are no-ops when no agent branch
     # was set up (LOKI_BRANCH_PROTECTION=false) or nothing changed.
     commit_session_changes
-    # Trusted post-session step: it gets the GitHub token main() withheld from
-    # agent sessions (its push may authenticate through the env token).
-    _loki_with_github_tokens create_session_pr
+    # Trusted post-session step. NOT wrapped in _loki_with_github_tokens as a
+    # whole (round 5): that ran every git call inside it (rev-list, merge-base,
+    # push) with the real credentials AND the agent's repo config loaded. Its
+    # push (_loki_trusted_push) and gh calls (gh wrapper) each re-grant the
+    # credentials themselves, outside the agent's repo.
+    create_session_pr
     audit_agent_action "session_stop" "Session ended" "result=$result,iterations=$ITERATION_COUNT"
 
     # The first terminal summary is written before session changes are committed.

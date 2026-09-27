@@ -67,6 +67,10 @@ fail() {
 }
 
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/loki-branch-lifecycle.XXXXXX")"
+# Test-owned global git config (the fixtures' github.com -> local bare
+# rewrites live here), so the real ~/.gitconfig is never read or written.
+export GIT_CONFIG_GLOBAL="$WORKROOT/gitconfig"
+: > "$GIT_CONFIG_GLOBAL"
 cleanup() {
     rm -rf "$WORKROOT" 2>/dev/null || true
 }
@@ -102,6 +106,15 @@ if [ -f "$_SECRET_LIB" ]; then
     printf '\n' >> "$BRANCH_LIB"
     cat "$_SECRET_LIB" >> "$BRANCH_LIB"
 fi
+# BACKLOG 149 round 5: create_session_pr pushes through _loki_trusted_push,
+# defined with the Rule of Two withhold block, not in the branch block. Append
+# that block too (variable initializers and functions only; nothing runs).
+awk '
+    /^_LOKI_WITHHELD_TOKENS=""$/ { on = 1 }
+    on { print }
+    on && /^_loki_withhold_github_tokens\(\) \{$/ { last = 1 }
+    last && /^}$/ { exit }
+' "$RUN_SH" >> "$BRANCH_LIB"
 
 # Non-vacuity gate: all three function definitions MUST be present, else every
 # test below is meaningless. Fail loudly (not vacuously) and abort.
@@ -112,7 +125,7 @@ _extract_ok=true
 # name so a future move out of range fails loudly here instead of vacuously
 # (an out-of-range _commit_path_looks_secret would be command-not-found at
 # commit time, which the `if` silently treats as "not a secret").
-for fn in setup_agent_branch _loki_snapshot_preexisting _commit_scan_secret_file _commit_path_looks_secret commit_session_changes create_session_pr _loki_session_created_seal _loki_session_created_verify _loki_record_session_created _loki_resume_snapshot; do
+for fn in setup_agent_branch _loki_snapshot_preexisting _commit_scan_secret_file _commit_path_looks_secret commit_session_changes create_session_pr _loki_session_created_seal _loki_session_created_verify _loki_record_session_created _loki_resume_snapshot _loki_trusted_push; do
     grep -q "^${fn}() {" "$BRANCH_LIB" || _extract_ok=false
 done
 if [ "$_extract_ok" = true ]; then
@@ -383,7 +396,12 @@ make_ahead_repo_with_remote() {
         git config user.email "test@loki.local"
         git config user.name "Loki Test"
         git config commit.gpgsign false
-        git remote add origin "$bare"
+        # Loki pushes only to a validated github.com origin, from a fresh repo
+        # that never loads this repo's config (BACKLOG 149 round 5). So the
+        # origin is GitHub-shaped and the operator-level (global) config routes
+        # it to the local bare repo -- never any network.
+        git remote add origin "https://github.com/loki-test/$name.git"
+        git config --global url."$bare".insteadOf "https://github.com/loki-test/$name.git"
         git checkout -q -b develop
         echo "seed" > seed.txt
         git add seed.txt

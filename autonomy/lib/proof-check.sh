@@ -42,7 +42,14 @@ _PROOF_CHECK_SH=1
 _proof_check_net() {
     # run.sh withholds GitHub tokens from agent sessions (Rule of Two); this is
     # one of Loki's own trusted calls, so it takes them back for the command.
-    if declare -f _loki_with_github_tokens >/dev/null 2>&1; then
+    if declare -f _loki_run_neutral >/dev/null 2>&1; then
+        # BACKLOG 149 round 5: run from / with GH_REPO read as data first, so
+        # gh's own git calls never load the agent's repo config while holding
+        # the real credentials.
+        local _pc_repo
+        _pc_repo="$(_loki_trusted_repo)"
+        _loki_with_github_tokens _loki_run_neutral "$_pc_repo" _proof_check_net_timed "$@"
+    elif declare -f _loki_with_github_tokens >/dev/null 2>&1; then
         _loki_with_github_tokens _proof_check_net_timed "$@"
     else
         _proof_check_net_timed "$@"
