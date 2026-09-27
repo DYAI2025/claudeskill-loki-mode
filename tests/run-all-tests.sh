@@ -673,6 +673,7 @@ run_test "cleanup-test-processes.sh scoped to LISTEN + this uid, --aggressive ga
 run_test "Runtime Gate port reclaims scoped to LISTEN + cwd ownership" "$SCRIPT_DIR/test-runtime-gate-port-scoping.sh"
 run_test "Bun Parity disk.available_gb tolerance (BACKLOG 26)" "$SCRIPT_DIR/test-bun-parity-disk-tolerance.sh"
 run_test "council_augment_from_managed_memory never falls back to cwd for PROJECT_DIR (BACKLOG 63)" "$SCRIPT_DIR/test-council-augment-managed-memory-project-dir.sh"
+run_test "council_should_stop's shadow-write never falls back to cwd for PROJECT_DIR (BACKLOG 63/127)" "$SCRIPT_DIR/test-council-shadow-write-project-dir.sh"
 run_test "Bench Haschanges" "$SCRIPT_DIR/test-bench-haschanges.sh"
 run_test "Benchmarks Resume Atomic" "$SCRIPT_DIR/test-benchmarks-resume-atomic.sh"
 run_test "Bmad Integration" "$SCRIPT_DIR/test-bmad-integration.sh"
