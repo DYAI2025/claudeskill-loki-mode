@@ -1412,7 +1412,10 @@ council_checklist_gate() {
     # than the old `|| echo PASS`, which cleared the first hard gate on a broken
     # host. (Absent python is a real deployment problem; failing open here is
     # exactly the fake-green this gate exists to prevent.)
-    if ! command -v python3 >/dev/null 2>&1; then
+    # S-141: resolved -I -S interpreter (see _loki_snapshot_py_tool); a bare
+    # python3 -E still runs user-site .pth lines that can forge json.load.
+    local _gate_py
+    if ! _gate_py="$(_loki_snapshot_py_tool)"; then
         log_warn "[Council] Hard gate BLOCKED: python3 unavailable, cannot verify checklist (fail-closed)."
         return 1
     fi
@@ -1422,7 +1425,7 @@ council_checklist_gate() {
     # council_heldout_gate at the ship gate, and surfacing them in this gate's
     # block report would leak their identity back into the build loop.
     local gate_result
-    gate_result=$(_RESULTS_FILE="$results_file" _WAIVERS_FILE="$waivers_file" _HELDOUT_FILE="$heldout_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+    gate_result=$(_RESULTS_FILE="$results_file" _WAIVERS_FILE="$waivers_file" _HELDOUT_FILE="$heldout_file" "$_gate_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, sys, os
 
 results_file = os.environ['_RESULTS_FILE']
@@ -1560,8 +1563,14 @@ council_heldout_gate() {
     # The failing titles are NOT carried in this line (a checklist title may
     # contain ':' or '|'); they are read separately from the held-out JSON block
     # below in the BLOCK branch.
+    # S-141: resolved -I -S interpreter; none resolvable -> BLOCK (fail-closed).
+    local _heldout_py
+    if ! _heldout_py="$(_loki_snapshot_py_tool)"; then
+        log_warn "[Council] Held-out gate BLOCKED: python3 unavailable (fail-closed)."
+        return 1
+    fi
     local gate_result
-    gate_result=$(_RESULTS_FILE="$results_file" _HELDOUT_FILE="$heldout_file" _WAIVERS_FILE="$waivers_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+    gate_result=$(_RESULTS_FILE="$results_file" _HELDOUT_FILE="$heldout_file" _WAIVERS_FILE="$waivers_file" "$_heldout_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, sys, os
 
 results_file = os.environ['_RESULTS_FILE']
@@ -4228,8 +4237,15 @@ council_evaluate() {
         if declare -f loki_council_dispatch_agents >/dev/null 2>&1; then
             if loki_council_dispatch_agents "$ITERATION_COUNT" "${COUNCIL_PRD_PATH:-}"; then
                 local _va_round_file="$COUNCIL_STATE_DIR/votes/round-${ITERATION_COUNT}.json"
-                if [ -f "$_va_round_file" ]; then
-                    aggregate_result=$(_RF="$_va_round_file" python3 -E -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os; print(json.load(open(os.environ['_RF'])).get('verdict', 'CONTINUE'))" 2>/dev/null || echo "")
+                # S-141: resolved -I -S interpreter. Dispatch succeeded, so an
+                # unreadable round file is CONTINUE, never a fall-through to the
+                # heuristic path that could still reach COMPLETE.
+                local _va_py=""
+                if [ -f "$_va_round_file" ] && ! _va_py="$(_loki_snapshot_py_tool)"; then
+                    log_warn "[Council] python3 unavailable, cannot read dispatch verdict (fail-closed CONTINUE)."
+                    aggregate_result="CONTINUE"
+                elif [ -f "$_va_round_file" ]; then
+                    aggregate_result=$(_RF="$_va_round_file" "$_va_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]; import json, os; print(json.load(open(os.environ['_RF'])).get('verdict', 'CONTINUE'))" 2>/dev/null || echo "")
                 fi
             fi
         fi
