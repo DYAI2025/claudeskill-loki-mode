@@ -738,13 +738,35 @@ def literal_rows(arr):
 # substring: `10` (contains "0") and `{ ready: true }` (contains "true", not
 # empty) are genuine literals and must keep exempting, pinned by
 # NearAbsentLiteralSiblingHonest.tsx.
-ABSENT = re.compile(r"^(?:null|undefined|''|\"\"|true|false|0|\{\})$")
+#
+# Rework (Tech Lead review of 0a897a91, CONCERN): the exact-string `\{\}`
+# match missed any empty object carrying internal whitespace (`{ }`, a
+# multi-line `{\n}`) -- same bypass, one formatter away. Emptiness is now
+# checked structurally (split_top of the brace interior, the same helper
+# is_literal() itself uses to parse object literals) instead of by string
+# shape. The review's second, advisory finding (zero-valued numeric
+# spellings other than bare `0` -- `0.0`, `-0`, `00`, `0e0` -- also exempting)
+# is fixed the same way: evaluate the literal instead of listing spellings.
+ABSENT = re.compile(r"^(?:null|undefined|''|\"\"|true|false)$")
+ZERO_NUM = re.compile(r'^[+-]?\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?$')
 def is_exempting_sibling(v):
     """True when v is a genuine data-shaped literal for the both-branches-
     literal ternary exemption: is_literal() minus the bare absence/sentinel
-    markers (null/undefined/''/""/true/false/0/{})."""
+    markers (null/undefined/''/""/true/false), any empty object literal
+    (regardless of internal whitespace), and any zero-valued numeric literal
+    (regardless of spelling)."""
     v = re.sub(r'\s+as\s+const\s*$', '', v.strip())
-    return is_literal(v) and not ABSENT.match(v)
+    if not is_literal(v) or ABSENT.match(v):
+        return False
+    if v[:1] == '{' and close_of(v, 0) == len(v) - 1 and not split_top(v[1:-1]):
+        return False
+    if ZERO_NUM.match(v):
+        try:
+            if float(v.replace('_', '')) == 0:
+                return False
+        except ValueError:
+            pass
+    return True
 line_of = lambda s, i: s.count('\n', 0, i) + 1
 SETTER = re.compile(r'\b(set[A-Z]\w*|useState)\s*(?=[(<])')
 CATCH = re.compile(r'\bcatch\s*(?:\([^()]*\))?\s*\{|\.catch\s*\(')
@@ -3624,6 +3646,42 @@ export function NA({ mode }) {
   return <b>{a === b ? 1 : 0}</b>;
 }
 TSX
+    # S-30 rework, finding #1 (Tech Lead review of 0a897a91, blocking CONCERN):
+    # ABSENT matched the empty object only as the exact string "{}", so any
+    # whitespace inside it (a formatter's `{ }`, or a multi-line `{\n}`) fell
+    # through as a "genuine literal" and kept exempting a fabricated-rows
+    # sibling -- the same bypass class this commit closes, one whitespace
+    # variant wider. is_exempting_sibling now checks emptiness structurally
+    # (split_top of the brace interior) instead of string-matching `\{\}`.
+    cat > "$d/src/components/EmptyObjectWhitespaceSiblingBypassFallback.tsx" <<'TSX'
+const BACKUP_ROWS19 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function EOB({ loading }) {
+  const a = loading ? { } : BACKUP_ROWS19;
+  return <b>{a}</b>;
+}
+TSX
+    # S-30 rework, finding #2 (same review, advisory fast-follow): the bare
+    # digit `0` was the only zero-valued numeric spelling ABSENT rejected;
+    # `0.0`, `-0`, `00` and `0e0` are equally zero and equally carry no row
+    # data, so each still exempted a fabricated-rows sibling. Fixed by
+    # evaluating any bare numeric literal and rejecting one that equals zero,
+    # rather than listing spellings.
+    cat > "$d/src/components/NumericZeroSpellingSiblingBypassFallback.tsx" <<'TSX'
+const BACKUP_ROWS20 = [
+  { id: 'c1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function NZ({ mode }) {
+  const a = mode ? 0.0 : BACKUP_ROWS20;
+  const b = mode ? -0 : BACKUP_ROWS20;
+  const c = mode ? 00 : BACKUP_ROWS20;
+  const d = mode ? 0e0 : BACKUP_ROWS20;
+  return <b>{(a || b || c || d) ? 1 : 0}</b>;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -3689,6 +3747,11 @@ AbsentSiblingBypassFallback.tsx:6|module-level table 'BACKUP_ROWS17' (fabricated
 AbsentSiblingBypassFallback.tsx:7|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
 AbsentSiblingBypassFallback.tsx:8|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
 AbsentSiblingBypassFallback.tsx:9|module-level table 'BACKUP_ROWS17' (fabricated rows) used as a fallback
+EmptyObjectWhitespaceSiblingBypassFallback.tsx:6|module-level table 'BACKUP_ROWS19' (fabricated rows) used as a fallback
+NumericZeroSpellingSiblingBypassFallback.tsx:6|module-level table 'BACKUP_ROWS20' (fabricated rows) used as a fallback
+NumericZeroSpellingSiblingBypassFallback.tsx:7|module-level table 'BACKUP_ROWS20' (fabricated rows) used as a fallback
+NumericZeroSpellingSiblingBypassFallback.tsx:8|module-level table 'BACKUP_ROWS20' (fabricated rows) used as a fallback
+NumericZeroSpellingSiblingBypassFallback.tsx:9|module-level table 'BACKUP_ROWS20' (fabricated rows) used as a fallback
 HelperReturnTaskVerbatim.tsx:1|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnFnDecl.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
 HelperReturnArrow.tsx:2|'getRows' returns fabricated literal rows reaching a data sink
@@ -3732,6 +3795,8 @@ EOF
         BareOrChainTernaryFallback.tsx:1 BareNullishChainTernaryFallback.tsx:1 \
         BareOrChainCastTernaryFallback.tsx:1 \
         AbsentSiblingBypassFallback.tsx:4 NearAbsentLiteralSiblingHonest.tsx:0 \
+        EmptyObjectWhitespaceSiblingBypassFallback.tsx:1 \
+        NumericZeroSpellingSiblingBypassFallback.tsx:4 \
         DefaultProvidersSpreadHonest.tsx:0 \
         ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
         BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
