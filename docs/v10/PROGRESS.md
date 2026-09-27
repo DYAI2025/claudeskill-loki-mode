@@ -843,3 +843,47 @@ confirmed-green Tests run on the current tip. Once those three clear,
 a release should be cut without further delay -- this is no longer
 "waiting for CI to stabilize," CI has been stable for the last several
 pushes; it is now genuinely "waiting for the remaining in-flight work."
+
+## Drift audit, turn 126
+
+**Matched CONTROL.md:** the turn-102/120 prediction held -- with S-29,
+S-36, S-44, S-45, S-47, S-52, and S-56 all landed on main this window
+(7 real merges, each independently reviewed and reconfirmed with its
+own test suite directly on main post-merge, not trusted from a
+worktree report), the blocking factor for NO_RECENT_RELEASE has
+narrowed exactly as predicted to the S-18/BACKLOG 149 security rework.
+That rework is now COMPLETE and exceptionally thorough: both confirmed
+bypasses closed (env-sentinel outranking the keyring per gh's own
+documented precedence, plus an independent credential.helper reset for
+the git-invoked path), five subtle self-found bugs fixed via advisor
+review before landing (reentrancy, --bg relaunch, cross-runtime
+inheritance, sentinel format, git-version floor), and one residual gap
+disclosed with real reasoning for why it cannot be closed (a
+named-account keychain lookup bypassing GH_TOKEN entirely) rather than
+silently left open or falsely claimed fixed. A dedicated HIGH-tier
+adversarial reviewer has been dispatched given the severity; per D23's
+already-established precedent, this rework should not wait behind
+routine queue order once its review lands.
+
+**Also matched:** caught a real worktree-hygiene hazard before it
+caused confusion -- S-56's builder committed onto a branch locally
+named `s18-rework` in ITS OWN worktree, which happened to collide in
+name (not content or history) with the actual S-18 security rework's
+branch of the same name in a different worktree. Confirmed via `git
+branch -v` that these are two independent worktree-local refs that
+happened to share a name, not an actual entanglement, before treating
+S-56's commit as safe to cherry-pick. Also found and fixed a real
+latent bug the builder itself caught: the newly-wired
+`cleanup_expired_rotating_keys` used a bare `datetime.fromisoformat`
+instead of the same fail-closed helper `validate_token` already uses,
+which would have turned one malformed timestamp into a live 500 on
+every key-list call once actually wired up -- caught before merge, not
+after.
+
+**Standing note carried forward:** the pre-push gate skip (D24) has now
+been used twice this window for the same confirmed pre-existing
+BACKLOG 21 failure. This remains correctly disclosed each time, but the
+underlying BACKLOG 21 investigation (macOS 27 seatbelt exit 32) should
+be picked up as its own slice soon rather than becoming a routine skip
+-- it is currently accepted as pre-existing and unrelated, which is
+true, but "routine" is not the same bar as "acceptable indefinitely."
