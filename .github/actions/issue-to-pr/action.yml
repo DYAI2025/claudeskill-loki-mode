@@ -13,6 +13,21 @@ branding:
 # agent. .github/workflows/loki-issue-to-pr.yml in asklokesh/loki-mode is the
 # reference. Earlier versions pushed and opened the PR from the same step that
 # ran the agent; this one does not.
+#
+# Token co-location within THIS job: the fetch step below holds GH_TOKEN and
+# runs no agent; the agent step runs `loki start` on the pre-fetched PRD file
+# and is given no token (GH_TOKEN/GITHUB_TOKEN/GH_ENTERPRISE_TOKEN/
+# GITHUB_ENTERPRISE_TOKEN all explicitly blanked, overriding anything the
+# caller's `uses:` step set at a level this composite's steps would otherwise
+# inherit). This narrows exposure to the same-step case (a prompt-injected
+# agent invoking `gh`/git with the token directly) but does NOT provide
+# process isolation: fetch and agent steps still share one runner VM and one
+# Actions Runner.Worker process holding the job token in memory, reachable via
+# /proc/<pid>/environ or ptrace with the passwordless sudo hosted runners
+# grant (see the March 2025 tj-actions/changed-files compromise, which used
+# exactly this). The real isolation boundary is the caller's job split: keep
+# this job's permissions read-only (contents: read, issues: read) and push
+# from a separate job/runner, as the reference workflow does.
 
 inputs:
   issue:
@@ -83,18 +98,112 @@ runs:
         echo "ref=$REF" >> "$GITHUB_OUTPUT"
         echo "Resolved issue reference: $REF"
 
-    - name: Resolve the issue to a patch
+    - name: Fetch the issue (holds the token, runs no agent)
+      id: fetch
+      shell: bash
+      env:
+        # Used only to read the issue in this step. Never exported to the
+        # agent step below.
+        GH_TOKEN: ${{ github.token }}
+        ISSUE_REF: ${{ steps.ref.outputs.ref }}
+      run: |
+        set -euo pipefail
+
+        case "$ISSUE_REF" in
+          */*'#'*) : ;;
+          *) echo "::error::Malformed issue reference: $ISSUE_REF (expected owner/repo#number)"; exit 1 ;;
+        esac
+        REPO="${ISSUE_REF%%#*}"
+        NUMBER="${ISSUE_REF##*#}"
+        case "$NUMBER" in
+          ''|*[!0-9]*) echo "::error::Issue number must be digits, got '$NUMBER' from '$ISSUE_REF'"; exit 1 ;;
+        esac
+
+        # Same fields as fetch_github_issue() in autonomy/issue-providers.sh:
+        # number,title,body,labels,author,createdAt,url. No comments -- the
+        # PRD the agent works from carries the same content the CLI's own
+        # issue-mode path would have handed it, nothing wider.
+        ISSUE_JSON="$(gh issue view "$NUMBER" --repo "$REPO" \
+          --json number,title,body,labels,author,createdAt,url)"
+
+        OUT="$RUNNER_TEMP/loki-out"
+        mkdir -p "$OUT"
+        PRD_FILE="$OUT/prd-issue-${NUMBER}.md"
+
+        REPO="$REPO" ISSUE_JSON="$ISSUE_JSON" PRD_FILE="$PRD_FILE" python3 -c "
+        import json, os
+
+        data = json.loads(os.environ['ISSUE_JSON'])
+        repo = os.environ['REPO']
+        title = data.get('title', '')
+        body = data.get('body') or ''
+        labels = ', '.join(l['name'] for l in data.get('labels', []))
+        author = (data.get('author') or {}).get('login', '')
+        url = data.get('url', '')
+        created_at = data.get('createdAt', '')
+        number = data.get('number', '')
+
+        lines = [
+            '# PRD: ' + title,
+            '',
+            '**Source:** GitHub Issue [#' + str(number) + '](' + url + ')',
+            '**Author:** @' + author,
+            '**Created:** ' + created_at,
+            '**Repository:** ' + repo,
+        ]
+        if labels:
+            lines.append('**Labels:** ' + labels)
+        lines += [
+            '',
+            '---',
+            '',
+            '## Overview',
+            '',
+            body,
+            '',
+            '---',
+            '',
+            '## Acceptance Criteria',
+            '',
+            'Based on the issue description, implement the following:',
+            '',
+            '1. Address all requirements specified in the issue body above',
+            '2. Ensure backward compatibility (unless explicitly breaking changes are requested)',
+            '3. Add appropriate tests for new functionality',
+            '4. Update documentation as needed',
+            '',
+            '---',
+            '',
+            '## References',
+            '',
+            '- Original Issue: ' + url,
+            '',
+        ]
+        with open(os.environ['PRD_FILE'], 'w') as f:
+            f.write(chr(10).join(lines))
+        "
+        echo "prd=$PRD_FILE" >> "$GITHUB_OUTPUT"
+        echo "issue_number=$NUMBER" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve the issue to a patch (no token in this step's environment)
       id: run
       shell: bash
       env:
-        # Used to read the issue. Loki withholds it from the agent session.
-        GH_TOKEN: ${{ github.token }}
         LOKI_PROVIDER: ${{ inputs.provider }}
         LOKI_BUDGET_LIMIT: ${{ inputs.budget_limit }}
         LOKI_MAX_ITERATIONS: ${{ inputs.max_iterations }}
         # The agent step never pushes or opens a PR (Rule of Two).
         LOKI_DELEGATE_PR: '0'
         ISSUE_REF: ${{ steps.ref.outputs.ref }}
+        PRD_FILE: ${{ steps.fetch.outputs.prd }}
+        # Explicitly blanked, not merely omitted: this overrides any value the
+        # caller's `uses:` step set, which a composite action's steps would
+        # otherwise inherit. These are the same four run.sh withholds
+        # (_loki_withhold_github_tokens).
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        GH_ENTERPRISE_TOKEN: ''
+        GITHUB_ENTERPRISE_TOKEN: ''
       run: |
         set -uo pipefail
 
@@ -104,7 +213,7 @@ runs:
 
         START_SHA="$(git rev-parse HEAD)"
         RC=0
-        loki start "$ISSUE_REF" || RC=$?
+        loki start "$PRD_FILE" || RC=$?
 
         OUT="$RUNNER_TEMP/loki-out"
         mkdir -p "$OUT"

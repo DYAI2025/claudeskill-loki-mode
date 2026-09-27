@@ -245,6 +245,13 @@ runs:
         # Rule of Two: the PRD carries PR text, so the agent never pushes or
         # opens a PR from this step. Post or push from a later step.
         LOKI_DELEGATE_PR: '0'
+        # Explicitly blanked: overrides any token the caller's workflow set at
+        # job level (composite-action steps inherit that unless a step
+        # overrides it). This step must not be able to read a write token.
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        GH_ENTERPRISE_TOKEN: ''
+        GITHUB_ENTERPRISE_TOKEN: ''
       run: |
         PRD_FILE="${{ steps.review-prd.outputs.prd_file }}"
         OUTPUT_FILE="${RUNNER_TEMP}/loki-review-output.txt"
@@ -282,6 +289,13 @@ runs:
         # Rule of Two: the PRD carries PR text, so the agent never pushes or
         # opens a PR from this step. Post or push from a later step.
         LOKI_DELEGATE_PR: '0'
+        # Explicitly blanked: overrides any token the caller's workflow set at
+        # job level (composite-action steps inherit that unless a step
+        # overrides it). This step must not be able to read a write token.
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        GH_ENTERPRISE_TOKEN: ''
+        GITHUB_ENTERPRISE_TOKEN: ''
       run: |
         OUTPUT_FILE="${RUNNER_TEMP}/loki-fix-output.txt"
         PRD_FILE="${{ inputs.prd_file }}"
@@ -318,6 +332,13 @@ runs:
         # Rule of Two: the PRD carries PR text, so the agent never pushes or
         # opens a PR from this step. Post or push from a later step.
         LOKI_DELEGATE_PR: '0'
+        # Explicitly blanked: overrides any token the caller's workflow set at
+        # job level (composite-action steps inherit that unless a step
+        # overrides it). This step must not be able to read a write token.
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        GH_ENTERPRISE_TOKEN: ''
+        GITHUB_ENTERPRISE_TOKEN: ''
       run: |
         OUTPUT_FILE="${RUNNER_TEMP}/loki-test-output.txt"
         PRD_FILE="${{ inputs.prd_file }}"
