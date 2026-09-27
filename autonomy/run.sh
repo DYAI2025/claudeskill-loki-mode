@@ -5351,47 +5351,194 @@ except Exception:
 # LOKI_ALLOW_AGENT_GITHUB_TOKEN=1 (exact value) restores the old inheritance
 # and prints one stderr warning that the agent holds the token.
 #
-# BACKLOG 149: the 4-var withhold above does not cover a user who is
-# authenticated to gh via its own credential store (~/.config/gh/hosts.yml,
-# `gh auth login`) rather than via GH_TOKEN/GITHUB_TOKEN. The provider's real
-# $HOME stays live by design (F49, see the build-time-sandbox comment above),
-# so an agent session's own `gh` invocation would still resolve that file and
-# push/open a PR with the user's real credentials -- no env var involved. Fix:
-# scope GH_CONFIG_DIR (gh's own documented override, `gh help environment`) to
-# a fresh empty directory for the duration of the session, whether or not any
-# GH_TOKEN-family var was present, unless the operator opted out. GH_CONFIG_DIR
-# takes precedence over $XDG_CONFIG_HOME/gh and $HOME/.config/gh (in that
-# order) once it is set to any non-empty value, so nothing else needs to move.
-# $HOME itself is untouched, so Claude's own OAuth (F49) keeps working.
+# BACKLOG 149 (round 2, REJECT rework): the previous fix scoped GH_CONFIG_DIR
+# to a fresh empty directory but a reviewer confirmed, live, that this does not
+# close the vulnerability. Two bypasses, both reproduced empirically against
+# real gh 2.92 + a real macOS Keychain-backed `gh auth login` on 2026-09-27:
+#
+#   1. `GH_CONFIG_DIR=<empty dir> gh auth token` (real $HOME, no env token)
+#      still exits 0: gh's resolution is config-dir file, THEN OS keyring
+#      fallback (Keychain on macOS, libsecret on Linux). An empty config dir
+#      does not stop the keyring lookup.
+#   2. git's own `credential.helper` (`gh auth setup-git` wires
+#      `credential.https://github.com.helper = !gh auth git-credential`, and a
+#      plain `osxkeychain`/`libsecret`/etc. helper may ALSO be configured,
+#      unscoped, ahead of or behind it) is invoked directly by git on any
+#      `git push`/`git credential fill` over HTTPS. This path is git-invoked,
+#      not GH_CONFIG_DIR-mediated at all -- scoping GH_CONFIG_DIR does nothing
+#      to it, and it resolves through the same keyring fallback OR a
+#      completely separate OS-keychain entry that git's own helper (not gh's)
+#      maintains independently.
+#
+# Fix, verified against `gh help environment` and empirically against both
+# bypasses (see the S-18 rework session transcript for the repro/counter-repro
+# pairs; no real credential value was ever printed during that verification):
+#
+#   (a) GH_TOKEN/GITHUB_TOKEN/GH_ENTERPRISE_TOKEN/GITHUB_ENTERPRISE_TOKEN are
+#       no longer merely unset -- each is set to a fresh per-process garbage
+#       value (SENTINEL below). `gh help environment` documents the env token
+#       as taking "precedence over previously stored credentials", and this
+#       was confirmed live: with the sentinel present, `gh auth token` AND
+#       `gh auth git-credential get` both echo back the garbage value, never
+#       falling through to the keyring. `gh auth git-credential get` is a pure
+#       read/print in this path -- it does not write to GH_CONFIG_DIR or touch
+#       the keychain, so planting a sentinel has no destructive side effect;
+#       a `git push` that ends up using it simply gets a 401 from GitHub, the
+#       same as any other wrong password.
+#   (b) The sentinel alone does not close a plain `osxkeychain` (or similar)
+#       helper that is configured UNSCOPED (`credential.helper = osxkeychain`,
+#       no gh involved at all) and holds its own independently-cached
+#       credential -- confirmed present as a THIRD, gh-independent store on
+#       the verification machine (git's own keychain entry, distinct from
+#       gh's). GH_TOKEN only feeds gh's own resolution; it does not touch
+#       git's credential-helper chain. So the session additionally gets
+#       `credential.helper=` (empty string) injected via
+#       GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n, appended after
+#       any GIT_CONFIG_COUNT the operator already has set. Per gitcredentials(7):
+#       "If credential.helper is configured to the empty string, this resets
+#       the helper list to empty" -- this is why the reset must be UNSCOPED
+#       (plain `credential.helper`, not `credential.<url>.helper`, since a
+#       URL-scoped reset does not necessarily out-order every already
+#       configured helper) and appended LAST (env-var config values override
+#       every config FILE, per `git help config` on GIT_CONFIG_COUNT, and later
+#       GIT_CONFIG_KEY_n entries are read after earlier ones). Confirmed live:
+#       with this override present, `git credential fill` against github.com
+#       fails closed ("could not read Username") instead of returning a
+#       password line, with no fallback to any other helper. This closes the
+#       git-invoked path directly, independent of GH_CONFIG_DIR or any
+#       GH_TOKEN-family value.
+#
+# GH_CONFIG_DIR is still scoped to a fresh empty directory (unconditionally,
+# same as before) -- it remains correct for the plaintext-hosts.yml-read case
+# and for any gh subcommand that does not consult GH_TOKEN. $HOME itself stays
+# untouched, so Claude's own OAuth (F49) is unaffected -- nothing here reads
+# or writes $HOME/.claude or touches any Anthropic credential path.
+#
 # Loki's own trusted calls (gh() below, _loki_with_github_tokens) restore the
-# real GH_CONFIG_DIR (or its absence) around the one command, exactly like the
-# token re-grant.
+# REAL env values (or absence) for the 4 token vars, the real GH_CONFIG_DIR
+# (or absence), and the real GIT_CONFIG_COUNT/KEY/VALUE state (or absence)
+# around the one trusted command, then re-apply the withhold afterward.
+#
 # This is hygiene against a naive injection, not an isolation boundary: code
 # running as the same user can still read the parent's environment block
-# (/proc/<pid>/environ on Linux, sudo on a hosted runner) or the hosts.yml
-# file directly off disk (F49 keeps $HOME live). The boundary is a CI job that
-# holds no write token while the agent runs (see
-# .github/workflows/loki-issue-to-pr.yml).
+# (/proc/<pid>/environ on Linux, sudo on a hosted runner), the hosts.yml file
+# directly off disk (F49 keeps $HOME live), or invoke `git -c
+# credential.helper=...` / `security find-generic-password` explicitly to
+# route around this. The boundary is a CI job that holds no write token while
+# the agent runs (see .github/workflows/loki-issue-to-pr.yml).
 #===============================================================================
 _LOKI_WITHHELD_TOKENS=""
+_LOKI_GH_TOKEN_REAL_HAD=""
+_LOKI_GH_TOKEN_REAL_VAL=""
+_LOKI_GITHUB_TOKEN_REAL_HAD=""
+_LOKI_GITHUB_TOKEN_REAL_VAL=""
+_LOKI_GH_ENT_TOKEN_REAL_HAD=""
+_LOKI_GH_ENT_TOKEN_REAL_VAL=""
+_LOKI_GITHUB_ENT_TOKEN_REAL_HAD=""
+_LOKI_GITHUB_ENT_TOKEN_REAL_VAL=""
 _LOKI_GH_CONFIG_SCOPED=""
 _LOKI_GH_CONFIG_DIR_HAD=""
 _LOKI_GH_CONFIG_DIR_OLD=""
+_LOKI_GIT_CRED_SCOPED=""
+_LOKI_GIT_CONFIG_COUNT_OLD=""
+_LOKI_GIT_CONFIG_COUNT_HAD=""
+_LOKI_GIT_CRED_INDEX=""
+_LOKI_GH_SENTINEL=""
+
+# Restore the real value (or absence) of one of the 4 token vars, using the
+# per-var _HAD/_VAL pair captured by _loki_gh_capture. Bash has no portable
+# array-of-names-by-reference here, so this is spelled out per var rather than
+# looped over a dynamic name. Also used by the --bg relaunch path to hand the
+# REAL values to the relaunched child (see call site below).
+_loki_restore_one_token() {
+    local _var="$1" _had="$2" _val="$3"
+    if [ -n "$_had" ]; then
+        export "$_var=$_val"
+    else
+        unset "$_var"
+    fi
+}
+
+# Capture the REAL pre-withhold state exactly once per process: the 4 token
+# vars, GH_CONFIG_DIR, and GIT_CONFIG_COUNT. Idempotent via _LOKI_WITHHELD_TOKENS
+# as the guard, so a later _loki_gh_apply (called after a trusted command
+# restores and re-applies) never re-captures its own sentinel/scoped state as
+# if it were the original.
+_loki_gh_capture() {
+    [ -z "$_LOKI_WITHHELD_TOKENS" ] || return 0
+    local _v
+    if [ -n "${GH_TOKEN+x}" ]; then _LOKI_GH_TOKEN_REAL_HAD=1; _LOKI_GH_TOKEN_REAL_VAL="$GH_TOKEN"; fi
+    if [ -n "${GITHUB_TOKEN+x}" ]; then _LOKI_GITHUB_TOKEN_REAL_HAD=1; _LOKI_GITHUB_TOKEN_REAL_VAL="$GITHUB_TOKEN"; fi
+    if [ -n "${GH_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GH_ENT_TOKEN_REAL_HAD=1; _LOKI_GH_ENT_TOKEN_REAL_VAL="$GH_ENTERPRISE_TOKEN"; fi
+    if [ -n "${GITHUB_ENTERPRISE_TOKEN+x}" ]; then _LOKI_GITHUB_ENT_TOKEN_REAL_HAD=1; _LOKI_GITHUB_ENT_TOKEN_REAL_VAL="$GITHUB_ENTERPRISE_TOKEN"; fi
+    for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+        _LOKI_WITHHELD_TOKENS="${_LOKI_WITHHELD_TOKENS:+$_LOKI_WITHHELD_TOKENS }$_v"
+    done
+    if [ -n "${GH_CONFIG_DIR+x}" ]; then
+        _LOKI_GH_CONFIG_DIR_HAD=1
+        _LOKI_GH_CONFIG_DIR_OLD="$GH_CONFIG_DIR"
+    fi
+    if [ -n "${GIT_CONFIG_COUNT:-}" ] && [ "${GIT_CONFIG_COUNT}" -eq "${GIT_CONFIG_COUNT}" ] 2>/dev/null; then
+        _LOKI_GIT_CONFIG_COUNT_HAD=1
+        _LOKI_GIT_CONFIG_COUNT_OLD="$GIT_CONFIG_COUNT"
+        _LOKI_GIT_CRED_INDEX="$GIT_CONFIG_COUNT"
+    else
+        _LOKI_GIT_CRED_INDEX=0
+    fi
+    # Fixed for the process lifetime once captured, so restore-then-reapply
+    # (the trusted-call cycle) always re-exports the SAME sentinel rather than
+    # minting a new one that a caller mid-command could not have seen.
+    _LOKI_GH_SENTINEL="ghp_LOKI_WITHHELD_$$_${RANDOM}${RANDOM}_INVALID"
+}
+
+# Unconditionally (re-)export the withheld/scoped state. Never captures --
+# _loki_gh_capture must run first. Silent: callers that want the one-time
+# operator-facing log line print it themselves.
+_loki_gh_apply() {
+    export GH_TOKEN="$_LOKI_GH_SENTINEL" GITHUB_TOKEN="$_LOKI_GH_SENTINEL" \
+        GH_ENTERPRISE_TOKEN="$_LOKI_GH_SENTINEL" GITHUB_ENTERPRISE_TOKEN="$_LOKI_GH_SENTINEL"
+    if [ -z "$_LOKI_GH_CONFIG_SCOPED" ]; then
+        local _empty_cfg
+        _empty_cfg="$(mktemp -d "${TMPDIR:-/tmp}/loki-gh-config.XXXXXX" 2>/dev/null)" || _empty_cfg=""
+        [ -n "$_empty_cfg" ] && _LOKI_GH_CONFIG_SCOPED="$_empty_cfg"
+    fi
+    [ -n "$_LOKI_GH_CONFIG_SCOPED" ] && export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_SCOPED"
+    export "GIT_CONFIG_KEY_${_LOKI_GIT_CRED_INDEX}=credential.helper"
+    export "GIT_CONFIG_VALUE_${_LOKI_GIT_CRED_INDEX}="
+    export GIT_CONFIG_COUNT=$((_LOKI_GIT_CRED_INDEX + 1))
+    _LOKI_GIT_CRED_SCOPED=1
+    if command -v gh >/dev/null 2>&1; then
+        gh() { _loki_with_github_tokens command gh "$@"; }
+    fi
+}
+
+# Put back the REAL pre-withhold state around one trusted command.
+_loki_gh_restore() {
+    _loki_restore_one_token GH_TOKEN "$_LOKI_GH_TOKEN_REAL_HAD" "$_LOKI_GH_TOKEN_REAL_VAL"
+    _loki_restore_one_token GITHUB_TOKEN "$_LOKI_GITHUB_TOKEN_REAL_HAD" "$_LOKI_GITHUB_TOKEN_REAL_VAL"
+    _loki_restore_one_token GH_ENTERPRISE_TOKEN "$_LOKI_GH_ENT_TOKEN_REAL_HAD" "$_LOKI_GH_ENT_TOKEN_REAL_VAL"
+    _loki_restore_one_token GITHUB_ENTERPRISE_TOKEN "$_LOKI_GITHUB_ENT_TOKEN_REAL_HAD" "$_LOKI_GITHUB_ENT_TOKEN_REAL_VAL"
+    if [ -n "$_LOKI_GH_CONFIG_DIR_HAD" ]; then
+        export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_DIR_OLD"
+    else
+        unset GH_CONFIG_DIR
+    fi
+    if [ -n "$_LOKI_GIT_CONFIG_COUNT_HAD" ]; then
+        export GIT_CONFIG_COUNT="$_LOKI_GIT_CONFIG_COUNT_OLD"
+    else
+        unset GIT_CONFIG_COUNT
+    fi
+    unset "GIT_CONFIG_KEY_${_LOKI_GIT_CRED_INDEX}" "GIT_CONFIG_VALUE_${_LOKI_GIT_CRED_INDEX}"
+}
 
 _loki_with_github_tokens() {
-    local _v _rc=0
-    for _v in $_LOKI_WITHHELD_TOKENS; do export "${_v?}"; done
-    if [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
-        if [ -n "$_LOKI_GH_CONFIG_DIR_HAD" ]; then
-            export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_DIR_OLD"
-        else
-            unset GH_CONFIG_DIR
-        fi
+    local _rc=0
+    if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
+        _loki_gh_restore
     fi
     "$@" || _rc=$?
-    for _v in $_LOKI_WITHHELD_TOKENS; do export -n "${_v?}"; done
-    if [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
-        export GH_CONFIG_DIR="$_LOKI_GH_CONFIG_SCOPED"
+    if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
+        _loki_gh_apply
     fi
     return "$_rc"
 }
@@ -5400,8 +5547,9 @@ _loki_withhold_github_tokens() {
     local _v _held=""
     # Operator opt-out (exact value 1): keep the earlier behavior, where the
     # agent inherits the token and the real gh config. That is a Rule of Two
-    # exposure, so say so. No GH_CONFIG_DIR scoping under the opt-out either --
-    # the point of this knob is the old, fully-inherited behavior.
+    # exposure, so say so. No GH_CONFIG_DIR/credential.helper scoping under
+    # the opt-out either -- the point of this knob is the old, fully-inherited
+    # behavior.
     if [ "${LOKI_ALLOW_AGENT_GITHUB_TOKEN:-}" = "1" ]; then
         for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
             [ -n "${!_v:-}" ] && _held="${_held:+$_held }$_v"
@@ -5409,39 +5557,22 @@ _loki_withhold_github_tokens() {
         [ -z "$_held" ] || printf '%s\n' "WARNING: LOKI_ALLOW_AGENT_GITHUB_TOKEN=1: the agent session holds the GitHub token ($_held); an injected prompt can push with it (Rule of Two exposure)." >&2
         return 0
     fi
-    for _v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
-        [ -n "${!_v:-}" ] || continue
-        export -n "${_v?}"
-        case " $_LOKI_WITHHELD_TOKENS " in
-            *" $_v "*) ;;
-            *) _LOKI_WITHHELD_TOKENS="${_LOKI_WITHHELD_TOKENS:+$_LOKI_WITHHELD_TOKENS }$_v" ;;
-        esac
-    done
-    # Scope gh's own credential store unconditionally (not gated on any
-    # GH_TOKEN-family var being present): a user authenticated only via
-    # `gh auth login` (hosts.yml) has none of those vars set, and is exactly
-    # the case BACKLOG 149 covers. Idempotent: only scope once per process.
-    if [ -z "$_LOKI_GH_CONFIG_SCOPED" ]; then
-        local _empty_cfg
-        _empty_cfg="$(mktemp -d "${TMPDIR:-/tmp}/loki-gh-config.XXXXXX" 2>/dev/null)" || _empty_cfg=""
-        if [ -n "$_empty_cfg" ]; then
-            if [ -n "${GH_CONFIG_DIR+x}" ]; then
-                _LOKI_GH_CONFIG_DIR_HAD=1
-                _LOKI_GH_CONFIG_DIR_OLD="$GH_CONFIG_DIR"
-            fi
-            _LOKI_GH_CONFIG_SCOPED="$_empty_cfg"
-            export GH_CONFIG_DIR="$_empty_cfg"
-        fi
-    fi
-    # Define the gh() wrapper whenever either withhold is active (tokens,
-    # config scoping, or both), so a hosts.yml-only user's trusted `gh` calls
-    # still resolve their real config even when no env token was ever present.
-    if { [ -n "$_LOKI_WITHHELD_TOKENS" ] || [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; } \
-        && command -v gh >/dev/null 2>&1; then
-        gh() { _loki_with_github_tokens command gh "$@"; }
-    fi
-    if [ -n "$_LOKI_WITHHELD_TOKENS" ] || [ -n "$_LOKI_GH_CONFIG_SCOPED" ]; then
-        log_info "Withheld from agent sessions (Rule of Two): ${_LOKI_WITHHELD_TOKENS:-no env tokens present}${_LOKI_GH_CONFIG_SCOPED:+, gh config store}. Loki's own push and PR steps still use it."
+    local _first_time=""
+    [ -n "$_LOKI_WITHHELD_TOKENS" ] || _first_time=1
+    # gh documents (`gh help environment`) that an env token "takes precedence
+    # over previously stored credentials", so a garbage-but-present value
+    # makes gh's own resolution (both `gh auth token` and `gh auth
+    # git-credential`, the latter reachable directly by git's
+    # credential.helper) return the garbage value instead of falling through
+    # to a keyring/hosts.yml lookup. GH_CONFIG_DIR stays scoped to a fresh
+    # empty dir (the plaintext-hosts.yml-read case). credential.helper is
+    # additionally reset to empty (gitcredentials(7)): this is git-invoked,
+    # not gh-mediated, so the sentinel does not reach a plain
+    # osxkeychain/libsecret helper on its own.
+    _loki_gh_capture
+    _loki_gh_apply
+    if [ -n "$_first_time" ]; then
+        log_info "Withheld from agent sessions (Rule of Two): $_LOKI_WITHHELD_TOKENS (sentineled, not merely unset), gh config store, git credential.helper. Loki's own push and PR steps still use the real credentials."
     fi
 }
 
@@ -28013,10 +28144,19 @@ main() {
 
     # Handle background mode
     if [ "$BACKGROUND_MODE" = "true" ]; then
-        # The relaunched runner withholds the tokens itself; it needs them in
-        # its environment to do so. This process exits right after launching.
-        local _bg_tok
-        for _bg_tok in $_LOKI_WITHHELD_TOKENS; do export "${_bg_tok?}"; done
+        # The relaunched runner withholds the tokens itself; it needs the REAL
+        # pre-withhold state in its inherited environment to capture correctly,
+        # not this process's own scoped/sentineled state (BACKLOG 149 round 2:
+        # if the child inherited THIS process's scoped GH_CONFIG_DIR/
+        # GIT_CONFIG_COUNT as if they were the operator's originals, its own
+        # trusted gh/git calls would run with credential.helper reset and
+        # GH_CONFIG_DIR pointed at a directory this process's EXIT trap deletes
+        # seconds later). Full restore, not just the 4 token vars, exactly like
+        # the pre-trusted-call restore. This process exits right after
+        # launching, so nothing here needs to re-apply the withhold afterward.
+        if [ -n "$_LOKI_WITHHELD_TOKENS" ]; then
+            _loki_gh_restore
+        fi
         # Initialize .loki directory first
         mkdir -p .loki/logs
 
