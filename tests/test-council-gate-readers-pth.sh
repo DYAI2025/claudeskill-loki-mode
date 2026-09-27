@@ -84,12 +84,14 @@ run_case() {
         . "$WORK/autonomy/completion-council.sh" >/dev/null 2>&1
         log_info() { :; }; log_warn() { :; }; log_error() { :; }
         [ "${2:-}" = nopy ] && _loki_snapshot_py_tool() { return 1; }
-        COUNCIL_ENABLED=true COUNCIL_SIZE=3 ITERATION_COUNT=1
-        COUNCIL_STATE_DIR="$WORK/proj/.loki/council"
+        # shellcheck disable=SC2034  # read by the sourced council functions
+        COUNCIL_ENABLED=true COUNCIL_SIZE=3 ITERATION_COUNT=1 COUNCIL_STATE_DIR="$WORK/proj/.loki/council"
         council_reverify_checklist() { :; }
         council_evidence_gate() { return 0; }
         council_assumption_ledger_gate() { return 0; }
-        council_aggregate_votes() { echo CONTINUE; }
+        # COMPLETE so the no-interpreter dispatch case goes red if it falls
+        # through to the heuristic aggregator instead of failing closed.
+        council_aggregate_votes() { echo COMPLETE; }
         council_write_transcript() { :; }
         council_devils_advocate_review() { echo CONFIRM; }
         eval "$1"
@@ -117,8 +119,9 @@ printf '{"verdict":"CONTINUE","complete_votes":0,"total_members":3}\n' >"$WORK/p
 # Fail closed when no interpreter resolves.
 [ "$(run_case "$CL" nopy)" = "rc=1" ] && ok "checklist gate: no interpreter -> BLOCK" \
     || bad "checklist gate: no interpreter did not BLOCK"
-[ "$(run_case "$HO" nopy)" = "rc=1" ] && ok "held-out gate: no interpreter -> BLOCK" \
-    || bad "held-out gate: no interpreter did not BLOCK"
+HOF='rm -f .loki/council/heldout-block.json; council_heldout_gate; r=$?; [ -f .loki/council/heldout-block.json ] && echo "rc=$r recorded" || echo "rc=$r unrecorded"'
+[ "$(run_case "$HOF" nopy)" = "rc=1 recorded" ] && ok "held-out gate: no interpreter -> BLOCK, block record still written" \
+    || bad "held-out gate: no interpreter did not BLOCK with a block record"
 [ "$(run_case "$EV" nopy)" = "rc=1" ] && ok "dispatch verdict: no interpreter -> not COMPLETE" \
     || bad "dispatch verdict: no interpreter reached COMPLETE"
 

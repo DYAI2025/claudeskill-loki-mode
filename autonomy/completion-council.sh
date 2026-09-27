@@ -1563,13 +1563,13 @@ council_heldout_gate() {
     # The failing titles are NOT carried in this line (a checklist title may
     # contain ':' or '|'); they are read separately from the held-out JSON block
     # below in the BLOCK branch.
-    # S-141: resolved -I -S interpreter; none resolvable -> BLOCK (fail-closed).
-    local _heldout_py
+    # S-141: resolved -I -S interpreter. None resolvable -> "BLOCK 0 1" and fall
+    # through, so the BLOCK branch still records its trust event and block file.
+    local gate_result _heldout_py
     if ! _heldout_py="$(_loki_snapshot_py_tool)"; then
         log_warn "[Council] Held-out gate BLOCKED: python3 unavailable (fail-closed)."
-        return 1
-    fi
-    local gate_result
+        gate_result="BLOCK 0 1"
+    else
     gate_result=$(_RESULTS_FILE="$results_file" _HELDOUT_FILE="$heldout_file" _WAIVERS_FILE="$waivers_file" "$_heldout_py" -I -S -c "import sys; sys.path[:] = [p for p in sys.path if p not in ('', '.')]
 import json, sys, os
 
@@ -1640,6 +1640,7 @@ if matched == 0:
 verdict = 'BLOCK' if failed > 0 else 'PASS'
 print('%s %d %d' % (verdict, passed, failed))
 " 2>/dev/null || echo "BLOCK 0 1")
+    fi
 
     local verdict pass_count fail_count
     read -r verdict pass_count fail_count <<< "$gate_result"
