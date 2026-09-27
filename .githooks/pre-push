@@ -15,8 +15,30 @@
 #
 # Install:  ./scripts/install-hooks.sh
 # Skip once: PRE_PUSH_SKIP=1 git push   (use sparingly; CI will catch you)
+#   PRE_PUSH_SKIP never skips the push-authority guard (S-152) below.
 
 set -euo pipefail
+
+# --- Push-authority guard (S-152) -- runs BEFORE PRE_PUSH_SKIP, never skippable -
+# Incident 2026-09-27 18:35Z: an agent inside a .claude/worktrees/* worktree
+# committed and pushed 28926937 to origin main. Only the Release Manager / Chief
+# of Staff pushes main, and it sets LOKI_RELEASE_MANAGER=1 on every push.
+_top="$(git rev-parse --show-toplevel)"
+_gd="$(cd "$(git rev-parse --git-dir)" && pwd -P)"
+_gcd="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+if [[ "$_gd" != "$_gcd" && "$_top/" == */.claude/worktrees/* ]]; then
+    echo "[pre-push] REFUSED: pushing from a linked worktree under .claude/worktrees ($_top)." >&2
+    echo "[pre-push]   Agent worktrees never push; only the Chief of Staff pushes, from the main checkout." >&2
+    exit 1
+fi
+# stdin: "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref.
+while read -r _lref _lsha _rref _rsha; do
+    if [[ "$_rref" == "refs/heads/main" && "${LOKI_RELEASE_MANAGER:-}" != "1" ]]; then
+        echo "[pre-push] REFUSED: push to refs/heads/main requires LOKI_RELEASE_MANAGER=1." >&2
+        echo "[pre-push]   Only the Chief of Staff / Release Manager pushes main. PRE_PUSH_SKIP does not bypass this." >&2
+        exit 1
+    fi
+done
 
 if [[ "${PRE_PUSH_SKIP:-0}" == "1" ]]; then
     echo "[pre-push] PRE_PUSH_SKIP=1 set, skipping"

@@ -18,6 +18,10 @@
 
 set -uo pipefail
 
+# The caller (a Chief of Staff shell) may carry these; the refusal cases below
+# are only real measurements if they start from an unset environment.
+unset LOKI_RELEASE_MANAGER PRE_PUSH_SKIP
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$REPO_ROOT/.githooks/pre-push"
 
@@ -62,10 +66,11 @@ setup_clone() {
 # the updated-ref line on stdin. Echoes "RC=<n>".
 run_hook() {
     local dir="$1" url="${2:-https://github.com/asklokesh/loki-mode}"
+    local rref="${3:-refs/heads/main}"
     cd "$dir" || return 1
     local sha
     sha="$(git -C "$dir" rev-parse HEAD)"
-    printf 'refs/heads/main %s refs/heads/main %s\n' "$sha" "$sha" \
+    printf 'refs/heads/main %s %s %s\n' "$sha" "$rref" "$sha" \
         | PRE_PUSH_NO_CI_CHECK=1 bash .githooks/pre-push origin "$url" \
               >"$dir/hook.out" 2>&1
     echo "RC=$?"
@@ -88,7 +93,7 @@ g() {
 D="$SCRATCH/c1"; setup_clone "$D"
 g "$D" config user.name murel002
 g "$D" config user.email murel002@example.com
-rc="$(run_hook "$D")"
+rc="$(LOKI_RELEASE_MANAGER=1 run_hook "$D")"
 if [[ "$rc" == "RC=0" ]]; then
     ko "wrong identity blocks a github.com push" "hook exited 0; out: $(cat "$D/hook.out")"
 elif grep -q "requires identity asklokesh" "$D/hook.out"; then
@@ -102,7 +107,7 @@ D="$SCRATCH/c2"; setup_clone "$D"
 echo 'if [[ true' >> autonomy/run.sh
 g "$D" add autonomy/run.sh >/dev/null 2>&1
 g "$D" commit -q -m "break syntax" --no-verify >/dev/null 2>&1
-rc="$(run_hook "$D")"
+rc="$(LOKI_RELEASE_MANAGER=1 run_hook "$D")"
 if [[ "$rc" == "RC=0" ]]; then
     ko "a bash -n syntax error blocks the push" "hook exited 0; out: $(cat "$D/hook.out")"
 elif grep -q "syntax errors" "$D/hook.out"; then
@@ -129,7 +134,7 @@ D="$SCRATCH/c4"; setup_clone "$D"
 _slow=0
 for _i in 1 2 3; do
     _start=$(date +%s)
-    rc="$(run_hook "$D")"
+    rc="$(LOKI_RELEASE_MANAGER=1 run_hook "$D")"
     _end=$(date +%s)
     _elapsed=$((_end - _start))
     if [[ "$rc" != "RC=0" ]]; then
@@ -141,6 +146,53 @@ for _i in 1 2 3; do
         ok "clean run $_i completes under 5s (${_elapsed}s)"
     fi
 done
+
+# --- S-152: only the Release Manager pushes main, never from an agent worktree -
+# Incident 2026-09-27 18:35Z: an agent in a .claude/worktrees/* worktree pushed
+# 28926937 to origin main. expect_refused <label> <out-pattern> <dir> [env...]
+expect_refused() {
+    local label="$1" pat="$2" dir="$3"; shift 3
+    local rc
+    rc="$( [[ $# -gt 0 ]] && export "$@"; run_hook "$dir" )"
+    if [[ "$rc" == "RC=0" ]]; then
+        ko "$label" "hook exited 0; out: $(cat "$dir/hook.out")"
+    elif grep -q "$pat" "$dir/hook.out"; then
+        ok "$label"
+    else
+        ko "$label" "refused but not on '$pat': $(cat "$dir/hook.out")"
+    fi
+}
+
+D="$SCRATCH/c5"; setup_clone "$D"
+expect_refused "push of main without LOKI_RELEASE_MANAGER=1 is refused" \
+    "LOKI_RELEASE_MANAGER=1" "$D"
+expect_refused "PRE_PUSH_SKIP=1 does not bypass the main-push marker check" \
+    "LOKI_RELEASE_MANAGER=1" "$D" PRE_PUSH_SKIP=1
+
+rc="$(LOKI_RELEASE_MANAGER=1 run_hook "$D")"
+if [[ "$rc" == "RC=0" ]]; then
+    ok "push of main with LOKI_RELEASE_MANAGER=1 from the main checkout is allowed"
+else
+    ko "push of main with LOKI_RELEASE_MANAGER=1 from the main checkout is allowed" \
+        "$rc; out: $(cat "$D/hook.out")"
+fi
+
+# A guard that refused every push would pass the refusal cases above; this is
+# the allow path PR-branch pushes depend on.
+rc="$(run_hook "$D" "https://github.com/asklokesh/loki-mode" refs/heads/feat)"
+if [[ "$rc" == "RC=0" ]]; then
+    ok "push of a non-main ref without the marker from the main checkout is allowed"
+else
+    ko "push of a non-main ref without the marker from the main checkout is allowed" \
+        "$rc; out: $(cat "$D/hook.out")"
+fi
+
+WT="$D/.claude/worktrees/agent-1"
+g "$D" worktree add -q -b agent-1 "$WT" >/dev/null 2>&1
+expect_refused "push from a .claude/worktrees linked worktree is refused (marker set)" \
+    "linked worktree" "$WT" LOKI_RELEASE_MANAGER=1
+expect_refused "push from a .claude/worktrees worktree is refused under PRE_PUSH_SKIP=1" \
+    "linked worktree" "$WT" LOKI_RELEASE_MANAGER=1 PRE_PUSH_SKIP=1
 
 cd "$REPO_ROOT" || true
 echo ""
