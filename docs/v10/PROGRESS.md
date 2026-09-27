@@ -369,3 +369,34 @@ over writing status prose whenever the ready queue is below 8 -- the
 IDLE_BUILDERS/LOW_READY violations have been sitting un-actioned for
 multiple pulse ticks in a row while review-processing consumed the
 turn instead.
+
+### Drift audit (turn 18, 6-hour window)
+
+**Matched CONTROL.md:** review rigor held -- S-16's real CONCERN
+(mktemp/mv silently narrowing 14 tracked files from 644 to 600 on
+every release) was not waved through; rework was dispatched instead
+of overriding on a split quorum. D22 (release.yml ships alone,
+watched to green) was honored for GF-3. The moat's shrink-only
+ratchet (D2) was respected: S-02's merge knowingly reintroduced a
+real P7 regression (BACKLOG 137) and the response was an urgent
+same-window fix (S-39), not silently accepting a worse baseline.
+
+**Drifted:** the turn-12 correction did not measurably take. Docs-only
+BOARD.md commits are 41 of 68 in this window, versus 42 of 68 last
+time -- essentially unchanged despite the stated correction to batch
+them. Zero releases shipped in this window (still the same v9.55.0,
+now ~187 minutes old), so NO_RECENT_RELEASE has now been a standing
+violation for the entire turn-12-to-turn-18 span, not just spiking
+once. IDLE_BUILDERS did clear this turn (5 ready slices dispatched:
+S-29 through S-32 plus the GF-4 rebase), showing the "prioritize
+dispatching" half of the correction DID work when applied -- the
+BOARD-batching half did not.
+
+**Correction for the next 6 hours:** stop writing an individual
+BOARD.md commit per reviewer nudge or status check -- fold status-only
+edits into the same commit as the next real merge/rebase action, even
+if that means BOARD.md briefly shows a slightly stale state between
+events. Treat NO_RECENT_RELEASE as the standing top-tier violation it
+now is: once S-16 rework, S-39, S-14, S-20, S-36, and GF-3/GF-4's
+CI checks are confirmed green, cut a release immediately rather than
+folding one more slice in first -- the queue will refill after.
