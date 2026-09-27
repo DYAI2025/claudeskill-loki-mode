@@ -123,3 +123,36 @@ ratchet-ordering deadlock: GF-4 cannot promote `P4.three-setups-resolve`
 out of pending.txt until S-19's stricter pass bar is also in the tree, or
 the merge itself becomes a ratchet regression. S-19 promoted to the
 critical path and reviewed immediately.
+
+## CI: Tests workflow shell-tests sharding (S-81, supersedes S-70)
+
+S-70 resharded shell-tests 4 -> 8 with a plain `idx % n` split and measured
+the real per-suite cost of doing so (see its commit, c6000cb9). S-81 keeps
+n=8 but replaces the index split with a deterministic greedy longest-first
+(LPT) bin-packing over measured per-suite durations, so the 8 shards are
+balanced by real cost instead of by coincidence of registration order.
+
+BEFORE numbers are measured from a real completed GitHub Actions run. AFTER
+numbers are **projected from measured per-suite durations**, not measured --
+this sandbox cannot trigger a real push, so nothing below claims to be a live
+CI wall clock for the new packing until a real run confirms it.
+
+| Metric | Value | Method |
+|---|---|---|
+| BEFORE: measured per-suite durations, source | real run 36319020918 (2026-09-27), 4 shard job logs, S-44's START/END lines | `gh run view --job <id> --log`, grepped for `END: ` |
+| BEFORE: suites with a real measured row | 496 of 496 registered suites (100%; no suite needed the default) | exact-name join against `tests/run-all-tests.sh`'s `run_test` registrations |
+| Deliberate override, not a measurement | `test-ci-json-argmax.sh` measured 1186s in that run; a parallel BACKLOG 25 slice is shrinking its fixture, so `tests/shard-durations.tsv` assumes ~60s post-fix and uses 60, not 1186 | documented in the table's own header comment |
+| BEFORE (projected from measured per-suite durations): max shard at n=4, plain `idx % 4` (current main, pre-S-70/S-81) | 451s test-time (~7.5min) | `idx % 4` replay against `tests/shard-durations.tsv`'s same measured rows (single source run, n=1) |
+| BEFORE (projected from measured per-suite durations): max shard at n=8, plain `idx % 8` (S-70's scheme) | 346s test-time (~5.8min) | same replay, `idx % 8` -- matches S-70's own commit projection (c6000cb9) of "~346s (~5.8min)" once argmax is fixed, cross-checked independently here |
+| AFTER (projected from measured per-suite durations): max shard at n=8, LPT-packed (S-81, this change) | 197s test-time (~3.3min) -- every shard lands at exactly 197s, because 1576s total / 8 divides evenly against this suite set | replay of the actual `tests/run-all-tests.sh` LPT logic via `LOKI_TEST_SHARD=i/8 LOKI_TEST_LIST=1`, summed against `tests/shard-durations.tsv` |
+| AFTER (projected from measured per-suite durations): max shard including ~29s job setup (checkout/pip/npm/bun, per S-70's measurement) | about 226s (about 3.8min), under the 6-minute target | same table + S-70's measured setup overhead |
+| Named suites land in 5 distinct shards (required) | trust-core-detect -> shard 1, review-assurance-tail -> shard 0, e2e-features -> shard 4, shellcheck -> shard 2, no-unreachable -> shard 3 | same LPT replay |
+| Partition proof | `tests/test-shard-coverage.sh`: n in [2, 3, 4, 6, 8] each give union=496, 0 duplicates, 0 missing, no empty shard -- driven through the real runtime path (`LOKI_TEST_LIST=1`), not a second copy of the packing algorithm | `bash tests/test-shard-coverage.sh` |
+
+**What still needs real-CI verification** (cannot be done from this sandbox):
+an actual GitHub Actions run of the updated `test.yml` at n=8 with the new
+packing, to confirm the real wall clock lands near the ~3.8min projection
+rather than something job-setup variance or GitHub's own queueing missed, and
+that `test-ci-json-argmax.sh` actually lands near 60s once its BACKLOG 25
+fixture fix ships (until then this table's 60s row is an assumption, not a
+measurement, as stated in `tests/shard-durations.tsv`'s own header).

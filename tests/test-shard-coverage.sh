@@ -34,33 +34,83 @@ else
 fi
 
 echo
-echo "T2 -- shards partition the suite list exactly"
+echo "T2 -- shards partition the suite list exactly (duration-balanced LPT)"
 
-# Simulate the shard filter with the same arithmetic run_test uses:
-# suite index i belongs to shard (i % n).
-for n in 2 3 4 6; do
-    sum=0
-    overlap_ok=1
+# S-81: the shard filter is no longer plain `idx % n` -- it is a
+# duration-balanced greedy longest-first (LPT) packing over
+# tests/shard-durations.tsv, computed inside run-all-tests.sh itself. Rather
+# than re-implement that packing a second time here (a second copy is exactly
+# how the two drift apart), this drives the REAL runtime path with
+# LOKI_TEST_LIST=1, which prints each selected suite's name and returns
+# without executing it. The ground truth for "is this a real suite name" is
+# the same run_test-line extraction T1 already trusts.
+_reg_names_file="$(mktemp)"
+trap 'rm -f "$_reg_names_file"' EXIT
+grep -E '^[[:space:]]*run_test "' "$RUNNER" | sed -E 's/^[[:space:]]*run_test "//; s/".*$//' > "$_reg_names_file"
+
+for n in 2 3 4 6 8; do
+    union_file="$(mktemp)"
+    empty_shard=0
     for i in $(seq 0 $((n - 1))); do
-        c=$(awk -v n="$n" -v want="$i" '
-            /^[[:space:]]*run_test / { if ((idx % n) == want) hit++; idx++ }
-            END { print hit + 0 }
-        ' "$RUNNER")
-        sum=$((sum + c))
-        # A shard that gets zero suites means the split is degenerate.
-        [ "$c" -gt 0 ] || overlap_ok=0
+        # run_test's LOKI_TEST_LIST path prints a plain "echo $test_name" with
+        # no color codes, so grep -Fxf's exact-line match against the real
+        # suite names already discards every banner/summary line untouched --
+        # no ANSI stripping needed (an earlier draft added one; \x1b in sed is
+        # a GNU-ism this repo's own "no platform-divergent construct" suite
+        # would flag).
+        shard_names="$(LOKI_TEST_SHARD="$i/$n" LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null \
+            | grep -Fxf "$_reg_names_file" -)" || true
+        if [ -z "$shard_names" ]; then
+            empty_shard=1
+        else
+            printf '%s\n' "$shard_names" >> "$union_file"
+        fi
     done
-    if [ "$sum" -eq "$total" ]; then
-        ok "n=$n: shards sum to $sum, exactly the $total declared suites"
+    count=$(wc -l < "$union_file" | tr -d ' ')
+    dupcount=$(sort "$union_file" | uniq -d | wc -l | tr -d ' ')
+    missing=$(comm -23 <(sort "$_reg_names_file") <(sort "$union_file") | wc -l | tr -d ' ')
+    if [ "$count" -eq "$total" ] && [ "$dupcount" -eq 0 ] && [ "$missing" -eq 0 ]; then
+        ok "n=$n: shards sum to $count, exactly the $total declared suites (0 dup, 0 missing)"
     else
-        bad "n=$n: shards sum to $sum but there are $total suites -- $((total - sum)) would NEVER RUN"
+        bad "n=$n: union=$count dup=$dupcount missing=$missing (want union=$total dup=0 missing=0)"
     fi
-    if [ "$overlap_ok" -eq 1 ]; then
+    if [ "$empty_shard" -eq 0 ]; then
         ok "n=$n: every shard received at least one suite"
     else
         bad "n=$n: at least one shard is empty (degenerate split)"
     fi
+    rm -f "$union_file"
 done
+
+echo
+echo "T5 -- the five heaviest named suites land in five distinct n=8 shards"
+
+# S-81 requirement: these five must never share a shard at n=8. True today
+# because LPT places the 5 longest suites first, one per shard in rotation --
+# but assert it directly rather than trusting that property to hold forever
+# as durations drift.
+_watch_suites=(
+    "trust-core tests detect their regressions"
+    "Review deadline, requirements, and speculative assurance tail"
+    "E2e Features"
+    "ShellCheck Linting"
+    "shipped modules have a recorded reachability verdict"
+)
+_watch_shards=()
+for i in $(seq 0 7); do
+    shard_names="$(LOKI_TEST_SHARD="$i/8" LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null | grep -Fxf "$_reg_names_file" -)" || true
+    for w in "${_watch_suites[@]}"; do
+        if printf '%s\n' "$shard_names" | grep -Fxq -- "$w"; then
+            _watch_shards+=("$i:$w")
+        fi
+    done
+done
+_distinct=$(printf '%s\n' "${_watch_shards[@]}" | cut -d: -f1 | sort -u | wc -l | tr -d ' ')
+if [ "${#_watch_shards[@]}" -eq 5 ] && [ "$_distinct" -eq 5 ]; then
+    ok "all 5 watched suites found, each in its own shard: ${_watch_shards[*]}"
+else
+    bad "expected 5 watched suites in 5 distinct shards, got: ${_watch_shards[*]:-none found}"
+fi
 
 echo
 echo "T3 -- an invalid shard spec fails loudly, never silently"

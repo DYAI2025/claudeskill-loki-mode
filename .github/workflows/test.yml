@@ -73,16 +73,22 @@ jobs:
         run: python3 -m pytest -n auto
 
   shell-tests:
-    name: Shell tests (shard ${{ matrix.shard }}/4)
+    name: Shell tests (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    # SHARDED because this job WAS the pipeline. Measured 2026-07-30:
-    #   Shell tests  13m01s   <- sets the wall clock single-handedly
-    #   Bun (ubuntu)  2m17s
-    #   Python 3.13   1m59s
-    #   Helm lint        8s
-    # 289 suites ran serially on one runner. Four shards cut that to roughly
-    # 3m15s, putting the whole pipeline near the ~2.5m the other jobs already
-    # take.
+    # SHARDED because this job WAS the pipeline. Measured 2026-07-30 at 4
+    # shards / 289 suites: Shell tests 13m01s, next slowest job 2m17s.
+    #
+    # RESHARDED 4 -> 8 with DURATION-BALANCED packing (S-81), not plain
+    # `idx % n`. A plain index split ignores that suites are wildly uneven
+    # (496 suites today, 0-153s each per tests/shard-durations.tsv), so
+    # whichever shard happened to catch the slow suites set the whole
+    # workflow's wall clock regardless of shard count. tests/run-all-tests.sh
+    # now assigns each suite to a shard via a deterministic greedy
+    # longest-first (LPT) bin-packing over that measured duration table,
+    # instead of by index -- see the SHARDING comment there for the
+    # algorithm. Projected from that same table (not a new CI run): all 8
+    # shards land at ~197s of suite time (~3.3min) plus job setup, comfortably
+    # under a 6-minute per-shard target; see docs/v10/METRICS.md.
     #
     # fail-fast is OFF deliberately: one shard failing must not cancel the
     # others, or a single red suite hides every other failure and the next
@@ -91,11 +97,13 @@ jobs:
     # Safety: tests/test-shard-coverage.sh proves the shards partition the
     # suite list exactly (every suite in exactly one shard, none dropped, none
     # duplicated) and that an invalid shard spec exits non-zero rather than
-    # silently running nothing.
+    # silently running nothing -- for n in [2, 3, 4, 6, 8], driven through the
+    # real runtime path (LOKI_TEST_LIST=1), not a re-implementation of the
+    # packing algorithm.
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -144,9 +152,9 @@ jobs:
         working-directory: loki-ts
         run: bun install
 
-      - name: Run shell tests (shard ${{ matrix.shard }} of 4)
+      - name: Run shell tests (shard ${{ matrix.shard }} of 8)
         env:
-          LOKI_TEST_SHARD: ${{ matrix.shard }}/4
+          LOKI_TEST_SHARD: ${{ matrix.shard }}/8
         run: bash tests/run-all-tests.sh
 
   # The moat suite: nine product properties, each PROVEN or honestly NOT

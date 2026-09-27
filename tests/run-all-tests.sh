@@ -139,25 +139,41 @@ echo -e "${BLUE}║          LOKI MODE - COMPREHENSIVE TEST SUITE               
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# SHARDING (v8.3.x). Shell tests took 13m01s of a ~15m pipeline -- 6x the next
-# slowest job -- because all 289 suites ran serially on one runner. With
-# LOKI_TEST_SHARD=i/n each runner executes only the suites whose index satisfies
-# (index % n == i), so N runners cut the wall clock by roughly N.
+# SHARDING (S-81, supersedes the plain idx%n split). LOKI_TEST_SHARD=i/n
+# splits the suite list across n runners so N runners cut the wall clock by
+# roughly N -- but a plain `index % n` split ignores that suites are wildly
+# uneven (496 suites from ~0s to 153s measured; see tests/shard-durations.tsv),
+# so whichever shard happened to catch the slowest suites set the whole
+# workflow's wall clock regardless of n. Measured directly: at n=4 one shard
+# held test-ci-json-argmax.sh (1146-1460s alone) while the other three
+# finished in 4-8 minutes each.
 #
-# INDEX-BASED, NOT A CURATED LIST, and that is the load-bearing choice. A
-# hand-maintained "shard 1 runs these files" list is a place for a suite to go
-# missing: add a run_test line, forget the list, and it silently never runs
-# again. Here every run_test call takes the next index, so a new suite lands in
-# some shard automatically and the union of shards is provably the whole set.
+# Fix: assign each suite to a shard by deterministic greedy longest-first
+# (LPT) bin-packing over tests/shard-durations.tsv's measured per-suite
+# seconds, instead of by index. Suites are sorted longest-first, then each
+# goes to whichever shard currently has the smallest running total (ties
+# broken by lowest shard number) -- the standard LPT heuristic, computed once
+# per invocation from this file's own run_test registration order.
 #
-# The precedent this repo already paid for: a shellcheck "optimization" that was
-# ~2x faster and SILENTLY LOST 2 real failures. It was reverted. Speed that
-# stops noticing failures is worse than slow. tests/test-shard-coverage.sh
-# asserts the shards partition the suite list exactly -- every suite in exactly
-# one shard, none dropped, none duplicated.
+# STILL INDEX-BASED FOR REGISTRATION, NOT A CURATED LIST: the packing reads
+# every `run_test` call from THIS file in source order (the same grep
+# tests/test-shard-coverage.sh uses for its own count) and looks each one up
+# by name in the duration table; nothing is hand-maintained per suite. A
+# suite missing from the table (new, not yet measured) still gets a shard via
+# _shard_default_duration_s below -- it is never silently dropped, and the
+# union of all shards is still provably the whole suite list.
+#
+# The precedent this repo already paid for: a shellcheck "optimization" that
+# was ~2x faster and SILENTLY LOST 2 real failures. It was reverted. Speed
+# that stops noticing failures is worse than slow. tests/test-shard-coverage.sh
+# asserts the shards partition the suite list exactly -- every suite in
+# exactly one shard, none dropped, none duplicated -- for every n it checks.
+_shard_durations_file="$SCRIPT_DIR/shard-durations.tsv"
+_shard_default_duration_s=30
 _shard_index=0
 _shard_i=""
 _shard_n=""
+_shard_assign=()
 if [ -n "${LOKI_TEST_SHARD:-}" ]; then
     _shard_i="${LOKI_TEST_SHARD%%/*}"
     _shard_n="${LOKI_TEST_SHARD##*/}"
@@ -170,8 +186,83 @@ if [ -n "${LOKI_TEST_SHARD:-}" ]; then
         echo "run-all-tests: invalid shard '$LOKI_TEST_SHARD' (need 0 <= i < n, n >= 1)" >&2
         exit 2
     fi
-    echo -e "${BLUE}Shard ${_shard_i} of ${_shard_n} -- running every ${_shard_n}th suite${NC}"
+    echo -e "${BLUE}Shard ${_shard_i} of ${_shard_n} -- duration-balanced (LPT), not index modulo${NC}"
     echo ""
+
+    # One awk pass computes the whole assignment: read this script's own
+    # run_test lines in order (ground truth for suite count/order), join each
+    # against the duration table by exact name, LPT-pack into _shard_n bins,
+    # print the resulting shard number per suite index in registration order.
+    # A missing/unreadable duration file degrades to every suite using the
+    # default duration -- still a valid, deterministic partition, never a
+    # dropped suite.
+    _shard_assign_str="$(awk -v n="$_shard_n" -v defdur="$_shard_default_duration_s" -v durfile="$_shard_durations_file" '
+        BEGIN {
+            while ((getline line < durfile) > 0) {
+                if (line == "" || substr(line, 1, 1) == "#") continue
+                split(line, f, "\t")
+                dur[f[1]] = f[2] + 0
+            }
+            close(durfile)
+        }
+        /^[ \t]*run_test "/ {
+            q1 = index($0, "\"")
+            rest = substr($0, q1 + 1)
+            q2 = index(rest, "\"")
+            name = substr(rest, 1, q2 - 1)
+            names[count] = name
+            secs[count] = (name in dur) ? dur[name] : defdur
+            count++
+        }
+        END {
+            for (i = 0; i < count; i++) order[i] = i
+            for (i = 0; i < count; i++) {
+                best = i
+                for (j = i + 1; j < count; j++) {
+                    if (secs[order[j]] > secs[order[best]] || \
+                        (secs[order[j]] == secs[order[best]] && order[j] < order[best])) {
+                        best = j
+                    }
+                }
+                tmp = order[i]; order[i] = order[best]; order[best] = tmp
+            }
+            for (s = 0; s < n; s++) total[s] = 0
+            # start rotates after every pick. Without this, a tie always
+            # resolves to the lowest shard number and NEVER moves off it --
+            # most suites here measure 0-1s, so hundreds of true ties would
+            # all pile onto shard 0 while shard 7 sat near-empty. Rotating the
+            # scan start spreads ties round-robin instead.
+            start = 0
+            for (k = 0; k < count; k++) {
+                idx = order[k]
+                pick = start
+                best_total = total[start]
+                for (kk = 1; kk < n; kk++) {
+                    s = (start + kk) % n
+                    if (total[s] < best_total) { pick = s; best_total = total[s] }
+                }
+                shardof[idx] = pick
+                total[pick] += secs[idx]
+                start = (pick + 1) % n
+            }
+            out = ""
+            for (idx = 0; idx < count; idx++) out = out shardof[idx] " "
+            print out
+        }
+    ' "$SCRIPT_DIR/run-all-tests.sh")"
+    read -ra _shard_assign <<< "$_shard_assign_str"
+
+    # Fail loudly if the awk pass produced fewer entries than there are
+    # run_test calls (a broken awk, an unreadable source file, anything that
+    # makes the assignment short). Without this check a short/empty
+    # _shard_assign makes EVERY suite's lookup miss -- every shard would
+    # silently run zero suites and print "ALL TESTS PASSED" with nothing
+    # tested, exactly the failure mode the old idx%n scheme could never have.
+    _shard_registered=$(grep -cE '^[[:space:]]*run_test ' "$SCRIPT_DIR/run-all-tests.sh")
+    if [ "${#_shard_assign[@]}" -ne "$_shard_registered" ]; then
+        echo "run-all-tests: shard assignment produced ${#_shard_assign[@]} entries for $_shard_registered registered suites -- refusing to run with a broken partition" >&2
+        exit 2
+    fi
 fi
 
 run_test() {
@@ -179,11 +270,21 @@ run_test() {
     local test_file="$2"
 
     # Take this suite's index BEFORE any skip, so indices are stable regardless
-    # of which shard is running. Two shards must agree on which index a suite
-    # has, or the partition breaks.
+    # of which shard is running -- the awk pass above walks run_test calls in
+    # this same source order, so _shard_assign[idx] always names the shard for
+    # this same suite, on every shard's invocation.
     local _idx=$_shard_index
     _shard_index=$((_shard_index + 1))
-    if [ -n "$_shard_n" ] && [ $((_idx % _shard_n)) -ne "$_shard_i" ]; then
+    if [ -n "$_shard_n" ] && [ "${_shard_assign[_idx]:-}" != "$_shard_i" ]; then
+        return 0
+    fi
+
+    # LOKI_TEST_LIST=1: print the suite name and stop, no execution. Lets
+    # tests/test-shard-coverage.sh (and a CI dry run) verify the real
+    # partition -- the same lookup run_test uses, not a re-implementation of
+    # it -- without paying for up to 496 suite executions per shard checked.
+    if [ -n "${LOKI_TEST_LIST:-}" ]; then
+        echo "$test_name"
         return 0
     fi
 
