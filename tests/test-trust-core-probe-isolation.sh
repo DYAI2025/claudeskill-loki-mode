@@ -26,16 +26,23 @@ src="$tmp/repo"
 mkdir "$src"
 tar -C "$REPO_ROOT" --exclude=./.git --exclude=./.claude/worktrees \
     --exclude=./loki-ts/node_modules -cf - . | tar -C "$src" -xf - || { echo "  FAIL: copy"; exit 1; }
-[[ -d "$REPO_ROOT/loki-ts/node_modules" ]] && ln -s "$REPO_ROOT/loki-ts/node_modules" "$src/loki-ts/node_modules"
+if [[ -d "$REPO_ROOT/loki-ts/node_modules" ]]; then
+    cp -Rc "$REPO_ROOT/loki-ts/node_modules" "$src/loki-ts/" 2>/dev/null ||
+        cp -R "$REPO_ROOT/loki-ts/node_modules" "$src/loki-ts/"
+fi
 
 touch "$tmp/stamp"
 sleep 1
-out="$(cd "$src" && TRUST_CORE_PROBE_LIMIT=6 TRUST_CORE_PROBE_JOBS=3 LOKI_NO_BROWSER=1 \
+out="$(cd "$src" && TRUST_CORE_PROBE_LIMIT=8 TRUST_CORE_PROBE_JOBS=3 LOKI_NO_BROWSER=1 \
     timeout 50 bash tests/test-trust-core-tests-detect.sh 2>&1)"
 rc=$?
 
 written="$(find "$src/autonomy" "$src/dashboard" "$src/providers" "$src/loki-ts/src" \
     -type f \( -name '*.sh' -o -name '*.py' -o -name '*.ts' \) -newer "$tmp/stamp" 2>/dev/null | head -3)"
+# bun rewrites node_modules/.bin during a run: a worker linked to the shared
+# node_modules instead of holding its own copy writes through the link.
+[[ -d "$src/loki-ts/node_modules" ]] && written="$written$(find "$src/loki-ts/node_modules" \
+    -newer "$tmp/stamp" 2>/dev/null | head -3)"
 if [[ -z "$written" ]]; then
     ok "no probed source file in the starting tree was written"
 else
@@ -43,10 +50,10 @@ else
 fi
 
 cases="$(printf '%s\n' "$out" | grep -c '^  PASS: ')"
-if [[ $rc -eq 0 && $cases -eq 7 ]]; then
-    ok "the limited run passed all 6 cases plus the restore check"
+if [[ $rc -eq 0 && $cases -eq 9 ]]; then
+    ok "the limited run passed all 8 cases plus the restore check"
 else
-    ko "the limited run passed all 6 cases plus the restore check" \
+    ko "the limited run passed all 8 cases plus the restore check" \
        "rc=$rc pass-lines=$cases; tail: $(printf '%s\n' "$out" | tail -4 | tr '\n' ' ')"
 fi
 

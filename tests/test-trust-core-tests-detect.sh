@@ -65,20 +65,22 @@ if [[ "$mode" != "worker" ]]; then
     # One read of the repo into a pristine base, then one copy of the base per
     # worker (a copy-on-write clone where cp -c exists, 1s vs 4s per copy
     # measured). No .git: git state is shared and contended, and no case needs
-    # it. loki-ts/node_modules is read-only to every case and most of the
-    # bytes, so it is linked, not copied. A failed worker copy starts no
-    # worker; the others claim its cases, and if none started every case
-    # reports red.
+    # it. loki-ts/node_modules is most of the bytes, so it skips the tar and is
+    # cloned straight from the repo. It is NOT linked: bun rewrites
+    # node_modules/.bin during a run (measured), so a link is shared mutable
+    # state. A failed worker copy starts no worker; the others claim its cases,
+    # and if none started every case reports red.
+    clone_dir() { cp -Rc "$1" "$2" 2>/dev/null || { rm -rf -- "$2"; cp -R "$1" "$2"; }; }
     mkdir "$work/base" &&
         tar -C "$REPO_ROOT" --exclude=./.git --exclude=./.claude/worktrees \
-            --exclude=./loki-ts/node_modules -cf - . | tar -C "$work/base" -xf - &&
-        { [[ ! -d "$REPO_ROOT/loki-ts/node_modules" ]] ||
-          ln -s "$REPO_ROOT/loki-ts/node_modules" "$work/base/loki-ts/node_modules"; } ||
+            --exclude=./loki-ts/node_modules -cf - . | tar -C "$work/base" -xf - ||
         { echo "  FAIL: could not copy the repo"; exit 1; }
     w=0
     while (( w < jobs )); do
-        ( cp -Rc "$work/base" "$work/copy$w" 2>/dev/null ||
-          { rm -rf -- "$work/copy$w"; cp -R "$work/base" "$work/copy$w"; } ) &
+        ( clone_dir "$work/base" "$work/copy$w" &&
+          { [[ ! -d "$REPO_ROOT/loki-ts/node_modules" ]] ||
+            clone_dir "$REPO_ROOT/loki-ts/node_modules" "$work/copy$w/loki-ts/node_modules"; } ||
+          rm -rf -- "$work/copy$w" ) &
         w=$((w + 1))
     done
     wait
