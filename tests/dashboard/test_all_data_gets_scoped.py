@@ -81,8 +81,33 @@ def _run_in_subprocess(body: str):
 _BODY_NO_UNGUARDED_DATA_GET = """
 import dashboard.server as server
 
-unguarded = []
+# FastAPI >= 0.141 stores an included router as ONE lazy wrapper in
+# app.routes (path=None), so a plain app.routes walk sees zero /api/v2 and
+# /api/operator routes even though they are mounted and serving (BACKLOG
+# 27/29; tests/dashboard/test_router_mounts_diagnostic.py). That made this
+# audit's v2 coverage silently vacuous instead of failing loudly (BACKLOG
+# 94a). Collect each included router's OWN .routes too, the way the P7
+# route matcher does (tests/moat/p7-no-fabricated-data.sh), and de-dup by
+# (path, methods) since <= 0.128 already lists the same route objects both
+# ways.
+seen = {}
 for r in server.app.routes:
+    path = getattr(r, "path", None)
+    if path is not None:
+        seen[(path, frozenset(getattr(r, "methods", None) or ()))] = r
+for modname in ("dashboard.api_v2", "dashboard.api_operator"):
+    try:
+        router = __import__(modname, fromlist=["router"]).router
+    except Exception:
+        continue  # optional router not importable; server.py already skips its mount
+    for r in getattr(router, "routes", []):
+        path = getattr(r, "path", None)
+        if path is not None:
+            seen.setdefault((path, frozenset(getattr(r, "methods", None) or ())), r)
+
+unguarded = []
+audited_v2 = 0
+for r in seen.values():
     methods = getattr(r, "methods", None) or set()
     path = getattr(r, "path", None)
     if path is None or "GET" not in methods:
@@ -90,12 +115,18 @@ for r in server.app.routes:
     if not path.startswith("/api/"):
         # Non-/api paths are shells/probes; only /api carries data.
         continue
+    if path.startswith("/api/v2/"):
+        audited_v2 += 1
     if path in PUBLIC_ALLOWLIST:
         continue
     deps = getattr(r, "dependencies", [])
     if len(deps) < 1:
         unguarded.append(path)
 
+assert audited_v2 > 0, (
+    "zero /api/v2 GET routes were audited; on FastAPI >= 0.141 this means "
+    "the app.routes walk fell back to the vacuous case (BACKLOG 94a)"
+)
 assert not unguarded, (
     "These /api/* data GET routes have no auth dependency: " + repr(sorted(unguarded))
 )
