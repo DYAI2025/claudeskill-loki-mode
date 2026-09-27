@@ -5,6 +5,13 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.71.0
+
+**Honest metrics JSON and bump-commit verdict reuse for the Footer.** Released from green tree c6ed3882 (Tests run 36344585850 and Bun Parity run 36344585823 both success before the bump).
+
+- `loki metrics --json` reports null for tokens, iterations and time saved that were never recorded, instead of invented numbers; an empty tracking file no longer marks tokens as known (S-147).
+- web-app Footer.tsx joins the release workflow's version-only allowlist, so a bump commit reuses its parent's Tests verdict (S-153).
+
 ## v9.70.0
 
 **Faster CI on version bumps, honest heatmap, stricter council readers.** Released from green tree b61045fd (Tests run 36343940285 and Bun Parity run 36343940266 both success before the bump).
