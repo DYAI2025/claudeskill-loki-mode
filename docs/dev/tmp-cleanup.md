@@ -1,37 +1,29 @@
-# Loki Mode - Claude Code Skill
-@docs/v10/OPERATING-MODEL.md
-Autonomous spec-to-product system: takes a PRD, GitHub issue, OpenAPI/JSON/YAML doc, or one-line brief to a deployed product via the RARV-C closure loop. Provider-agnostic: Claude Code, OpenAI Codex CLI, Cline, Aider, opencode. Flagship product of [Autonomi](https://www.autonomi.dev/).
+# Temp directory and process cleanup (mandatory helpers)
 
-## Quick Start
+Moved out of CLAUDE.md (S-78) to keep the root file short. Content unchanged.
+CLAUDE.md still states the invariant; this file holds the runnable helpers.
 
-```bash
-claude --dangerously-skip-permissions   # then invoke "Loki Mode"
-loki start ./prd.md              # PRD-mode
-loki start owner/repo#123        # issue-mode
-```
+## Test and Resource Cleanup (MANDATORY - NEVER SKIP)
 
-## Core concepts
-- RARV cycle: **R**eason -> **A**ct -> **R**eflect -> **V**erify, every iteration.
-- Models: Opus for planning/architecture only; Sonnet for development and functional testing; Haiku for unit tests, monitoring, and parallelizable work.
-- Providers: Claude Code full (Tier 1); Cline reduced (Tier 2); Codex CLI/Aider degraded, sequential (Tier 3); opencode model-agnostic. Gemini CLI is DEPRECATED; `LOKI_PROVIDER=gemini` exits with a migration message. See `providers/*.sh`.
-- Version: see `VERSION` (semver: MAJOR = architecture change, MINOR = feature, PATCH = fix). Full release steps: `docs/dev/release-checklist.md`.
+**Before reporting ANY task as done, run ALL cleanup steps below. No exceptions.**
 
-## Git and release invariants (binding, no exceptions)
-- Repo-local commit identity: `asklokesh` / `lokeshmure@live.com`, never set globally. Stage files by name; never bulk-stage the whole tree; never add a co-author line.
-- Commit/push authority: the standing authorization in `docs/LOKI-10-BUILD-PROMPT.md` section 1 governs sessions operating under that program (no waiting for approval there). Ask before committing otherwise.
-- Release model: trains, not push-per-merge (`docs/v10/DECISIONS.md` D25). Batch approved merges locally, push once per train, wait for CI green on that exact SHA, then release.
-- Pre-push/release gate: `bash scripts/local-ci.sh` (fast tier). The FULL tier is diagnostic only, never a release blocker. Never force-push, kill processes by name/pattern, or bypass branch protection.
-- No emojis, no em dashes, no en dashes, anywhere (code, docs, commits, UI); remove any found on sight. SKILL.md stays under 500 lines with header AND footer version bumped together.
-- Harness code invariants (see `docs/dev/architecture-reference.md`): new always-on prompt text goes in the cache-stable prefix; `goal_score.ts` and `run.sh` change together, byte-mirrored; never invert smart-retry's fail-safe default.
+1. **Create one run-owned temp directory before the first temp write.** Keep
+   every archive, package extraction, log, PID file, and test fixture for the
+   task below this directory. Never use fixed names or shared globs under
+   `/tmp`.
 
-## Cleanup (mandatory before reporting any task done)
-Every temp file and background process goes under one run-owned directory
-created with `loki_run_tmp_create`; stop only PIDs you recorded; remove only
-that validated directory with `loki_run_tmp_cleanup`. Never sweep `/tmp`,
-`$TMPDIR`, or process names/patterns. Verify-before-documenting rule and full
-source commentary: `docs/dev/tmp-cleanup.md`.
+2. **Stop only processes started by the current task.** Retain their exact PIDs
+   below `$LOKI_RUN_TMP` and signal those PIDs individually. Do not use
+   `pkill`, a shared-port sweep, or a name-pattern kill as cleanup.
 
-<!-- BEGIN LOKI_RUN_TMP_HELPERS -->
+3. **Remove only the validated run-owned directory.** Use the helpers below.
+   Cleanup fails closed unless the target is a direct child of the canonical
+   temp root, has the exact ownership marker created with it, is owned by the
+   current UID, still carries the private permissions the helper set (`700`
+   for the directory, `600` for the marker), is not a symlink, and is not a
+   Git worktree. Never replace this with a wildcard deletion under `/tmp` or
+   `$TMPDIR`.
+
 ```bash
 loki_run_tmp_create() {
     local temp_root marker
@@ -140,11 +132,26 @@ loki_run_tmp_cleanup() {
     unset LOKI_RUN_TMP
 }
 ```
-<!-- END LOKI_RUN_TMP_HELPERS -->
 
-## Read when needed
-- `docs/dev/project-structure.md` - directory map, codebase knowledge graph, key functions, critical data flow; and `docs/dev/research-foundation.md` - the labs and papers this system is built on.
-- `docs/dev/architecture-reference.md` - the 8 quality gates, legacy healing, memory system, metrics, v8 harness knobs, RARV-C closure env vars.
-- `docs/dev/release-checklist.md` - full version-bump file list, dashboard build, pre-publish validation, distribution channels, local CI details.
-- `skills/sdlc-fleet.md` - six-role standing fleet pattern for non-trivial changes; its roles are superseded by `docs/v10/OPERATING-MODEL.md`, its review rules by D12/D13, and its "ask the founder" step by the standing autonomous mandate in `docs/LOKI-10-BUILD-PROMPT.md`.
-- `docs/v10/DECISIONS.md` - the standing decision log (D1-D26 and later); check before assuming an older process rule still holds.
+4. **Verify exact cleanup.** Confirm each recorded PID is gone and the saved
+   `$LOKI_RUN_TMP` path no longer exists. Do not scan or delete other users'
+   or runs' temp paths.
+
+5. **Report cleanup status** to the user in the task completion message,
+   including only the explicit run-owned path and process IDs handled.
+
+## Feedback Loop Requirement (before documenting a new feature)
+
+1. **Verify it exists** - check files, run commands, test endpoints.
+2. **Run feedback loop** - Task tool with Opus to review claims for accuracy.
+3. **Be factual only** - never document features that don't work yet.
+4. **Mark planned features** - use "Coming Soon" or "Planned" labels.
+
+```bash
+# Before documenting "npm install -g loki-mode"
+npm view loki-mode  # Does package exist on registry?
+# Before documenting a CLI command
+which loki && loki --help
+# Before documenting a file path
+ls -la path/to/file
+```
