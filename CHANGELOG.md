@@ -5,6 +5,21 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.70.0
+
+**Faster CI on version bumps, honest heatmap, stricter council readers.** Released from green tree b61045fd (Tests run 36343940285 and Bun Parity run 36343940266 both success before the bump).
+
+- A version-bump-only push skips the heavy Tests jobs when its parent's Tests run succeeded, using the same eligibility rules as the release workflow (S-132).
+- Shard durations rebalanced, with a drift detector so a registered suite without a duration row fails (S-134).
+- The shard-coverage test drives the real runner instead of a static count, and ignores an inherited shard setting (S-137).
+- The pulse flags slices marked released before npm has the publish (S-139).
+- jest "Test Suites N failed" and vitest "Test Files N failed" lines count as failures (S-140).
+- The remaining council gate readers use the resolved isolated Python interpreter (S-141).
+- Convergence-floor negative case for the legacy runner:none pass:true shape (S-142).
+- Stale Gemini, Railway and gate-count copy removed from the web app; the roadmap badge is current (S-143).
+- The analytics heatmap marks days before the activity window as no data instead of 0 activities (S-151).
+- tests/test-select-tests.sh runs about 5x faster and works under bash 3.2 (S-136).
+
 ## v9.69.0
 
 **Trust page says when there is not enough history.** Released from green tree 7ef5ca28 (Tests run  and Bun Parity run  both success before the bump).
