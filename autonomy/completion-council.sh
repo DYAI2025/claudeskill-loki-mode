@@ -1856,6 +1856,12 @@ _loki_test_provenance() {
 # legitimate completion is never falsely stopped. Default-on; opt out with
 # LOKI_EVIDENCE_GATE=0 (byte-identical to prior behavior, no read/write).
 council_evidence_gate() {
+    # P2 (S-116): when the caller sets _LOKI_EVIDENCE_REQUIRE_TESTS=1, inconclusive
+    # test evidence blocks instead of passing through. council_evaluate sets it as
+    # a function-local (bash dynamic scope, gone on return), so the vote alone can
+    # never approve while every other caller keeps the old pass-through rc.
+    local _require_tests="false"
+    [ "${_LOKI_EVIDENCE_REQUIRE_TESTS:-0}" = "1" ] && _require_tests="true"
     # Knob first: opt-out is exact-as-today, before any file read or write.
     [ "${LOKI_EVIDENCE_GATE:-1}" = "0" ] && return 0
 
@@ -2702,6 +2708,12 @@ PYEOF
         # silently. The durable detail is in evidence-gate-details.json; this is
         # the human-visible honesty at the pass site.
         if [ "$test_inconclusive" = "true" ]; then
+            if [ "$_require_tests" = "true" ]; then
+                # Council route: a vote over inconclusive tests is the vote alone.
+                log_warn "[Council] Evidence gate: completion not backed by test evidence (${test_inconclusive_reason}); the council vote alone cannot approve. Record a real test run, or set LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1 to treat no-tests as affirmative."
+                _write_evidence_details "block"
+                return 1
+            fi
             log_warn "[Council] Evidence gate: completion not backed by test evidence (${test_inconclusive_reason}). Pass-through; set LOKI_EVIDENCE_NO_TESTS_AFFIRMATIVE=1 to treat no-tests as affirmative."
         fi
         # Same honesty for the runtime-boot axis: a pass that could not confirm the
@@ -4176,7 +4188,9 @@ council_evaluate() {
     fi
 
     # Phase 2.5 (v7.19.1): evidence hard gate - block completion unless there is
-    # real evidence that files changed AND tests are green.
+    # real evidence that files changed AND tests are green. The local below makes
+    # an inconclusive test signal block here, so the vote never approves alone.
+    local _LOKI_EVIDENCE_REQUIRE_TESTS=1
     if ! council_evidence_gate; then
         log_info "[Council] Completion blocked by evidence hard gate"
         return 1  # CONTINUE - cannot complete without real evidence
