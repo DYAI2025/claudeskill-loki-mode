@@ -420,8 +420,13 @@ assert_allowed "R4 allowed: rm -rf under .claude/worktrees" \
 rmdir "$SCRIPT_DIR/.claude/worktrees/scratch-fixture-$$" 2>/dev/null || true
 assert_allowed "R4 allowed: rm -rf under \$TMPDIR-rooted run tmp" \
     "rm -rf $LOKI_RUN_TMP/scratch-under-tmp" "$SCRIPT_DIR"
+# cwd="/" (not $SCRIPT_DIR): if the checkout itself sits under /tmp or
+# $TMPDIR, $SCRIPT_DIR/.claude/worktrees would ALSO resolve strictly under
+# the /tmp root and be correctly (per the rule's own literal wording)
+# allowed on that basis alone, masking whether the worktrees-root-itself
+# check works. cwd="/" keeps ONLY the worktrees-root check in play.
 assert_blocked "R4 blocked: rm -rf on .claude/worktrees ITSELF (the root, not under it)" \
-    "rm -rf .claude/worktrees" "$SCRIPT_DIR" "RULE4"
+    "rm -rf .claude/worktrees" "/" "RULE4"
 assert_blocked "R4 blocked: rm -rf on /tmp ITSELF (the root, not under it)" \
     "rm -rf /tmp" "$SCRIPT_DIR" "RULE4"
 # Absolute, clearly-outside-any-root targets below (not SCRIPT_DIR-relative
@@ -506,6 +511,48 @@ EOF" "$SCRIPT_DIR"
 # shellcheck disable=SC2016  # literal text passed as the guarded command string, not expanded here
 assert_allowed "Heredoc: arithmetic << is not mistaken for a heredoc marker" \
     'echo $((1<<2))' "$SCRIPT_DIR"
+
+echo ""
+echo "--- Heredocs continued: no-terminator must strip NOTHING, not the rest of the command (round 4) ---"
+assert_blocked "Heredoc: here-string <<< is not a heredoc marker (opener tail still runs)" \
+    "cat <<< hello
+pkill -f loki" "$SCRIPT_DIR" "RULE1"
+assert_blocked "Heredoc: here-string <<< before a force-push (opener tail still runs)" \
+    "grep x <<< word
+git push --force origin main" "$REPO2" "RULE2"
+assert_blocked "Heredoc: <<EOF inside a quoted grep pattern is not a marker (opener tail still runs)" \
+    'grep -rn "<<EOF" scripts/
+rm -rf docs' "/" "RULE4"
+assert_blocked "Heredoc: <<X after an unquoted # comment is not a marker (opener tail still runs)" \
+    "# note <<X
+git push -f origin main" "$REPO2" "RULE2"
+assert_blocked "Heredoc: arithmetic << with spaces is not a marker (opener tail still runs)" \
+    "echo \$((1 << 2 ))
+pkill -f loki" "$SCRIPT_DIR" "RULE1"
+# shellcheck disable=SC2016  # literal text passed as the guarded command string, not expanded here
+assert_blocked "Heredoc: arithmetic << with spaces and a variable is not a marker (opener tail still runs)" \
+    'x=$(( n << 1 ))
+rm -rf docs' "/" "RULE4"
+assert_blocked "Heredoc: delimiter with a hyphen is a real heredoc (full shell-word, not just \\w+)" \
+    "cat <<EOF-X
+hi
+EOF-X
+pkill -f loki" "$SCRIPT_DIR" "RULE1"
+# shellcheck disable=SC2016  # literal text (with embedded CR) passed as the guarded command string
+assert_blocked "Heredoc: CRLF line endings, terminator line has a trailing \\r" \
+    $'cat <<EOF\r\nhi\r\nEOF\r\ngit push --force origin main' "$REPO2" "RULE2"
+assert_blocked "Heredoc: genuinely unterminated heredoc must strip NOTHING (not the whole rest of the command)" \
+    "cat <<EOF
+pkill -f loki" "$SCRIPT_DIR" "RULE1"
+assert_allowed "Heredoc: a here-string alone is allowed" \
+    "cat <<< hello" "$SCRIPT_DIR"
+assert_allowed "Heredoc: bc <<< 2+2 (here-string, common real usage)" \
+    "bc <<< 2+2" "$SCRIPT_DIR"
+assert_allowed "Heredoc: a real, properly terminated heredoc with a safe trailing command" \
+    "cat <<EOF
+hi
+EOF
+echo done" "$SCRIPT_DIR"
 
 echo ""
 echo "--- Rule 1 continued: a trailing redirect must not be read as the kill target (round 3) ---"

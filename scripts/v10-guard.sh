@@ -122,51 +122,148 @@ cwd = os.environ.get("_V10_CWD") or os.getcwd()
 # verbatim: the shell still runs whatever else is chained on that same
 # line (`<<EOF && rm -rf x`, `<<EOF; pkill -f loki`), and an earlier
 # version of this stripper deleted that trailing content too, silently
-# turning those into no-ops. Only the region from the opener's newline
-# through a line that is EXACTLY the delimiter (leading tabs allowed only
-# for `<<-`) is removed; `EOF anything` is not a terminator.
+# turning those into no-ops.
 #
-# `<<` is also the arithmetic left-shift operator (`$((1<<2))`), which is
-# not a heredoc: an unquoted delimiter immediately followed by `)` is
-# treated as that instead of a heredoc marker.
+# A marker is only recognized when a hand-rolled scan of the OPENER LINE
+# finds a genuine, live `<<`/`<<-`: not part of a `<<<` here-string, not
+# inside a single- or double-quoted string (so `grep "<<EOF" f` is not a
+# heredoc), and not after an unquoted `#` (a comment). The delimiter is
+# read as a shell WORD (quotes stripped, any run of non-blank,
+# non-metacharacter text -- so `EOF-X` is a valid delimiter, not just
+# `\w+`), and a delimiter immediately followed by `)` (skipping spaces) is
+# arithmetic `<<` (`$((1 << 2))`), not a heredoc.
+#
+# If no line consisting of exactly that delimiter (leading tabs allowed
+# only for `<<-`, and a trailing \r tolerated) is found afterward, this is
+# NOT treated as a real heredoc at all: nothing is stripped, and whatever
+# happens next is left for the tokenizer to parse or refuse. Silently
+# deleting the "body" here previously discarded real, dangerous commands
+# whenever the `<<` turned out to be a here-string, a quoted/commented-out
+# example, or arithmetic shift that still matched the marker shape.
 # ---------------------------------------------------------------------
-HEREDOC_MARKER_RE = re.compile(r"<<(-?)\s*((['\"]?)(\w+)\3)")
+METACHARS = set(" \t\r\n;&|()<>")
+
+
+def _read_shell_word(line, start):
+    """Read one shell WORD starting at `start` (quotes stripped), stopping
+    at a metacharacter. Returns (word, end_index)."""
+    out = []
+    i, n = start, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "'":
+            end = line.find("'", i + 1)
+            if end == -1:
+                return "".join(out), i
+            out.append(line[i + 1:end])
+            i = end + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and line[j] != '"':
+                if line[j] == "\\" and j + 1 < n:
+                    out.append(line[j + 1])
+                    j += 2
+                    continue
+                out.append(line[j])
+                j += 1
+            i = j + 1
+            continue
+        if ch in METACHARS:
+            break
+        if ch == "\\" and i + 1 < n:
+            out.append(line[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out), i
+
+
+def _heredoc_marker_on_line(line):
+    """Scan one line for a live (unquoted, uncommented, not a here-string)
+    `<<`/`<<-` heredoc marker. Returns (dash, delim) or None."""
+    in_squote = in_dquote = False
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if in_squote:
+            if ch == "'":
+                in_squote = False
+            i += 1
+            continue
+        if in_dquote:
+            if ch == '"':
+                in_dquote = False
+            elif ch == "\\" and i + 1 < n:
+                i += 1
+            i += 1
+            continue
+        if ch == "'":
+            in_squote = True
+            i += 1
+            continue
+        if ch == '"':
+            in_dquote = True
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return None  # rest of the line is a comment
+        if ch == "<" and i + 1 < n and line[i + 1] == "<":
+            if i > 0 and line[i - 1] == "<":
+                i += 1
+                continue
+            j = i + 2
+            if j < n and line[j] == "<":
+                i = j + 1
+                continue  # `<<<` here-string, not a heredoc
+            dash = False
+            if j < n and line[j] == "-":
+                dash = True
+                j += 1
+            while j < n and line[j] in " \t":
+                j += 1
+            delim, end = _read_shell_word(line, j)
+            if not delim:
+                i = j
+                continue
+            peek = end
+            while peek < n and line[peek] in " \t":
+                peek += 1
+            if peek < n and line[peek] == ")":
+                # `$((1 << 2))` / `$(( n << 1 ))` -- arithmetic, not a heredoc.
+                i = j
+                continue
+            return dash, delim
+        i += 1
+    return None
 
 
 def strip_heredocs(text):
-    out = []
-    pos = 0
-    search_from = 0
-    while True:
-        m = HEREDOC_MARKER_RE.search(text, search_from)
-        if not m:
-            out.append(text[pos:])
-            break
-        after = m.end()
-        if not m.group(3) and after < len(text) and text[after] == ")":
-            # Unquoted delimiter immediately closed by ')' -- arithmetic
-            # `<<`, not a heredoc. Leave it untouched and keep scanning.
-            search_from = after
+    lines = text.split("\n")
+    out_lines = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        out_lines.append(line)
+        i += 1
+        marker = _heredoc_marker_on_line(line)
+        if marker is None:
             continue
-        line_end = text.find("\n", after)
-        if line_end == -1:
-            # No newline after the opener -- nothing to strip a body from.
-            out.append(text[pos:])
-            break
-        delim = m.group(4)
-        indent = r"[ \t]*" if m.group(1) else ""
-        term_re = re.compile(r"^" + indent + re.escape(delim) + r"[ \t]*$", re.MULTILINE)
-        tm = term_re.search(text, line_end + 1)
-        out.append(text[pos:line_end + 1])
-        if tm is None:
-            # Unterminated heredoc -- drop the (unterminated) body, nothing
-            # legitimate follows it to preserve.
-            pos = len(text)
-            break
-        term_line_end = text.find("\n", tm.end())
-        pos = term_line_end + 1 if term_line_end != -1 else len(text)
-        search_from = pos
-    return "".join(out)
+        dash, delim = marker
+        indent = r"[ \t]*" if dash else ""
+        term_re = re.compile(r"^" + indent + re.escape(delim) + r"[ \t]*\r?$")
+        j = i
+        while j < n and not term_re.match(lines[j]):
+            j += 1
+        if j < n:
+            i = j + 1  # drop the body lines and the terminator line itself
+        # else: no terminator found -- strip NOTHING; the body lines remain
+        # in out_lines via the normal loop continuation above.
+    return "\n".join(out_lines)
 
 
 command = strip_heredocs(command)
