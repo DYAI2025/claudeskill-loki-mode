@@ -110,14 +110,14 @@ _suite_timeout_for() {
     fi
     case "$(basename -- "$1")" in
         # BACKLOG 143 / S-79: test-ci-json-argmax.sh used to need 2400s
-        # (1327s measured, run 36299762731, 2026-09-27) because its default
-        # fixture was sized for total ARG_MAX (~116K findings) when the crash
-        # it guards only needs ONE exported string past Linux's MAX_ARG_STRLEN
-        # (131072 bytes). Re-sized to a ~4000-finding fixture on Linux; the
-        # full ARG_MAX-scale fixture still exists behind LOKI_ARGMAX_FULL=1
-        # for the nightly run (see .github/workflows/integrity-audit.yml), so
-        # no override is needed here -- the default sizing now fits the
-        # suite's own default timeout.
+        # (1327s measured, run 36299762731, 2026-09-27) because cmd_ci forked
+        # echo+cut once per finding while tallying and rendering the full
+        # ARG_MAX-scale fixture (~116K findings). Fixed at the source in
+        # autonomy/loki (${match%%:*} / IFS='|' read, no per-finding fork);
+        # the fixture itself is unchanged and still sized for total ARG_MAX
+        # on every run. Measured post-fix: 4.4s Linux (docker ubuntu:24.04),
+        # 4.6s macOS, 8.9s at a 4 MiB ARG_MAX -- all well inside the 450s
+        # default, so no override is needed here.
         #
         # Real `bun test` mutation probes (trust-core regression detection),
         # not a fixed-size fixture. Measured: 191s solo (CI shard 2, run
