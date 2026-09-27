@@ -138,7 +138,7 @@ echo "T4 -- the real runner selects every suite: unsharded, and via n=4/n=8 dry-
 
 # Unsharded (no LOKI_TEST_SHARD set) is the path a developer runs locally by
 # default; it must still select every registered suite.
-unsharded_names="$(LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null | grep -Fxf "$_reg_names_file" -)" || true
+unsharded_names="$(env -u LOKI_TEST_SHARD LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null | grep -Fxf "$_reg_names_file" -)" || true
 unsharded_count=$(printf '%s\n' "$unsharded_names" | sort -u | grep -c .)
 if [ "$unsharded_count" -eq "$total" ]; then
     ok "unsharded real run selects all $total registered suites"
