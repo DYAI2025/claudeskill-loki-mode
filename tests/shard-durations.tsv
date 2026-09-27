@@ -599,6 +599,7 @@ council gate readers use the resolved -I -S interpreter (S-141)	3
 Metrics JSON Unmeasured	1
 web-app workspace panels surface fetch failures (node --test)	1
 web-app chat completion never says Done. for a silent failure (node --test)	1
+web-app issue list shows the gh comment count (node --test)	1
 dashboard checkpoint viewer shows a failed read, not empty (node --test)	0
 dashboard council transcripts show a failed hook-events read (node --test)	0
 dashboard task board keeps a server load error visible (node --test)	1
