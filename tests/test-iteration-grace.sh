@@ -39,8 +39,12 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # provider file OLDER than this predates this test run and is not ours to
 # blame (another suite in the same shared checkout may legitimately write it,
 # e.g. one that runs `loki provider show` against the repo as its project).
+# The 1s sleep guards the `-nt` comparison below against same-second mtime
+# granularity (measured: without it, bash 3.2's `-nt` can read a marker and a
+# same-second contaminating write as simultaneous and pass vacuously).
 PROBE_START="$SCRATCH/.probe-start"
 touch "$PROBE_START"
+sleep 1
 
 # NOTE: TARGET_DIR must be assigned AFTER sourcing run.sh -- sourcing sets it,
 # so exporting it beforehand is silently overwritten (that cost a debug cycle).
