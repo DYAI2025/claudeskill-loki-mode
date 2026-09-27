@@ -10823,7 +10823,7 @@ var LokiDashboard=(()=>{var Le=Object.defineProperty;var kt=Object.getOwnPropert
             ${t}
             <span class="migration-title">Migration Dashboard</span>
           </div>
-          <div class="empty-state">No migration data available</div>
+          <div class="empty-state status-failed">Could not load migrations: ${this._escapeHtml(this._error)}</div>
         </div>
       `;return}if(this._migration){let i=this._migration,a=this._escapeHtml(i.migration_id||i.id||"--"),s=this._escapeHtml(i.source||"--"),r=this._escapeHtml(i.target||"--"),o=i.current_phase||i.phase||"unknown",n=i.completed_phases||[];this.shadowRoot.innerHTML=`
         <style>${e}</style>
