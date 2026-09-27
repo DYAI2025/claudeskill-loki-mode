@@ -5,6 +5,18 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.66.0
+
+**Council honesty, a faster moat, and a clean quarantine list.** Released from green tree 51ae52fe (Tests run 36338540948 and Bun Parity run 36338540897 both success before the bump).
+
+- The completion council can no longer approve on its vote alone when the test evidence is inconclusive; moat case P2.council-inconclusive-cannot-exit-zero is now proven (S-116).
+- `--add-dir` directories reach the provider again, and two more CI-only test bugs are fixed, so the quarantine list is empty (S-110).
+- Moat baseline detection refuses a symlinked pending.txt or cases.txt at a release tag instead of treating it as unratcheted (S-128).
+- The P9 Rule of Two moat check runs its injection scenarios in parallel: 43s instead of about 90s, with identical verdicts (S-88).
+- The CI python suite runs with `pytest -n auto` again, now that the launch race behind the earlier failures is fixed (S-111).
+- A hard-deadline test no longer fails under load on correct behaviour (S-129).
+- The web-app Settings page drops the removed Gemini provider, adds opencode, and stops showing a stale build date (S-130).
+
 ## v9.65.0
 
 **Honest proofs, a louder release tag step, and fewer vacuous tests.** Released from green tree 55521236 (Tests run 36337415795 and Bun Parity run 36337415765 both success before the bump).
