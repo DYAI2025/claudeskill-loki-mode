@@ -467,7 +467,7 @@ jobs:
               echo "FAIL: required workflows did not complete before the deadline"
               exit 1
             fi
-            sleep 30
+            sleep 10
           done
 
   release:
@@ -868,10 +868,11 @@ jobs:
           #   (cd loki-ts && bun install --production && bun run build) \
           #     || echo 'WARN: loki-ts build failed, using existing dist if present'
           # so a broken build yields exit 0 and a tarball carrying a STALE dist.
-          # publish-docker asserts `test -f dist/loki.js` after its own build,
-          # but publish-docker and publish-npm are PARALLEL siblings on
-          # `needs: release`: the channel with the assertion cannot stop the one
-          # without it, and npm has already shipped by the time Docker goes red.
+          # publish-docker-build asserts `test -f dist/loki.js` after its own
+          # build, but publish-docker-build and publish-npm are PARALLEL
+          # siblings on `needs: release`: the channel with the assertion
+          # cannot stop the one without it, and npm has already shipped by the
+          # time Docker goes red.
           set -euo pipefail
           want="$(cat VERSION)"
           # prepack's bun build writes to stdout too, so --silent is NOT
