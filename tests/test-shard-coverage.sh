@@ -126,16 +126,43 @@ for bad_spec in "3/3" "5/2" "abc/2" "1/0"; do
 done
 
 echo
-echo "T4 -- no shard set means run everything (default is unchanged)"
+echo "T4 -- the real runner selects every suite: unsharded, and via n=4/n=8 dry-run union"
 
-# The default path must be byte-identical in behaviour to before sharding
-# existed, so a developer running the suite locally sees no change.
-unsharded=$(awk '/^[[:space:]]*run_test / { c++ } END { print c + 0 }' "$RUNNER")
-if [ "$unsharded" -eq "$total" ]; then
-    ok "unsharded run still selects all $total suites"
+# S-137 (S-81 review follow-up): this used to recompute two counts by parsing
+# run_test lines out of the source text -- the exact same static grep T1
+# already trusts -- and compare them to EACH OTHER. Both sides read the same
+# source text, never the runtime, so a real selection bug (the LPT packing
+# silently dropping a suite from every shard, say) could never turn this red.
+# Drive the real runner instead, through the same LOKI_TEST_LIST dry-run path
+# T2 already trusts, so a runtime bug shows up here too.
+
+# Unsharded (no LOKI_TEST_SHARD set) is the path a developer runs locally by
+# default; it must still select every registered suite.
+unsharded_names="$(LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null | grep -Fxf "$_reg_names_file" -)" || true
+unsharded_count=$(printf '%s\n' "$unsharded_names" | sort -u | grep -c .)
+if [ "$unsharded_count" -eq "$total" ]; then
+    ok "unsharded real run selects all $total registered suites"
 else
-    bad "unsharded run selects $unsharded of $total"
+    bad "unsharded real run selected $unsharded_count of $total registered suites"
 fi
+
+# Cross-check by actually enumerating every shard through the real dry-run
+# path at n=4 and n=8 and comparing the union against the registration list
+# -- not a second static count.
+for n in 4 8; do
+    union_file="$(mktemp)"
+    for i in $(seq 0 $((n - 1))); do
+        LOKI_TEST_SHARD="$i/$n" LOKI_TEST_LIST=1 bash "$RUNNER" 2>/dev/null \
+            | grep -Fxf "$_reg_names_file" - >> "$union_file" || true
+    done
+    ucount=$(sort -u "$union_file" | wc -l | tr -d ' ')
+    if [ "$ucount" -eq "$total" ]; then
+        ok "n=$n: real dry-run union covers all $total registered suites"
+    else
+        bad "n=$n: real dry-run union covers $ucount of $total registered suites"
+    fi
+    rm -f "$union_file"
+done
 
 echo
 echo "==============================================================="
