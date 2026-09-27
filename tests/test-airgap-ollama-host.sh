@@ -41,8 +41,18 @@ fi
 # ---- Part 2: current behavior (green) ---------------------------------------
 airgap_ready_json() {  # env assignments... -> prints airgap_ready / required_egress
     local out="$WORK/out-$$-$RANDOM"
+    # This test is a genuine victim, not a source, of BACKLOG 126's class of
+    # bug: a saved .loki/state/provider anywhere the CLI can see it beats
+    # LOKI_PROVIDER by design (see the CLI's own precedence rule), so a stray
+    # file left in the repo checkout by an unrelated, unisolated test running
+    # earlier in the same CI shard/local-ci session silently overrides
+    # LOKI_PROVIDER=opencode below and misreports locality. Point LOKI_DIR at
+    # this test's own isolated scratch dir so nothing outside this test's
+    # control can ever be read here, regardless of how many more contamination
+    # sources exist elsewhere in the suite.
     env -u OLLAMA_HOST -u OPENAI_BASE_URL -u OPENROUTER_API_KEY \
         LOKI_PROVIDER=opencode LOKI_OPENCODE_MODEL=ollama/qwen2.5-coder \
+        LOKI_DIR="$WORK/.loki" \
         "$@" "$LOKI" doctor --airgap --json >"$out" 2>"$out.err"
     python3 - "$out" <<'PY'
 import json, sys
