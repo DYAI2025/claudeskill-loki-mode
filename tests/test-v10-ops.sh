@@ -457,63 +457,122 @@ else
     bad "the malformed-status-cell refusal modified the file"
 fi
 
-# --- board-row-status: pins all 4 real BOARD.md table layouts --------------
-# Runs against a COPY of the real docs/v10/BOARD.md (never the file itself)
-# to prove the header-lookup approach works against every layout actually in
-# use, not just the synthetic 4-column fixtures above.
+# --- board-row-status: two explicit shapes measured in the real board ------
+# Round 4 regression: the header-index primary path breaks the moment a
+# row's column count differs from its header's -- 30 real rows are missing
+# one column (no "Acceptance checks"), 2 have an extra one (a literal "|"
+# inside Notes, e.g. inline code with "||"). These are isolated, synthetic
+# reproductions of both shapes before the full real-data sweep below.
 
-echo "== board-row-status: flips one row from each real BOARD.md table layout =="
+echo "== board-row-status: a row with FEWER columns than its header (measured real shape) =="
+BOARD_SHORT="$WORK/BOARD-short.md"
+cat > "$BOARD_SHORT" <<'EOF'
+# Board
+
+| ID | Owner | File set | Tier | Acceptance checks (Wall) | Status | Notes |
+|---|---|---|---|---|---|---|
+| Y-1 | owner | files | MEDIUM | ready@2026-09-27T09:00Z | short row notes |
+EOF
+out="$(bash "$OPS_SH" board-row-status "Y-1" "merged" "$BOARD_SHORT" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "Y-1 -> merged@"; then
+    ok "board-row-status handles a row with one fewer column than its header"
+else
+    bad "board-row-status short-row case: rc=$rc out=$out"
+fi
+row_after=$(grep "^| Y-1 " "$BOARD_SHORT")
+if printf '%s' "$row_after" | grep -q "merged@[0-9]" && ! printf '%s' "$row_after" | grep -q "ready@2026-09-27T09:00Z"; then
+    ok "the short row's real Status cell was located and replaced"
+else
+    bad "the short row's Status cell was not correctly updated: $row_after"
+fi
+
+echo "== board-row-status: a row with an embedded | in Notes (MORE columns than header) =="
+BOARD_EXTRAPIPE="$WORK/BOARD-extrapipe.md"
+cat > "$BOARD_EXTRAPIPE" <<'EOF'
+# Board
+
+| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |
+|---|---|---|---|---|---|---|
+| Z-1 | owner | main @ abc123 | files | HIGH | ready@2026-09-27T09:00Z | uses `a || b` inline logic |
+EOF
+out="$(bash "$OPS_SH" board-row-status "Z-1" "merged" "$BOARD_EXTRAPIPE" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "Z-1 -> merged@"; then
+    ok "board-row-status handles a row with an embedded pipe in Notes"
+else
+    bad "board-row-status extra-pipe-in-notes case: rc=$rc out=$out"
+fi
+row_after=$(grep "^| Z-1 " "$BOARD_EXTRAPIPE")
+if printf '%s' "$row_after" | grep -q "merged@[0-9]" && printf '%s' "$row_after" | grep -q "main @ abc123"; then
+    ok "the Branch cell was untouched and Status correctly updated despite the extra pipe"
+else
+    bad "the extra-pipe row was not handled correctly: $row_after"
+fi
+
+# --- board-row-status: sweeps EVERY slice row in the real BOARD.md ---------
+# The prior version of this test sampled only the FIRST row under each of
+# the 4 headers -- which is exactly why it missed this regression: none of
+# those 4 sampled rows happened to have a mismatched column count. This
+# sweeps every single slice row instead, each against a FRESH copy of the
+# real board (so one row's outcome can never mask or compound into the
+# next), asserting each flip touches exactly one line and exactly one cell.
+
+echo "== board-row-status: sweeps every slice row in the real BOARD.md =="
 REAL_BOARD_HASH_BEFORE=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
 [ -n "$REAL_BOARD_HASH_BEFORE" ] || REAL_BOARD_HASH_BEFORE=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
-BOARD_REAL_COPY="$WORK/BOARD-real-copy.md"
-cp "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_REAL_COPY"
+BOARD_SWEEP="$WORK/BOARD-sweep.md"
 
-real_layout_headers=(
-    "| ID | Owner | Branch @ SHA | File set (summary) | Tier | Status | Notes |"
-    "| ID | Owner | Branch @ SHA | File set | Tier | Status | Notes |"
-    "| ID | Owner | File set | Tier | Acceptance checks (Wall) | Status | Notes |"
-    "| ID | Owner | Branch | File set | Tier | Status | Notes |"
-)
-layout_n=0
-for header in "${real_layout_headers[@]}"; do
-    layout_n=$((layout_n + 1))
-    header_line=$(grep -n -F -x "$header" "$BOARD_REAL_COPY" | head -1 | cut -d: -f1)
-    if [ -z "$header_line" ]; then
-        bad "real-layout $layout_n: header not found in docs/v10/BOARD.md (layout drift -- update this test)"
-        continue
+sweep_ids=()
+while IFS= read -r sweep_id; do
+    [ -n "$sweep_id" ] && sweep_ids+=("$sweep_id")
+done < <(grep -E '^\| [A-Za-z]+-[0-9]+ ' "$REPO_ROOT/docs/v10/BOARD.md" \
+    | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+
+if [ "${#sweep_ids[@]}" -eq 0 ]; then
+    bad "real-board sweep: found zero slice rows -- the extraction is broken, not the board"
+else
+    sweep_fail=0
+    for row_id in "${sweep_ids[@]}"; do
+        cp "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_SWEEP"
+        out="$(bash "$OPS_SH" board-row-status "$row_id" "review" "$BOARD_SWEEP" 2>&1)"; rc=$?
+        if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q -- "-> review@"; then
+            bad "real-board sweep: $row_id failed to flip: rc=$rc out=$out"
+            sweep_fail=$((sweep_fail + 1))
+            continue
+        fi
+        changed_lines=$(diff "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_SWEEP" | grep -c '^[<>]')
+        if [ "$changed_lines" -ne 2 ]; then
+            bad "real-board sweep: $row_id changed $changed_lines diff line(s), expected exactly 2 (one before, one after)"
+            sweep_fail=$((sweep_fail + 1))
+            continue
+        fi
+        # Line-anchored: an ID like "PF-2" can also appear as plain text
+        # inside another row's Notes cell (e.g. "...@01:33Z | PF-2 (P7
+        # scanner..."), which an unanchored search would match first.
+        before_row=$(grep -E "^\| $row_id " "$REPO_ROOT/docs/v10/BOARD.md" | head -1)
+        after_row=$(grep -E "^\| $row_id " "$BOARD_SWEEP" | head -1)
+        cell_diff=$(python3 -c '
+import sys
+ca, cb = sys.argv[1].split("|"), sys.argv[2].split("|")
+print("COUNT_MISMATCH" if len(ca) != len(cb) else sum(1 for x, y in zip(ca, cb) if x != y))
+' "$before_row" "$after_row")
+        if [ "$cell_diff" != "1" ]; then
+            bad "real-board sweep: $row_id changed $cell_diff cell(s), expected exactly 1"
+            sweep_fail=$((sweep_fail + 1))
+        fi
+    done
+    if [ "$sweep_fail" -eq 0 ]; then
+        ok "all ${#sweep_ids[@]} real BOARD.md slice rows flip cleanly, exactly one line and one cell each"
     fi
-    data_line=$((header_line + 2))
-    row_text=$(sed -n "${data_line}p" "$BOARD_REAL_COPY")
-    row_id=$(printf '%s' "$row_text" | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
-    if [ -z "$row_id" ]; then
-        bad "real-layout $layout_n: could not extract a row ID under the header"
-        continue
-    fi
-    out="$(bash "$OPS_SH" board-row-status "$row_id" "merged" "$BOARD_REAL_COPY" 2>&1)"; rc=$?
-    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q -- "-> merged@"; then
-        ok "real-layout $layout_n ($row_id) flips cleanly"
-    else
-        bad "real-layout $layout_n ($row_id): rc=$rc out=$out"
-    fi
-    row_after=$(grep "^| $row_id " "$BOARD_REAL_COPY")
-    if printf '%s' "$row_after" | grep -q "merged@[0-9]"; then
-        ok "real-layout $layout_n ($row_id) Status cell updated"
-    else
-        bad "real-layout $layout_n ($row_id) Status cell not updated: $row_after"
-    fi
-done
+fi
+rm -f "$BOARD_SWEEP"
+
 # The real board itself must never be touched by this test.
 REAL_BOARD_HASH_AFTER=$(md5sum "$REPO_ROOT/docs/v10/BOARD.md" 2>/dev/null | awk '{print $1}')
 [ -n "$REAL_BOARD_HASH_AFTER" ] || REAL_BOARD_HASH_AFTER=$(md5 -q "$REPO_ROOT/docs/v10/BOARD.md")
 if [ -n "$REAL_BOARD_HASH_BEFORE" ] && [ "$REAL_BOARD_HASH_BEFORE" = "$REAL_BOARD_HASH_AFTER" ]; then
-    ok "the real docs/v10/BOARD.md is byte-identical before and after this test run"
+    ok "the real docs/v10/BOARD.md is byte-identical before and after the sweep"
 else
-    bad "the real docs/v10/BOARD.md changed during this test run: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
-fi
-if ! diff -q "$REPO_ROOT/docs/v10/BOARD.md" "$BOARD_REAL_COPY" >/dev/null 2>&1; then
-    ok "the scratch copy diverged from the real file, confirming the flips actually ran"
-else
-    bad "real-layout test: the copy is identical to the source -- no flip actually happened"
+    bad "the real docs/v10/BOARD.md changed during the sweep: before=$REAL_BOARD_HASH_BEFORE after=$REAL_BOARD_HASH_AFTER"
 fi
 
 # --- version-check / ci-status: PATH shadowing -----------------------------

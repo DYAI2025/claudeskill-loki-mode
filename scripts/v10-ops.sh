@@ -213,22 +213,18 @@ if header_idx is None:
     sys.exit(2)
 
 header_cells = lines[header_idx].split("|")
-status_idx = None
+header_status_idx = None
 for i, cell in enumerate(header_cells):
     if cell.strip().lower() == "status":
-        status_idx = i
+        header_status_idx = i
         break
-if status_idx is None:
+if header_status_idx is None:
     print("board-row-status: the table header above " + slice_id
           + " has no Status column", file=sys.stderr)
     sys.exit(2)
 
 row = lines[idx]
 cells = row.split("|")
-if status_idx >= len(cells):
-    print("board-row-status: row for " + slice_id + " has fewer columns "
-          "than its header -- refusing to guess", file=sys.stderr)
-    sys.exit(2)
 
 # The existing cell must already be exactly "<known-token>@<UTC timestamp>"
 # (the documented Status format in docs/v10/BOARD.md). Refusing anything else --
@@ -238,11 +234,38 @@ current_status_re = re.compile(
     r"^\s*(" + "|".join(re.escape(t) for t in known_tokens)
     + r")@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\s*$"
 )
-if not current_status_re.match(cells[status_idx]):
-    print("board-row-status: the Status cell for " + slice_id
-          + " does not match <token>@YYYY-MM-DDTHH:MMZ -- refusing to edit "
-          "an unexpected cell: " + cells[status_idx].strip(), file=sys.stderr)
-    sys.exit(2)
+
+if len(cells) == len(header_cells):
+    # Primary path: the row has the same column count as its header, so the
+    # header-derived index points at the real Status cell.
+    status_idx = header_status_idx
+    if not current_status_re.match(cells[status_idx]):
+        print("board-row-status: the Status cell for " + slice_id
+              + " does not match <token>@YYYY-MM-DDTHH:MMZ -- refusing to edit "
+              "an unexpected cell: " + cells[status_idx].strip(), file=sys.stderr)
+        sys.exit(2)
+else:
+    # A real BOARD.md shape: some rows drop a column relative to their
+    # header (measured: 30 rows missing "Acceptance checks"), which shifts
+    # every later column left by one and makes the header-derived index
+    # point at the wrong cell. Fall back to locating the Status cell by its
+    # full, exact shape -- known token, "@", a complete UTC timestamp -- not
+    # by the loose shape scan this script used before (which a bare
+    # "word@something" Branch/SHA cell like "main@779c50e5" could satisfy).
+    shape_matches = [i for i, c in enumerate(cells) if current_status_re.match(c)]
+    if len(shape_matches) == 0:
+        print("board-row-status: row for " + slice_id + " has " + str(len(cells))
+              + " columns (header has " + str(len(header_cells)) + ") and no cell "
+              "matches <known-token>@YYYY-MM-DDTHH:MMZ -- refusing to guess",
+              file=sys.stderr)
+        sys.exit(2)
+    if len(shape_matches) > 1:
+        print("board-row-status: row for " + slice_id + " has " + str(len(cells))
+              + " columns (header has " + str(len(header_cells)) + ") and "
+              + str(len(shape_matches)) + " cells match <known-token>@YYYY-MM-DDTHH:MMZ "
+              "-- refusing to guess", file=sys.stderr)
+        sys.exit(2)
+    status_idx = shape_matches[0]
 
 timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 cells[status_idx] = " " + new_token + "@" + timestamp + " "
