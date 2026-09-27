@@ -204,8 +204,16 @@ post_verified_completion_check() {
 
     # --- Resolve owner/repo (nameWithOwner). ----------------------------------
     # Prefer the current repo context (Loki's model is same-repo branch PRs).
+    # Under run.sh, gh runs from / (BACKLOG 149 round 5) and `gh repo view`
+    # with no argument IGNORES GH_REPO, so it could never resolve the repo
+    # there. Use the origin repo run.sh already reads as data and validates.
+    # Standalone (no run.sh helpers), gh runs in the cwd repo as before.
     local repo=""
-    repo="$(_proof_check_net gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    if declare -f _loki_trusted_repo >/dev/null 2>&1; then
+        repo="$(_loki_trusted_repo)"
+    else
+        repo="$(_proof_check_net gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    fi
 
     # --- Resolve head sha: PR head if a pr_url is given, else proof fallback. --
     local head_sha=""

@@ -192,5 +192,94 @@ reset_logs
 ( cd "$a" && _loki_trusted_push cred . "loki/fix-badorigin" ) >/dev/null 2>&1 \
     && bad "pushed to a non-GitHub origin" || ok "refuses to push to a non-GitHub origin"
 
+# --- round 6: origin forms, refusal reasons, shallow repos -------------------
+for u in "https://GitHub.com/o/r.git" "git@GITHUB.COM:o/r" "https://github.com/o/r/" "ssh://git@github.com/o/r.git/"; do
+    [ "$(_loki_github_repo_from_url "$u")" = "o/r" ] && ok "accepts $u" || bad "rejects valid $u"
+done
+for u in "git@github.com-work:o/r.git" "ssh://git@github.com-work/o/r"; do
+    _loki_github_repo_from_url "$u" >/dev/null 2>&1 && bad "accepts SSH host alias $u" || ok "rejects SSH host alias $u"
+    case "$(_loki_origin_refusal "$u")" in
+        *"SSH host alias"*) ok "refusal names the SSH host alias for $u" ;;
+        *) bad "refusal for $u does not name the alias: $(_loki_origin_refusal "$u")" ;;
+    esac
+done
+case "$(_loki_origin_refusal "https://gitlab.com/o/r.git")" in
+    *"not on github.com"*) ok "refusal names a non-GitHub host" ;;
+    *) bad "refusal for a GitLab origin is unclear: $(_loki_origin_refusal "https://gitlab.com/o/r.git")" ;;
+esac
+_loki_origin_refusal "https://x:ghp_SECRETINURL@github.com/o/r.git" | grep -q ghp_SECRETINURL \
+    && bad "refusal echoes an embedded credential" || ok "refusal never echoes the URL"
+
+# A shallow agent repo (clone --depth 1 of a two-commit history).
+a="$(new_agent shallow-src "$URL")"
+git -C "$a" commit -q --allow-empty -m second
+# The origin already holds the full history, as it does for any real shallow
+# clone (receive-pack refuses a shallow update onto history it never saw).
+cred git -C "$a" push -q "$W/gh/octocat/hello.git" HEAD:refs/heads/shallow-base 2>/dev/null
+git clone -q --depth 1 "file://$a" "$W/agent-shallow" 2>/dev/null
+git -C "$W/agent-shallow" commit -q --allow-empty -m "agent work on a shallow clone"
+git -C "$W/agent-shallow" remote set-url origin "$URL"
+git -C "$W/agent-shallow" branch loki/fix-shallow
+[ "$(git -C "$W/agent-shallow" rev-parse --is-shallow-repository)" = true ] \
+    && ok "shallow fixture really is shallow" || bad "shallow fixture is not shallow (test proves nothing)"
+reset_logs
+( cd "$W/agent-shallow" && _loki_trusted_push cred . loki/fix-shallow ) >/dev/null 2>&1 \
+    && grep -qx "remote token=$CANARY" "$W/remote.log" \
+    && ok "a shallow agent repo's branch is pushed" \
+    || bad "a shallow agent repo's branch was not pushed (remote log: $(tr '\n' ',' < "$W/remote.log"))"
+
+# --- round 6: origin pinned before the first iteration ------------------------
+a="$(new_agent pinned "$URL")"
+(
+    cd "$a" || exit 1
+    TARGET_DIR="$a" _loki_pin_origin
+    reset_logs
+    _loki_trusted_push cred . loki/fix-pinned >/dev/null 2>&1 && grep -qx "remote token=$CANARY" "$W/remote.log" \
+        && echo "UNCHANGED_PUSHED" || echo "UNCHANGED_NOT_PUSHED"
+    # The agent repoints origin at another github.com repository. The route to
+    # the attacker repo is in the (test) operator's global config, which the
+    # trusted push does load, so a push there would be observable and never
+    # touches the network.
+    git config --global url."$W/attacker.git".insteadOf "https://github.com/attacker/other.git"
+    git remote set-url origin "https://github.com/attacker/other.git"
+    reset_logs
+    _loki_trusted_push cred . loki/ctl-pinned >/dev/null 2>&1; echo "REPOINTED_RC=$?"
+    [ -s "$W/attacker.log" ] && echo "ATTACKER_REACHED" || echo "ATTACKER_UNTOUCHED"
+) > "$W/pin.out"
+grep -qx UNCHANGED_PUSHED "$W/pin.out" && ok "pinned origin, unchanged: pushed" || bad "pinned origin, unchanged: not pushed ($(tr '\n' ' ' < "$W/pin.out"))"
+grep -qx REPOINTED_RC=2 "$W/pin.out" && grep -qx ATTACKER_UNTOUCHED "$W/pin.out" \
+    && ok "origin repointed to another GitHub repo during the run: push refused, nothing sent" \
+    || bad "origin repointed during the run was not refused ($(tr '\n' ' ' < "$W/pin.out"))"
+
+# --- round 6: proof-check resolves the repo when gh runs from / ---------------
+# The gh stub behaves like real gh on the one point that matters: `gh repo
+# view` with no argument resolves from the CWD's git remote and ignores
+# GH_REPO, so from / it fails. `gh api` records what it was asked to post.
+GHLOG="$W/gh.log"
+cat > "$W/bin/gh" <<EOF
+#!/bin/sh
+case "\$1 \$2" in
+    "auth status") exit 0 ;;
+    "repo view") git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repository" >&2; exit 1; }
+                 echo "octocat/hello" ;;
+    "pr view") echo "0123456789abcdef0123456789abcdef01234567" ;;
+    "api "*) echo "api \$*" >> "$GHLOG" ;;
+esac
+exit 0
+EOF
+chmod +x "$W/bin/gh"
+( cd / && gh repo view --json nameWithOwner >/dev/null 2>&1 ) \
+    && bad "gh stub resolves repo view from / (it must not, like real gh)" \
+    || ok "control: gh repo view with no argument fails from /, as real gh does"
+printf '{"honesty":{"headline":"VERIFIED"},"run_id":"r1"}\n' > "$W/proof.json"
+a="$(new_agent proofcheck "$URL")"
+: > "$GHLOG"
+# shellcheck disable=SC1091
+( cd "$a" && export TARGET_DIR="$a" && . "$ROOT/autonomy/lib/proof-check.sh" \
+    && cred post_verified_completion_check "$W/proof.json" "https://github.com/octocat/hello/pull/1" ) >/dev/null 2>&1
+grep -q "repos/octocat/hello/check-runs" "$GHLOG" \
+    && ok "proof-check posts the check-run for the origin repo when gh runs from /" \
+    || bad "proof-check did not post (could not resolve the repo from /; gh log: $(tr '\n' ',' < "$GHLOG"))"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

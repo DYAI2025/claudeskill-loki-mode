@@ -5812,23 +5812,57 @@ _loki_with_github_tokens() {
 #-------------------------------------------------------------------------------
 
 # Echo OWNER/REPO for a github.com origin URL, else fail. Accepted forms:
-# https://github.com/O/R[.git], git@github.com:O/R[.git],
-# ssh://git@github.com/O/R[.git]. Anything else (other hosts, embedded
-# credentials, extra path segments, odd characters) is rejected.
+# https://github.com/O/R[.git][/], git@github.com:O/R[.git][/],
+# ssh://git@github.com/O/R[.git][/], host matched case-insensitively. Anything
+# else (other hosts, SSH host aliases such as github.com-work, embedded
+# credentials, extra path segments, odd characters) is rejected;
+# _loki_origin_refusal says why.
 _loki_github_repo_from_url() {
-    local _u="${1:-}" _p
-    case "$_u" in
-        https://github.com/*) _p="${_u#https://github.com/}" ;;
-        git@github.com:*) _p="${_u#git@github.com:}" ;;
-        ssh://git@github.com/*) _p="${_u#ssh://git@github.com/}" ;;
+    local _u="${1:-}" _lc _pre _p
+    _lc="$(printf '%s' "$_u" | tr '[:upper:]' '[:lower:]')"
+    case "$_lc" in
+        https://github.com/*) _pre="https://github.com/" ;;
+        git@github.com:*) _pre="git@github.com:" ;;
+        ssh://git@github.com/*) _pre="ssh://git@github.com/" ;;
         *) return 1 ;;
     esac
+    _p="${_u:${#_pre}}"
+    _p="${_p%/}"
     _p="${_p%.git}"
     case "$_p" in
         */*/* | /* | */ | */.* | .* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
         ?*/?*) printf '%s\n' "$_p" ;;
         *) return 1 ;;
     esac
+}
+
+# One line saying why an origin is refused. Never echoes the URL itself (it
+# may carry embedded credentials).
+_loki_origin_refusal() {
+    local _lc
+    _lc="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "$_lc" in
+        '') echo "this repository has no origin remote" ;;
+        *@github.com[!:/]*|*://github.com[!/]*|*@github.com[!:/]*:*)
+            echo "origin uses an SSH host alias or look-alike of github.com (for example github.com-work from ~/.ssh/config); Loki pushes only to a literal github.com origin, so the push never depends on agent-editable ssh config" ;;
+        *github.com*)
+            echo "origin names github.com but is not a plain https or ssh OWNER/REPO URL (embedded credentials, extra path segments or unusual characters are refused)" ;;
+        *)
+            echo "origin is not on github.com; Loki currently pushes only to github.com (GitHub Enterprise and GitLab are planned)" ;;
+    esac
+}
+
+# Origin pin (round 6, reviewer F1): the agent could otherwise repoint origin
+# at another github.com repository and have Loki push its branch there with
+# the operator's credentials. Loki never changes origin itself, so the value
+# recorded before the first iteration (possibly "no origin") is the only one
+# a trusted push accepts. Recorded once per process.
+_LOKI_ORIGIN_PINNED=""
+_LOKI_PINNED_ORIGIN=""
+_loki_pin_origin() {
+    [ -z "$_LOKI_ORIGIN_PINNED" ] || return 0
+    _LOKI_PINNED_ORIGIN="$(git -C "${TARGET_DIR:-.}" config --get remote.origin.url 2>/dev/null || true)"
+    _LOKI_ORIGIN_PINNED=1
 }
 
 # OWNER/REPO of TARGET_DIR's origin, read as data, or nothing.
@@ -5862,14 +5896,22 @@ _loki_trusted_push() {
     local _runner="$1" _dir="$2" _branch="$3" _url _tmp _rc=1
     _dir="$(cd "$_dir" 2>/dev/null && pwd -P)" || return 1
     git check-ref-format --branch "$_branch" >/dev/null 2>&1 || return 1
-    _url="$(git -C "$_dir" config --get remote.origin.url 2>/dev/null)" || return 1
+    _url="$(git -C "$_dir" config --get remote.origin.url 2>/dev/null)" || _url=""
     if ! _loki_github_repo_from_url "$_url" >/dev/null; then
-        log_warn "Not pushing: origin is not a github.com https/ssh URL (Loki pushes only to a validated GitHub origin)."
-        return 1
+        log_warn "Not pushing branch '$_branch': $(_loki_origin_refusal "$_url")."
+        return 2
+    fi
+    if [ -n "$_LOKI_ORIGIN_PINNED" ] && [ "$_url" != "$_LOKI_PINNED_ORIGIN" ]; then
+        log_warn "Not pushing branch '$_branch': origin changed during the run (it was $(_loki_github_repo_from_url "$_LOKI_PINNED_ORIGIN" 2>/dev/null || echo "not a GitHub repository") when the run started). Loki does not push to a destination the agent could have chosen."
+        return 2
     fi
     _tmp="$(mktemp -d "${TMPDIR:-/tmp}/loki-push.XXXXXX")" || return 1
+    # --update-shallow: a shallow agent repo's history ends in shallow roots,
+    # which a plain fetch rejects while still exiting 0. The rev-parse makes a
+    # silently empty fetch fail here instead of at the push.
     if git init -q --template= "$_tmp" >/dev/null 2>&1 \
-        && git -C "$_tmp" fetch -q --no-tags "$_dir" "+refs/heads/$_branch:refs/heads/$_branch" >/dev/null 2>&1; then
+        && git -C "$_tmp" fetch -q --no-tags --update-shallow "$_dir" "+refs/heads/$_branch:refs/heads/$_branch" >/dev/null 2>&1 \
+        && git -C "$_tmp" rev-parse -q --verify "refs/heads/$_branch" >/dev/null 2>&1; then
         _rc=0
         # `-C "$_tmp"`: git starts repository discovery in the fresh repo, so
         # the agent repo is never found, whatever the caller's cwd.
@@ -5881,6 +5923,9 @@ _loki_trusted_push() {
 
 _loki_withhold_github_tokens() {
     local _v _held=""
+    # Before any provider runs, so the pin is the operator's origin, not one
+    # an agent set. Also under the opt-out: it guards the push destination.
+    _loki_pin_origin
     # Operator opt-out (exact value 1): keep the earlier behavior, where the
     # agent inherits the token and the real gh config. That is a Rule of Two
     # exposure, so say so. No GH_CONFIG_DIR/credential.helper scoping under
@@ -6022,14 +6067,25 @@ on_run_complete() {
     log_info "LOKI_DELEGATE_PR=1: opening a local pull request for branch '$branch'..."
     # Push, then create. Non-interactive (no tty in --bg). Best-effort, each
     # network call bounded by the timeout guard above.
-    _loki_trusted_push _loki_net "${TARGET_DIR:-.}" "$branch" >/dev/null 2>&1 || true
+    # A refused or failed push is reported (the refusal names its reason on
+    # stderr) and ends the delegate step: there is nothing to open a PR from.
+    local _push_rc=0
+    _loki_trusted_push _loki_net "${TARGET_DIR:-.}" "$branch" >/dev/null || _push_rc=$?
+    if [ "$_push_rc" -ne 0 ]; then
+        [ "$_push_rc" -eq 2 ] || log_warn "LOKI_DELEGATE_PR=1: pushing branch '$branch' failed; not opening a pull request."
+        return 0
+    fi
+    # Explicit --repo on every gh call (not only GH_REPO): the repo the push
+    # just validated, so no gh subcommand can fall back to cwd detection.
+    local _pr_repo
+    _pr_repo="$(_loki_trusted_repo)"
     local pr_title
     pr_title="Loki Mode: ${branch}"
     local pr_url=""
     # ENT-4 (idempotent PR): reuse an existing OPEN PR for this head instead of
     # attempting a second create on a platform retry / resume.
     local existing_pr
-    existing_pr="$( (cd "${TARGET_DIR:-.}" && _loki_net gh pr list --head "$branch" --state open --json url --jq '.[0].url') 2>/dev/null || true )"
+    existing_pr="$( (cd "${TARGET_DIR:-.}" && _loki_net gh pr list --repo "$_pr_repo" --head "$branch" --state open --json url --jq '.[0].url') 2>/dev/null || true )"
     if [ -n "$existing_pr" ]; then
         _LOKI_DELEGATE_PR_URL="$existing_pr"
         export _LOKI_DELEGATE_PR_URL
@@ -6060,7 +6116,7 @@ ${_del_receipt}"
             fi
         fi
     fi
-    pr_url="$( (cd "${TARGET_DIR:-.}" && _loki_net gh pr create --title "$pr_title" --body "$_del_body" --head "$branch") 2>/dev/null || true )"
+    pr_url="$( (cd "${TARGET_DIR:-.}" && _loki_net gh pr create --repo "$_pr_repo" --title "$pr_title" --body "$_del_body" --head "$branch") 2>/dev/null || true )"
     if [ -n "$pr_url" ]; then
         # Export so build_completion_summary folds the url into the summary.
         _LOKI_DELEGATE_PR_URL="$pr_url"
@@ -11144,10 +11200,15 @@ create_session_pr() {
     # Round 5: never a credentialed `git push` inside the agent's repo (its
     # config -- hooks, sshCommand, credential.helper -- would run holding the
     # operator's credentials). See _loki_trusted_push.
-    if ! _loki_trusted_push _loki_with_github_tokens . "$branch_name" 2>/dev/null; then
-        log_warn "Failed to push agent branch: $branch_name"
+    # stderr is left visible: a refusal names its reason there.
+    local _push_rc=0
+    _loki_trusted_push _loki_with_github_tokens . "$branch_name" >/dev/null || _push_rc=$?
+    if [ "$_push_rc" -ne 0 ]; then
+        [ "$_push_rc" -eq 2 ] || log_warn "Failed to push agent branch: $branch_name"
         return 1
     fi
+    local _pr_repo
+    _pr_repo="$(_loki_trusted_repo)"
 
     # Create PR if gh CLI is available
     if command -v gh &>/dev/null; then
@@ -11159,7 +11220,7 @@ create_session_pr() {
         # guarantee explicit and the log honest: if an OPEN PR already exists for
         # this head, reuse its URL instead of attempting a second create.
         local existing_pr
-        existing_pr=$(gh pr list --head "$branch_name" --state open --json url --jq '.[0].url' 2>/dev/null || true)
+        existing_pr=$(gh pr list --repo "$_pr_repo" --head "$branch_name" --state open --json url --jq '.[0].url' 2>/dev/null || true)
         if [ -n "$existing_pr" ]; then
             log_info "PR already exists for branch $branch_name: $existing_pr (skipping create)"
             audit_log "PR_EXISTS" "branch=$branch_name,url=$existing_pr"
@@ -11200,6 +11261,7 @@ ${_auto_receipt}"
             fi
         fi
         pr_url=$(gh pr create \
+            --repo "$_pr_repo" \
             --title "Loki Mode: Agent session changes ($branch_name)" \
             --body "$_auto_body" \
             --base "$base" \

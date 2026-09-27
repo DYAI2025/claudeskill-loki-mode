@@ -262,8 +262,10 @@ fi
 #------------------------------------------------------------------------------
 echo ""
 echo "Test 2: the dedupe check queries the remote for an existing open PR"
-if grep -q '^pr list --head' "$GH_ARGV"; then
-    pass "'gh pr list --head' is consulted before create"
+# --repo names the validated origin explicitly (BACKLOG 149 round 6: gh runs
+# from /, so no subcommand may fall back to cwd repo detection).
+if grep -q '^pr list --repo loki-test/repo1 --head' "$GH_ARGV"; then
+    pass "'gh pr list --repo <origin> --head' is consulted before create"
 else
     fail "no 'gh pr list --head' call recorded; dedupe cannot be remote-keyed" \
          "$(cat "$GH_ARGV")"
