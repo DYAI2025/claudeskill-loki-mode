@@ -7753,6 +7753,12 @@ cmd_welcome_terminal() {
         echo -e "  ${DIM}Anonymous diagnostics on (os/arch/version/error type only -- never${NC}"
         echo -e "  ${DIM}code, prompts, or paths). Off: loki telemetry off  -  docs/PRIVACY.md${NC}"
         echo ""
+    elif [ -n "${LOKI_TELEMETRY_DISABLED:-}" ] || [ -n "${DO_NOT_TRACK:-}" ]; then
+        # Off-by-default means silence otherwise (nothing to disclose), but an
+        # EXPLICIT opt-out via env var deserves a confirmation that it took
+        # effect, distinct from the default off state nobody asked about.
+        echo -e "  ${DIM}Analytics are off (LOKI_TELEMETRY_DISABLED/DO_NOT_TRACK).${NC}"
+        echo ""
     fi
 }
 
