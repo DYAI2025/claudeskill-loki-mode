@@ -3672,6 +3672,263 @@ else
 fi
 rm -f "$RED_SEALFAIL_LIB"
 
+# =============================================================================
+# Test T130c-fifo-substitution: 1/2 CONCERN on this slice's first draft.
+# _loki_session_created_digest's `[ -f "$path" ]` check treated a FIFO
+# identically to a genuinely-absent file -- both printed the "-" sentinel. Every
+# fresh mint ALSO seals "-" as its normal starting state (nothing created yet),
+# so the window right after setup_agent_branch and before the first record call
+# is exactly where seal == "-" for a legitimate reason. An agent process
+# co-located with this run can substitute session-created.z with a FIFO in that
+# window, with a writer process ready: _loki_session_created_verify's digest
+# check never opens the FIFO (its own `[ -f ]` check also says "absent", so it
+# reads "-" == "-" and reports no tampering), but _loki_untracked_merge's
+# Python merge, later in the SAME _loki_record_session_created call, opens the
+# path for a real read to compute the NUL-delimited union -- which blocks on
+# the FIFO until the attacker's writer feeds it a planted path, silently
+# merging that path into the trusted record with no SESSION_CREATED_TAMPERED
+# ever logged. This is a rendezvous, not a race: no precise timing is needed,
+# the writer simply waits until the merge's open() call reads it.
+#
+# THE VICTIM PATH DOES NOT NEED TO EXIST YET for this particular test (unlike
+# the interrupt/resume T130c tests above): this test only asserts what lands in
+# session-created.z itself after ONE record call, not a second session's
+# resume-union adoption, so a not-yet-existing planted path is sufficient to
+# prove the record was silently populated with attacker-controlled content.
+#
+# WHY THE WRITER MUST BE BACKGROUNDED WITH ITS OWN WATCHDOG: a FIFO open for
+# writing blocks until a reader opens the other end. If the digest/merge code
+# never opens it (the FIXED path, since the pre-check returns "?" without ever
+# reaching a `[ -f ]`-gated read), the writer would block forever with no
+# safety net. The perl alarm(30) is the writer's own hard ceiling: if nothing
+# reads within 30s, it exits on its own. This test ALSO explicitly kills and
+# waits on the recorded writer PID after the record call, on every path
+# (pass or fail), so no background process or FIFO can ever survive this test
+# to hang a later suite run.
+#
+# WHY THE WRITER USES sysopen(O_WRONLY), NOT open(">"): a plain open(">", ...)
+# CREATES the path if it is missing. If perl is slow to start and only reaches
+# its open() call AFTER _loki_session_created_verify has already caught the
+# FIFO and rm -f'd it (the verify-to-merge window is not atomic; see the
+# ACCEPTED GAP comment at _loki_record_session_created), open(">", ...) simply
+# creates a new plain file there and writes victim.txt into it anyway --
+# TAMPERED still fires (correctly), but the record then legitimately picks up
+# that recreated file's content, which is a DIFFERENT, already-documented and
+# out-of-scope timing gap, not the FIFO-classification bug this test targets.
+# This was caught empirically as test flake while writing this test (~3/5
+# runs) before switching to sysopen(O_WRONLY), which never creates the path:
+# it can only succeed against an EXISTING fifo/device node, so if the FIFO is
+# already gone by the time perl runs, sysopen fails and the writer exits
+# immediately with no file ever created. A marker file (OUTSIDE the repo, in
+# WORKROOT) is written by the writer immediately after a successful open,
+# before the blocking write/close -- its presence after the record call is an
+# unambiguous, non-racy signal that a reader actually opened the FIFO
+# (OPENED=yes), replacing the earlier PID-liveness check (WRITERALIVE) that
+# could not distinguish "still blocked" from "exited after writing to a
+# recreated plain file".
+# =============================================================================
+echo "Test T130c-fifo-substitution: a FIFO substituted for session-created.z is not silently trusted as absent"
+RT6="$(make_repo t130cfifo)"
+outt6="$(
+    cd "$RT6" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'def greet():\n    return "hi"\n' > helper.py
+
+    # Attacker substitutes the fresh-mint session-created.z with a FIFO BEFORE
+    # the first record call (the only window where the seal is still the "-"
+    # sentinel for a legitimate reason -- see comment above). sysopen(O_WRONLY),
+    # not open(">"): see the non-vacuity note above for why a create-capable
+    # open would flake this test.
+    mkfifo .loki/state/session-created.z
+    rm -f "$WORKROOT/t130c-fifo-opened-green"
+    perl -e 'use Fcntl; alarm(30); sysopen(my $fh, $ARGV[0], O_WRONLY) or exit 1; open(my $m, ">", $ARGV[1]) and close($m); print $fh "victim.txt\0"; close $fh;' \
+        .loki/state/session-created.z "$WORKROOT/t130c-fifo-opened-green" &
+    wpid=$!
+
+    _loki_record_session_created >/dev/null 2>&1
+
+    opened="$( [ -e "$WORKROOT/t130c-fifo-opened-green" ] && echo yes || echo no )"
+    kill "$wpid" 2>/dev/null
+    wait "$wpid" 2>/dev/null
+
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    stillfifo="$( [ -p .loki/state/session-created.z ] && echo yes || echo no )"
+    if [ "$stillfifo" = "yes" ]; then
+        record="UNREADABLE"
+    else
+        record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+    fi
+    printf 'TAMPERED=%s RECORD=[%s] STILLFIFO=%s OPENED=%s' \
+        "$tampered" "$record" "$stillfifo" "$opened"
+)"
+if [ "$outt6" = "TAMPERED=yes RECORD=[helper.py|] STILLFIFO=no OPENED=no" ]; then
+    pass "FIFO substituted for session-created.z is caught as SESSION_CREATED_TAMPERED before ever being opened (confirmed via marker file: no reader ever opened it), record recomputed clean ([helper.py], victim.txt never adopted)"
+else
+    fail "FIFO substitution for session-created.z was not caught" "got: $outt6"
+fi
+
+# RED proof: strip ONLY the non-regular-file pre-check (its own
+# BACKLOG-130C-NONREG-CHECK trailing marker) and confirm the SAME FIFO
+# substitution is silently trusted as "-" (absent) instead, and the planted
+# victim.txt IS merged into the record with no SESSION_CREATED_TAMPERED ever
+# logged -- proving the GREEN assertion above is non-vacuous.
+RED_NONREG_LIB="$WORKROOT/red-nonreg-lib.sh"
+sed '/# BACKLOG-130C-NONREG-CHECK$/d' "$BRANCH_LIB" > "$RED_NONREG_LIB"
+red_nonreg_removed="$(grep -c '# BACKLOG-130C-NONREG-CHECK$' "$RED_NONREG_LIB")"
+red_nonreg_linecount="$(wc -l < "$RED_NONREG_LIB" | tr -d ' ')"
+branch_lib_linecount="$(wc -l < "$BRANCH_LIB" | tr -d ' ')"
+if [ "$red_nonreg_removed" != "0" ] || [ "$((branch_lib_linecount - red_nonreg_linecount))" != "1" ]; then
+    fail "RED mutation did not remove exactly the non-regular-file pre-check line (sed pattern drift)" "remaining=$red_nonreg_removed linediff=$((branch_lib_linecount - red_nonreg_linecount))"
+else
+    RT6R="$(make_repo t130cfifored)"
+    outt6r="$(
+        cd "$RT6R" || exit 1
+        AUDIT_CAPTURE=""
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_NONREG_LIB"
+        SCRIPT_DIR="$PROJECT_DIR/autonomy"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'def greet():\n    return "hi"\n' > helper.py
+        mkfifo .loki/state/session-created.z
+        rm -f "$WORKROOT/t130c-fifo-opened-red"
+        perl -e 'use Fcntl; alarm(30); sysopen(my $fh, $ARGV[0], O_WRONLY) or exit 1; open(my $m, ">", $ARGV[1]) and close($m); print $fh "victim.txt\0"; close $fh;' \
+            .loki/state/session-created.z "$WORKROOT/t130c-fifo-opened-red" &
+        wpidr=$!
+        _loki_record_session_created >/dev/null 2>&1
+        openedr="$( [ -e "$WORKROOT/t130c-fifo-opened-red" ] && echo yes || echo no )"
+        kill "$wpidr" 2>/dev/null
+        wait "$wpidr" 2>/dev/null
+        tamperedr="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+        stillfifor="$( [ -p .loki/state/session-created.z ] && echo yes || echo no )"
+        if [ "$stillfifor" = "yes" ]; then
+            recordr="UNREADABLE"
+        else
+            recordr="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+        fi
+        printf 'TAMPEREDR=%s RECORDR=[%s] OPENEDR=%s' "$tamperedr" "$recordr" "$openedr"
+    )"
+    if [ "$outt6r" = "TAMPEREDR=no RECORDR=[helper.py|victim.txt|] OPENEDR=yes" ]; then
+        pass "RED confirmed: without the non-regular-file pre-check, a FIFO substitution is silently trusted as absent and the planted victim.txt IS merged into the record with no TAMPERED ever logged (T130c-fifo-substitution is non-vacuous)"
+    else
+        fail "RED did not reproduce the pre-fix FIFO bypass" "got: $outt6r"
+    fi
+fi
+rm -f "$RED_NONREG_LIB"
+
+# =============================================================================
+# Test T130c-dangling-symlink: the same non-regular-file class as the FIFO
+# test above, via a dangling symlink instead (a symlink whose target never
+# exists). Unlike the FIFO case, a dangling symlink carries no
+# attacker-controlled CONTENT of its own: _loki_untracked_merge's Python
+# open() on a dangling symlink raises OSError, which its own code already
+# treats as "absent" -- so pre-fix, this scenario does NOT inject a planted
+# path (the record stays [helper.py] either way). What pre-fix DOES get wrong
+# is classification: the digest reads "-" (via the same `[ -f ]`-false,
+# fall-through-to-absent path as the FIFO case) and compares equal to the
+# fresh-mint seal's own "-", so a dangling symlink sitting where a trusted
+# record file belongs is silently accepted as normal, un-tampered "nothing
+# created yet" state instead of being flagged. Confirmed empirically (see this
+# slice's manual repro) before writing this assertion, rather than assumed.
+# =============================================================================
+echo "Test T130c-dangling-symlink: a dangling symlink substituted for session-created.z is caught, not silently accepted as absent"
+RT7="$(make_repo t130csymlink)"
+outt7="$(
+    cd "$RT7" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    ITERATION_COUNT=1
+    result=0
+    setup_agent_branch >/dev/null 2>&1
+    printf 'def greet():\n    return "hi"\n' > helper.py
+    rm -f .loki/state/session-created.z
+    ln -s "$WORKROOT/t130c-dangling-target-does-not-exist" .loki/state/session-created.z
+    _loki_record_session_created >/dev/null 2>&1
+    tampered="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+    stillsymlink="$( [ -L .loki/state/session-created.z ] && echo yes || echo no )"
+    record="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+    printf 'TAMPERED=%s RECORD=[%s] STILLSYMLINK=%s' "$tampered" "$record" "$stillsymlink"
+)"
+if [ "$outt7" = "TAMPERED=yes RECORD=[helper.py|] STILLSYMLINK=no" ]; then
+    pass "dangling symlink substituted for session-created.z is caught as SESSION_CREATED_TAMPERED, not silently classified as absent; symlink replaced, record recomputed clean"
+else
+    fail "dangling symlink substitution for session-created.z was not caught" "got: $outt7"
+fi
+
+# RED proof: same pre-check removal as the FIFO test above; confirm a dangling
+# symlink is instead silently classified as absent ("-" == "-"), with no
+# SESSION_CREATED_TAMPERED ever logged -- proving the GREEN assertion above is
+# non-vacuous.
+RED_NONREG_LIB2="$WORKROOT/red-nonreg-lib2.sh"
+sed '/# BACKLOG-130C-NONREG-CHECK$/d' "$BRANCH_LIB" > "$RED_NONREG_LIB2"
+red_nonreg_removed2="$(grep -c '# BACKLOG-130C-NONREG-CHECK$' "$RED_NONREG_LIB2")"
+if [ "$red_nonreg_removed2" != "0" ]; then
+    fail "RED mutation did not remove the non-regular-file pre-check line (sed pattern drift)" "remaining=$red_nonreg_removed2"
+else
+    RT7R="$(make_repo t130csymlinkred)"
+    outt7r="$(
+        cd "$RT7R" || exit 1
+        AUDIT_CAPTURE=""
+        log_info()  { echo "INFO: $*"; }
+        log_warn()  { echo "WARN: $*"; }
+        log_error() { echo "ERROR: $*"; }
+        audit_log() { AUDIT_CAPTURE="${AUDIT_CAPTURE}${AUDIT_CAPTURE:+;}$1 $2"; }
+        audit_agent_action() { return 0; }
+        # shellcheck disable=SC1090
+        source "$ADVISORY_LIB"
+        # shellcheck disable=SC1090
+        source "$RED_NONREG_LIB2"
+        SCRIPT_DIR="$PROJECT_DIR/autonomy"
+        ITERATION_COUNT=1
+        result=0
+        setup_agent_branch >/dev/null 2>&1
+        printf 'def greet():\n    return "hi"\n' > helper.py
+        rm -f .loki/state/session-created.z
+        ln -s "$WORKROOT/t130c-dangling-target-does-not-exist" .loki/state/session-created.z
+        _loki_record_session_created >/dev/null 2>&1
+        tamperedr="$(printf '%s' "$AUDIT_CAPTURE" | grep -q 'SESSION_CREATED_TAMPERED' && echo yes || echo no)"
+        stillsymlinkr="$( [ -L .loki/state/session-created.z ] && echo yes || echo no )"
+        recordr="$(tr '\000' '|' < .loki/state/session-created.z 2>/dev/null)"
+        printf 'TAMPEREDR=%s STILLSYMLINKR=%s RECORDR=[%s]' "$tamperedr" "$stillsymlinkr" "$recordr"
+    )"
+    if [ "$outt7r" = "TAMPEREDR=no STILLSYMLINKR=no RECORDR=[helper.py|]" ]; then
+        pass "RED confirmed: without the non-regular-file pre-check, a dangling symlink is silently classified as absent (the digest equating '-' == '-') with no TAMPERED ever logged, unlike the GREEN path which correctly flags it (T130c-dangling-symlink is non-vacuous)"
+    else
+        fail "RED did not reproduce the pre-fix dangling-symlink silent-acceptance behavior" "got: $outt7r"
+    fi
+fi
+rm -f "$RED_NONREG_LIB2"
+
 echo ""
 echo "============================================"
 echo "Results: $PASS/$TOTAL passed, $FAIL failed"

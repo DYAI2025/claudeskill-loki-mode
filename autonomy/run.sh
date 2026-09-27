@@ -9616,6 +9616,20 @@ _loki_session_created_digest() {
     local tool
     tool="$(_loki_snapshot_hash_tool)" || tool=""
     local path=".loki/state/session-created.z"
+    # A FIFO or ANY symlink at $path (dangling or not -- [ -L ] rejects both,
+    # deliberately broader than just the dangling case: the only way this
+    # file is ever legitimately written is _loki_untracked_merge's own
+    # write-to-.tmp-then-`mv -f`, which always leaves a plain regular file at
+    # $path, never a symlink, so a symlink here is never this session's own
+    # legitimate output) is neither absent ([ -f ] is false for both) nor a
+    # hashable regular file -- falling through to the absent-file branch below
+    # would print the same "-" sentinel every fresh mint already seals as its
+    # normal starting state, silently trusting an agent-planted FIFO (whose
+    # blocked writer feeds content into the merge's later open() call) or a
+    # dangling symlink (whose target read fails and is treated as "-" too).
+    # Caught here, before either digest branch, with a sentinel ("?") that can
+    # never equal "-", a real hex digest, or empty.
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then printf '%s\n' "?"; return 0; fi  # BACKLOG-130C-NONREG-CHECK
     if [ -n "$tool" ]; then
         local h=""
         if [ -f "$path" ]; then
