@@ -322,6 +322,7 @@ dashboard UI component utilities match shipped code (node --test)	0
 dashboard overview issue-to-PR journey (node --test)	1
 web-app workspace panels surface fetch failures (node --test)	1
 web-app chat completion never says Done. for a silent failure (node --test)	1
+dashboard checkpoint viewer shows a failed read, not empty (node --test)	0
 shipped agent roles reach the review pool	0
 policy present but unevaluable refuses fail-closed	0
 audit entries attribute an actor honestly	0
