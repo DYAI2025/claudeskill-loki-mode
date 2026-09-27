@@ -93,16 +93,31 @@
 #                       and the swarm's train-push tooling write their logs).
 #   PULSE_PYTHON        python3 interpreter to use (default: python3)
 #   PULSE_DEADLINE_SECS network-call time budget in seconds for npm+gh
-#                       together (default: 6; git/worktree calls use a
-#                       separate small fixed cap so the 10-second script
-#                       budget holds regardless of this value),
-#                       shared across every npm/gh/git-worktree call so the
-#                       10-second script budget cannot be exceeded by adding
-#                       up several full per-call timeouts.
+#                       together (default: 3; the calls run concurrently, so
+#                       this is also the per-call cap). git/worktree calls
+#                       use a separate small fixed cap.
+#   PULSE_CACHE         "0" disables the network cache below (default: on).
+#   PULSE_CACHE_DIR     cache directory (default: $PULSE_REPO_ROOT/.loki/pulse-cache,
+#                       gitignored via .loki/).
+#
+# Network cache (S-104: this runs as a UserPromptSubmit hook on every prompt,
+# on a machine with ~16 concurrent agents, and a 15s hook timeout was being
+# hit). When no PULSE_NPM_CMD/PULSE_GH_CMD/PULSE_GH_STREAK_CMD override is
+# set (i.e. real npm/gh), the status run NEVER makes a network call: it reads
+# the last successful npm/gh results from PULSE_CACHE_DIR. A result older than
+# 90s is shown as STALE with its age (never as fresh), older than 1h or absent
+# (or, for main CI, recorded against a different main SHA) is UNKNOWN. Any
+# stale/missing entry starts ONE detached background refresh (this same
+# script with PULSE_REFRESH_ONLY=1, PID recorded in refresh.pid, each call
+# capped at PULSE_DEADLINE_SECS) whose result the next prompt sees. A failed
+# refresh call never overwrites a good cached value; it just ages into STALE.
+# With any override set (every test in tests/test-v10-pulse.sh), the calls
+# run synchronously exactly as before, so fixtures are never cache-polluted.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+export PULSE_SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 
 PULSE_PYTHON="${PULSE_PYTHON:-python3}"
 PULSE_REPO_ROOT="${PULSE_REPO_ROOT:-$DEFAULT_REPO_ROOT}"
@@ -120,7 +135,10 @@ export PULSE_SWARM_START="${PULSE_SWARM_START:-}"
 export PULSE_NOW="${PULSE_NOW:-}"
 export PULSE_LAST_TRAIN_PUSH="${PULSE_LAST_TRAIN_PUSH:-}"
 export PULSE_PUSH_LOG_DIR="${PULSE_PUSH_LOG_DIR:-}"
-export PULSE_DEADLINE_SECS="${PULSE_DEADLINE_SECS:-6}"
+export PULSE_DEADLINE_SECS="${PULSE_DEADLINE_SECS:-3}"
+export PULSE_CACHE="${PULSE_CACHE:-1}"
+export PULSE_CACHE_DIR="${PULSE_CACHE_DIR:-$PULSE_REPO_ROOT/.loki/pulse-cache}"
+export PULSE_REFRESH_ONLY="${PULSE_REFRESH_ONLY:-}"
 
 # `-` (read the program from stdin) rather than a real path: sys.path[0] is
 # then '' as usual for stdin programs, and the scrub at the very top of the
@@ -178,8 +196,23 @@ MAIN_REF = os.environ.get("PULSE_MAIN_REF", "main") or "main"
 #     may run past. Every git call and the worktree-list call gets a small
 #     fixed per-call cap, further capped by whatever is left of this.
 T0 = time.monotonic()
-NETWORK_DEADLINE = T0 + float(os.environ.get("PULSE_DEADLINE_SECS", "6") or "6")
-HARD_DEADLINE = T0 + 9.0
+_NET_SECS = float(os.environ.get("PULSE_DEADLINE_SECS", "3") or "3")
+NETWORK_DEADLINE = T0 + _NET_SECS
+# Cache mode (see the bash header): real npm/gh only, never when a test
+# overrides a network command.
+REFRESH_ONLY = os.environ.get("PULSE_REFRESH_ONLY") == "1"
+CACHE_MODE = (
+    os.environ.get("PULSE_CACHE", "1") != "0"
+    and not any(os.environ.get(k) for k in ("PULSE_NPM_CMD", "PULSE_GH_CMD", "PULSE_GH_STREAK_CMD"))
+)
+CACHE_DIR = os.environ.get("PULSE_CACHE_DIR") or os.path.join(REPO_ROOT, ".loki", "pulse-cache")
+CACHE_TTL = 90.0
+CACHE_MAX_AGE = 3600.0
+# The status run waits on the network only when not serving from cache, so
+# only then does the hard deadline include the network budget. A cached run
+# stays under ~3.5s of git work even when every git call is slow (S-104: the
+# hook must finish well inside 5s on a loaded machine).
+HARD_DEADLINE = T0 + 3.5 + (0.0 if (CACHE_MODE and not REFRESH_ONLY) else _NET_SECS)
 GIT_CALL_CAP = 2.0
 
 
@@ -278,8 +311,16 @@ def run_capped(argv, cwd=None, env=None):
     return finish_proc(proc, budget)
 
 
+_GIT_MEMO = {}
+
+
 def git(args):
-    return run_capped(["git"] + list(args), cwd=REPO_ROOT, env=_clean_env())
+    # Memoized: `git describe` against MAIN_REF was run twice per pulse
+    # (unreleased-merge age and the moat baseline); one answer serves both.
+    key = tuple(args)
+    if key not in _GIT_MEMO:
+        _GIT_MEMO[key] = run_capped(["git"] + list(args), cwd=REPO_ROOT, env=_clean_env())
+    return _GIT_MEMO[key]
 
 
 def parse_time_value(raw):
@@ -409,23 +450,181 @@ _gh_streak_argv = shlex.split(os.environ["PULSE_GH_STREAK_CMD"]) if os.environ.g
     "--json", "status,conclusion", "--limit", "10",
 ]
 
-_npm_proc = safe(start_proc, _npm_argv, REPO_ROOT)
-# gh resolves its repo through git, so it must see the same scrubbed
-# environment as every direct git call -- a GIT_DIR inherited from the
-# eventual pre-push hook would misdirect gh's repo detection too.
-_gh_proc = safe(start_proc, _gh_argv, REPO_ROOT, _clean_env()) if _gh_argv is not None else None
-# Deliberately NOT gated on main_sha like _gh_argv above: CI_CANCELLED_STREAK
-# must still be able to run (and fire) even when the main-CI-status lookup
-# cannot resolve a SHA and reads UNKNOWN -- that independence is the whole
-# point of this check (see finding 3).
-_gh_streak_proc = safe(start_proc, _gh_streak_argv, REPO_ROOT, _clean_env())
+def run_network():
+    """Start npm + both gh calls concurrently, finish them against the one
+    shared NETWORK_DEADLINE. Returns {name: (rc, out, err)}."""
+    _npm_proc = safe(start_proc, _npm_argv, REPO_ROOT)
+    # gh resolves its repo through git, so it must see the same scrubbed
+    # environment as every direct git call -- a GIT_DIR inherited from the
+    # eventual pre-push hook would misdirect gh's repo detection too.
+    _gh_proc = safe(start_proc, _gh_argv, REPO_ROOT, _clean_env()) if _gh_argv is not None else None
+    # Deliberately NOT gated on main_sha like _gh_argv above: CI_CANCELLED_STREAK
+    # must still be able to run (and fire) even when the main-CI-status lookup
+    # cannot resolve a SHA and reads UNKNOWN -- that independence is the whole
+    # point of this check (see finding 3).
+    _gh_streak_proc = safe(start_proc, _gh_streak_argv, REPO_ROOT, _clean_env())
+    return {
+        "npm": safe(finish_proc, _npm_proc, time_left(NETWORK_DEADLINE)) or (None, "", ""),
+        "gh_ci": (
+            safe(finish_proc, _gh_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
+            if _gh_proc is not None else (None, "", "")
+        ),
+        "gh_streak": safe(finish_proc, _gh_streak_proc, time_left(NETWORK_DEADLINE)) or (None, "", ""),
+    }
 
-_npm_rc, _npm_out, _npm_err = safe(finish_proc, _npm_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
-_gh_rc, _gh_out, _gh_err = (
-    safe(finish_proc, _gh_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
-    if _gh_proc is not None else (None, "", "")
-)
-_gh_streak_rc, _gh_streak_out, _gh_streak_err = safe(finish_proc, _gh_streak_proc, time_left(NETWORK_DEADLINE)) or (None, "", "")
+
+def _cache_path(name):
+    return os.path.join(CACHE_DIR, name + ".json")
+
+
+def cache_read(name):
+    """(record, age_seconds) or (None, None). Age is real wall-clock time,
+    never PULSE_NOW (a fixture clock must not make a cache look fresh)."""
+    try:
+        with open(_cache_path(name), "r", encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec, time.time() - float(rec["t"])
+    except Exception:
+        return None, None
+
+
+def cache_write(name, result, sha=None):
+    rc, out = result[0], result[1]
+    # Only a successful call is cached: a failed/timed-out refresh leaves the
+    # previous good value in place to age into STALE, never replaces it with
+    # a failure (and never with a fabricated value).
+    if rc != 0 or not out.strip():
+        return
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = _cache_path(name) + ".%d.tmp" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"t": time.time(), "out": out, "sha": sha}, f)
+    os.replace(tmp, _cache_path(name))
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def spawn_refresh():
+    """Start ONE detached background refresh unless one is already running.
+    refresh.pid is created O_EXCL (two concurrent prompts cannot both spawn)
+    and holds the refresher's PID. A pid file older than 30s is dead by
+    construction (a refresh is bounded by PULSE_DEADLINE_SECS plus git caps),
+    which also covers PID reuse. Never waits on the child."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    pid_path = os.path.join(CACHE_DIR, "refresh.pid")
+    fd = None
+    for _ in range(2):
+        try:
+            fd = os.open(pid_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            try:
+                with open(pid_path, "r") as f:
+                    pid = int(f.read().strip() or "0")
+            except (OSError, ValueError):
+                pid = 0
+            try:
+                age = time.time() - os.stat(pid_path).st_mtime
+            except OSError:
+                age = 0.0
+            if age < 30 and (pid == 0 or _pid_alive(pid)):
+                return "already running"
+            try:
+                os.unlink(pid_path)
+            except OSError:
+                pass
+    if fd is None:
+        return "not started (lock busy)"
+    env = dict(os.environ)
+    env["PULSE_REFRESH_ONLY"] = "1"
+    try:
+        child = subprocess.Popen(
+            ["bash", os.environ["PULSE_SELF"]], env=env, cwd=REPO_ROOT,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except (OSError, KeyError):
+        os.close(fd)
+        try:
+            os.unlink(pid_path)
+        except OSError:
+            pass
+        return "not started (spawn failed)"
+    os.write(fd, ("%d\n" % child.pid).encode())
+    os.close(fd)
+    return "started"
+
+
+net = {}           # name -> (rc, out, err)
+cache_age = {}     # name -> age seconds of the cached value used, or None
+refresh_state = None
+if REFRESH_ONLY:
+    # Background refresher: fetch, cache what succeeded, exit. No report.
+    _res = run_network()
+    safe(cache_write, "npm", _res["npm"])
+    if _gh_argv is not None:
+        safe(cache_write, "gh_ci", _res["gh_ci"], main_sha)
+    safe(cache_write, "gh_streak", _res["gh_streak"])
+    try:
+        _pp = os.path.join(CACHE_DIR, "refresh.pid")
+        with open(_pp, "r") as _f:
+            if _f.read().strip() == str(os.getpid()):
+                os.unlink(_pp)
+    except (OSError, ValueError):
+        pass
+    sys.exit(0)
+elif CACHE_MODE:
+    _need_refresh = False
+    for _name in ("npm", "gh_ci", "gh_streak"):
+        _rec, _age = cache_read(_name)
+        _usable = (
+            _rec is not None and isinstance(_rec.get("out"), str)
+            and -60 <= _age <= CACHE_MAX_AGE
+            and (_name != "gh_ci" or (main_sha is not None and _rec.get("sha") == main_sha))
+        )
+        if _usable:
+            net[_name] = (0, _rec["out"], "")
+            cache_age[_name] = max(0.0, _age)
+            if _age > CACHE_TTL:
+                _need_refresh = True
+        else:
+            net[_name] = (None, "", "CACHE_MISS")
+            cache_age[_name] = None
+            _need_refresh = True
+    if _need_refresh:
+        refresh_state = safe(spawn_refresh) or "not started (error)"
+else:
+    net = run_network()
+
+stale_metrics = []
+
+
+def cache_note(name, metric=None):
+    """Suffix for a line built from a cached value: '' outside cache mode,
+    '(cached Ns ago)' when fresh, '(STALE: cached Ns ago, ...)' past the TTL."""
+    if not CACHE_MODE:
+        return ""
+    age = cache_age.get(name)
+    if age is None:
+        return " [no usable cached result; background refresh %s]" % (refresh_state or "not needed")
+    if age <= CACHE_TTL:
+        return " (cached %ds ago)" % age
+    if metric:
+        stale_metrics.append("%s (%ds)" % (metric, age))
+    return " (STALE: cached %ds ago; background refresh %s)" % (age, refresh_state or "not needed")
+
+
+_npm_rc, _npm_out, _npm_err = net["npm"]
+_gh_rc, _gh_out, _gh_err = net["gh_ci"]
+_gh_streak_rc, _gh_streak_out, _gh_streak_err = net["gh_streak"]
 
 
 # --- 1. releases in the last 24h / minutes since last release -------------
@@ -470,12 +669,13 @@ npm_result = safe(parse_npm_releases, _npm_rc, _npm_out)
 if npm_result is None:
     mark_unknown("releases_24h")
     mark_unknown("minutes_since_release")
-    emit("Releases (24h): UNKNOWN (npm check failed or timed out)")
+    emit("Releases (24h): UNKNOWN (npm check failed or timed out)%s" % cache_note("npm"))
     emit("Minutes since last release: UNKNOWN")
 else:
     mins_since = (NOW - npm_result["last_release_epoch"]) / 60.0
-    emit("Releases (24h): %d" % npm_result["count_24h"])
-    emit("Minutes since last release: %.1f" % mins_since)
+    _npm_note = cache_note("npm", "releases")
+    emit("Releases (24h): %d%s" % (npm_result["count_24h"], _npm_note))
+    emit("Minutes since last release: %.1f%s" % (mins_since, _npm_note))
 
 
 # --- 2. main CI status for PULSE_MAIN_REF's head SHA -----------------------
@@ -517,12 +717,14 @@ else:
     ci_status, ci_failing_workflows = _ci_parsed if _ci_parsed is not None else (None, None)
     if ci_status is None:
         mark_unknown("main_ci")
-        emit("Main CI (%s @ %s): UNKNOWN (gh check failed, timed out, or inconclusive)" % (MAIN_REF, main_sha[:8]))
+        emit("Main CI (%s @ %s): UNKNOWN (gh check failed, timed out, or inconclusive)%s"
+             % (MAIN_REF, main_sha[:8], cache_note("gh_ci")))
     else:
-        emit("Main CI (%s @ %s): %s" % (MAIN_REF, main_sha[:8], ci_status.upper()))
+        _ci_note = cache_note("gh_ci", "main_ci")
+        emit("Main CI (%s @ %s): %s%s" % (MAIN_REF, main_sha[:8], ci_status.upper(), _ci_note))
         if ci_status == "red":
             workflows = ", ".join(sorted(set(ci_failing_workflows or []))) or "unknown workflow"
-            add_violation("CI_RED", "main CI is RED at %s (%s)" % (main_sha[:8], workflows))
+            add_violation("CI_RED", "main CI is RED at %s (%s)%s" % (main_sha[:8], workflows, _ci_note))
 
 
 # --- 2b. CI_CANCELLED_STREAK: 3+ consecutive cancelled Tests runs on main ---
@@ -575,14 +777,16 @@ def parse_ci_cancelled_streak(rc, out):
 ci_streak = safe(parse_ci_cancelled_streak, _gh_streak_rc, _gh_streak_out)
 if ci_streak is None:
     mark_unknown("ci_cancelled_streak")
-    emit("CI cancelled streak (Tests, %s): UNKNOWN (gh check failed, timed out, or no completed runs)" % MAIN_REF)
+    emit("CI cancelled streak (Tests, %s): UNKNOWN (gh check failed, timed out, or no completed runs)%s"
+         % (MAIN_REF, cache_note("gh_streak")))
 else:
-    emit("CI cancelled streak (Tests, %s): %d consecutive" % (MAIN_REF, ci_streak))
+    _streak_note = cache_note("gh_streak", "ci_cancelled_streak")
+    emit("CI cancelled streak (Tests, %s): %d consecutive%s" % (MAIN_REF, ci_streak, _streak_note))
     if ci_streak >= _CANCELLED_STREAK_THRESHOLD:
         add_violation(
             "CI_CANCELLED_STREAK",
-            "%d consecutive cancelled Tests runs on %s (threshold %d)"
-            % (ci_streak, MAIN_REF, _CANCELLED_STREAK_THRESHOLD),
+            "%d consecutive cancelled Tests runs on %s (threshold %d)%s"
+            % (ci_streak, MAIN_REF, _CANCELLED_STREAK_THRESHOLD, _streak_note),
         )
 
 
@@ -1350,15 +1554,15 @@ def check_release_cadence():
     if mins_since > 90:
         add_violation(
             "NO_RECENT_RELEASE",
-            "no release in the last 90 minutes (%.1f minutes since last release)" % mins_since,
+            "no release in the last 90 minutes (%.1f minutes since last release)%s" % (mins_since, cache_note("npm")),
         )
     start = swarm_start_epoch()
     hours_running = (NOW - start) / 3600.0 if start else 0
     if hours_running >= 24 and npm_result["count_24h"] < 30:
         add_violation(
             "LOW_RELEASE_VOLUME",
-            "only %d release(s) in the last 24h (want at least 30) after %.1f hours of swarm operation"
-            % (npm_result["count_24h"], hours_running),
+            "only %d release(s) in the last 24h (want at least 30) after %.1f hours of swarm operation%s"
+            % (npm_result["count_24h"], hours_running, cache_note("npm")),
         )
 
 
@@ -1502,6 +1706,9 @@ def render_and_exit():
 
     if unknown_metrics:
         print("UNKNOWN metrics: " + ", ".join(sorted(set(unknown_metrics))))
+    if stale_metrics:
+        print("STALE metrics (cached value past %ds, shown with its age): %s"
+              % (CACHE_TTL, ", ".join(stale_metrics)))
 
     print("")
     ordered = sorted_violations()

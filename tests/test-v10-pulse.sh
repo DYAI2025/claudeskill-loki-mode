@@ -1471,6 +1471,115 @@ else
     printf '%s\n' "$OUT"
 fi
 
+echo "T33 -- network cache (S-104): real gh/npm stubbed on PATH, no *_CMD override"
+# Stub gh and npm record every invocation. With no PULSE_*_CMD override the
+# script is in cache mode: a fresh cache must mean ZERO network calls; a stale
+# one must print STALE with its age and be refreshed in the background; an
+# absent one must read UNKNOWN, never a value.
+STUB_BIN="$WORK/stub-bin"
+CALLS="$WORK/net-calls.log"
+CACHE="$WORK/pulse-cache"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/gh" <<EOF
+#!/bin/sh
+echo "gh \$*" >> "$CALLS"
+printf '[{"status":"completed","conclusion":"success","workflowName":"Tests"}]'
+EOF
+cat > "$STUB_BIN/npm" <<EOF
+#!/bin/sh
+echo "npm \$*" >> "$CALLS"
+printf '{"created":"2026-01-01T00:00:00.000Z","1.0.0":"2026-09-27T01:30:00.000Z"}'
+EOF
+chmod +x "$STUB_BIN/gh" "$STUB_BIN/npm"
+T33_SHA="$(cd "$FAKE_REPO" && git rev-parse main)"
+# write_cache AGE_SECONDS: all three cache entries, written AGE seconds ago
+# (real wall clock: cache age deliberately ignores PULSE_NOW).
+write_cache() {
+    mkdir -p "$CACHE"
+    python3 - "$CACHE" "$1" "$T33_SHA" <<'PYEOF'
+import json, sys, time
+d, age, sha = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+t = time.time() - age
+recs = {
+    "npm": '{"1.0.0":"2026-09-27T01:30:00.000Z"}',
+    "gh_ci": '[{"status":"completed","conclusion":"failure","workflowName":"Lint"}]',
+    "gh_streak": '[{"status":"completed","conclusion":"success"}]',
+}
+for name, out in recs.items():
+    json.dump({"t": t, "out": out, "sha": sha if name == "gh_ci" else None},
+              open("%s/%s.json" % (d, name), "w"))
+PYEOF
+}
+T33_ARGS=(
+    "PATH=$STUB_BIN:$PATH"
+    "PULSE_REPO_ROOT=$FAKE_REPO" "PULSE_MAIN_REF=main" "CONTROL_MD=$CONTROL_OK"
+    "BOARD_MD=$BOARD_CLEAN" "PULSE_NPM_CMD=" "PULSE_GH_CMD=" "PULSE_GH_STREAK_CMD="
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")" "PULSE_MOAT_RESULT="
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"
+    "PULSE_PUSH_LOG_DIR=$WORK/no-such-push-logs" "PULSE_CACHE_DIR=$CACHE"
+)
+# wait_refresh: poll (max ~10s) until the background refresher removed its pid file.
+wait_refresh() {
+    local i=0
+    while [ -e "$CACHE/refresh.pid" ] && [ "$i" -lt 50 ]; do
+        python3 -c "import time; time.sleep(0.2)"
+        i=$((i + 1))
+    done
+}
+
+# T33a: fresh cache -> no network call at all, cached values used, no refresh.
+rm -rf "$CACHE"; : > "$CALLS"
+write_cache 5
+run_pulse "${T33_ARGS[@]}"; rc=$?
+python3 -c "import time; time.sleep(1)"
+if [ ! -s "$CALLS" ] && [ ! -e "$CACHE/refresh.pid" ] \
+    && printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): RED (cached [0-9]*s ago)" \
+    && printf '%s\n' "$OUT" | grep -q "^Releases (24h): 1 (cached [0-9]*s ago)" \
+    && printf '%s\n' "$OUT" | grep -q "^VIOLATION: CI_RED: main CI is RED" \
+    && ! printf '%s\n' "$OUT" | grep -q "STALE"; then
+    ok "fresh cache: zero gh/npm calls, cached values reported with their age, CI_RED still fires"
+else
+    bad "T33a fresh-cache case: rc=$rc calls=[$(cat "$CALLS")] output follows"
+    printf '%s\n' "$OUT"
+fi
+
+# T33b: stale cache -> STALE with age (never fresh), background refresh runs.
+rm -rf "$CACHE"; : > "$CALLS"
+write_cache 600
+run_pulse "${T33_ARGS[@]}"; rc=$?
+wait_refresh
+if printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): RED (STALE: cached 6[0-9][0-9]s ago" \
+    && printf '%s\n' "$OUT" | grep -q "^STALE metrics .*main_ci (6[0-9][0-9]s)" \
+    && ! printf '%s\n' "$OUT" | grep -q "(cached 6[0-9][0-9]s ago)" \
+    && grep -q "^gh run list" "$CALLS" && grep -q "^npm view" "$CALLS" \
+    && [ ! -e "$CACHE/refresh.pid" ]; then
+    : > "$CALLS"
+    run_pulse "${T33_ARGS[@]}"
+    if [ ! -s "$CALLS" ] && printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): GREEN (cached [0-9]*s ago)"; then
+        ok "stale cache: STALE with age, background refresh called gh+npm, next run serves the refreshed value with no call"
+    else
+        bad "T33b post-refresh run: calls=[$(cat "$CALLS")] output follows"
+        printf '%s\n' "$OUT"
+    fi
+else
+    bad "T33b stale-cache case: rc=$rc calls=[$(cat "$CALLS")] output follows"
+    printf '%s\n' "$OUT"
+fi
+
+# T33c: no cache -> UNKNOWN (exit 2), never a value; refresh started.
+rm -rf "$CACHE"; : > "$CALLS"
+run_pulse "${T33_ARGS[@]}"; rc=$?
+wait_refresh
+if [ "$rc" = 2 ] \
+    && printf '%s\n' "$OUT" | grep -q "^Main CI (main @ .*): UNKNOWN .*background refresh started" \
+    && printf '%s\n' "$OUT" | grep -q "^Releases (24h): UNKNOWN" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: CI_RED"; then
+    ok "missing cache: UNKNOWN (exit 2), no fabricated value, background refresh started"
+else
+    bad "T33c missing-cache case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
 if command -v /bin/sh >/dev/null 2>&1 && /bin/sh -c 'case "$BASH_VERSION" in 3.2*) exit 0;; *) exit 1;; esac' 2>/dev/null; then
