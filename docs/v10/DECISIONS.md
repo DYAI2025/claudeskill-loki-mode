@@ -209,3 +209,22 @@ One entry per decision: context, choice, why, how to reverse. Newest last.
 - Release Manager exception, disclosed: until S-16 makes `scripts/release.sh` bump every checklist file without prompting or pushing, the Release Manager bumps VERSION with the editor tool (not a shell command) as part of the release commit. v9.57.0 (5332bfc3) was bumped this way. This is the only permitted VERSION write outside release.sh, and it ends when S-16 merges.
 - Evidence: train 2 push, `PRE_PUSH_SKIP=1 git push origin main` at 15:48:18Z: rc=0; `git rev-parse HEAD` = `git ls-remote origin refs/heads/main` = 89e350bd641a4b659faa405587a9db5bb7bcc201. Release push at 15:50:09Z: rc=0; both = 5332bfc35ccf801bdf8c67bff9fc07537ac4240f. The per-SHA concurrency from S-80 held on its first real push: Tests on 89e350bd kept running (`in_progress`) after 5332bfc3 was pushed.
 - Reverse: keep local CI as a precondition. Not chosen: it cannot finish inside the 10-minute command cap under swarm load, and it duplicates GitHub CI.
+
+## D28. 2026-09-27: Loki P0 directive -- restore green, release only verified trees, protect the machine
+
+- Context: v9.57.0, v9.58.0 and v9.59.0 were bumped and pushed but none had published (npm 9.56.0 at 16:18Z; `npm view loki-mode version`). Causes:
+  - `pytest -n auto` (S-86) turned the test_build_supervisor lineage race into a near-certain failure (runs 36330898897, 36331204715, 36332036570, 36333026958).
+  - A shell shard failed on the runtime-gate port-scoping positive control.
+  - The release job could not push its tag for releases that change workflow files.
+  - Machine load reached 136: a stale kind cluster (loki-smoke-control-plane) was crash-looping, and an orphaned tests/detect-mock-problems.sh had run for 12.5 hours; Loki stopped both. At 16:30Z a second orphan, PID 79553 tests/test-resource-monitor-sleep-reaped.sh (PPID 1, etime 23:48:17) with its child sleep 69161, was stopped by exact PID (0 remaining).
+- Choice (Loki approved):
+  1. Restore green by the fastest path. `pytest -n auto` is reverted as its own commit (b01bd36c); item 9 returns after S-102. The shard 0 suite, tests/test-runtime-gate-port-scoping.sh (not moat, not review), is quarantined until 2026-10-03 (ea8ecf1c) while S-106 fixes the race.
+  2. Release rule: never bump VERSION on a tree without a green Tier B run on that exact tree; a release is a lookup of a verified commit. Enforced by S-108 (release.sh refuses the bump without a green Tests and Bun Parity run for HEAD) and S-109 (RELEASE_ON_RED pulse violation). Versions bumped but never published are recorded as such in CHANGELOG.
+  3. Machine protection:
+     - Local load must stay under 2x the core count (28 on 14 cores).
+     - Engineers run only their slice's tests locally, never full suites, and no local `pytest -n auto`.
+     - Every swarm container gets --cpus=2 and a memory limit, no restart policy, and is removed when done. The S-102 container s102-repro-a167 was capped at 16:30Z (`docker update --cpus 2 --memory 4g`; restart=no).
+     - New pulse violations HIGH_LOAD (load > 28), ORPHAN_TEST (a tests/* process with PPID 1 or running more than 30 min) and STRAY_CONTAINER (a swarm container older than 1 hour) (S-109).
+  4. Release the first green tree, then continue the 20-minute trains.
+- Found while acting: train 5 (S-18) introduced a P9 moat regression on Linux: the opt-out positive control, "the hosts.yml probe is blind under the opt-out" (moat job 108658485224). It fails closed (no leak) but blocks every tree from 1cde81a7 onward. P0 S-107 is fixing it forward in a capped Linux container.
+- Version accounting: tags v9.57.0 through v9.62.0 were pushed at 16:25Z and 16:29Z to work around the release job's tag-permission failure (S-105), before this rule. v9.60.0 is already tagged at 1cde81a7 (red: P9 and the Python race), so the "first green tree" cannot reuse 9.60.0 without moving a published tag. Train 4 (08d64f4e, v9.59.0) went green on Tests after reruns and contains no S-18, so its full Release rerun is the first verified-tree release. The next release after S-107 takes the next unused version.
