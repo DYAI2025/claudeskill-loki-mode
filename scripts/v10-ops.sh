@@ -29,16 +29,18 @@ Subcommands:
       git status --short. Nothing more.
 
   clean-check
-      Exit 0 if the working tree (staged + unstaged) is clean, 1 otherwise.
-      Prints a one-line summary either way.
+      Exit 0 if the working tree (staged + unstaged) is clean, 1 if dirty,
+      2 if git itself failed (no .git, corrupt index, permission error --
+      never printed as CLEAN). Prints a one-line summary in all cases.
 
   commit-msg-template <type> <summary...>
       Formats a repo-convention commit message to stdout:
         <type>: <summary>
         <blank>
         Claude-Session: <session URL>
-      <type> is used verbatim (e.g. "docs(v10)", "fix(S-74)"). Reads the
-      session URL from V10_OPS_SESSION_URL if set, else a placeholder.
+      <type> is used verbatim (e.g. "docs(v10)", "fix(S-74)"). Requires
+      V10_OPS_SESSION_URL to be set -- exits 2 with no output on stdout if
+      it is unset, so a placeholder trailer can never land in a real commit.
       This is string formatting only -- it never calls a model.
 
   board-row-status <slice-id> <new-status-token> [board-md-path]
@@ -64,8 +66,13 @@ cmd_status() {
 }
 
 cmd_clean_check() {
-    local dirty
-    dirty="$(git -C "$REPO_ROOT" status --porcelain)"
+    local dirty status
+    dirty="$(git -C "$REPO_ROOT" status --porcelain 2>&1)"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "ERROR: 'git status' failed (exit $status) in $REPO_ROOT -- cannot determine clean/dirty: $dirty" >&2
+        return 2
+    fi
     if [ -z "$dirty" ]; then
         echo "CLEAN: working tree has no staged or unstaged changes."
         return 0
@@ -84,8 +91,12 @@ cmd_commit_msg_template() {
         echo "usage: v10-ops.sh commit-msg-template <type> <summary...>" >&2
         return 2
     fi
-    local session_url="${V10_OPS_SESSION_URL:-<set V10_OPS_SESSION_URL>}"
-    printf '%s: %s\n\nClaude-Session: %s\n' "$type" "$summary" "$session_url"
+    if [ -z "${V10_OPS_SESSION_URL:-}" ]; then
+        echo "commit-msg-template: V10_OPS_SESSION_URL is not set -- refusing to" \
+             "emit a placeholder trailer that could land in a real commit" >&2
+        return 2
+    fi
+    printf '%s: %s\n\nClaude-Session: %s\n' "$type" "$summary" "$V10_OPS_SESSION_URL"
 }
 
 # Precise, line-anchored single-row status flip. Never a blind find/replace:

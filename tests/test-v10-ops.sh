@@ -62,6 +62,18 @@ else
     bad "clean-check on dirty repo: rc=$rc out=$out"
 fi
 
+echo "== clean-check: fails loudly (not CLEAN) when git itself fails =="
+NOGIT="$WORK/scratch-nogit"
+mkdir -p "$NOGIT/scripts"
+cp "$OPS_SH" "$NOGIT/scripts/v10-ops.sh"
+out="$(bash "$NOGIT/scripts/v10-ops.sh" clean-check 2>&1)"
+rc=$?
+if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q "^CLEAN:"; then
+    ok "clean-check exits 2 (never CLEAN) when git status fails (no .git)"
+else
+    bad "clean-check git-failure case: rc=$rc out=$out"
+fi
+
 echo "== status: reflects git status --short =="
 out="$(bash "$SCRATCH2/scripts/v10-ops.sh" status 2>&1)"
 if printf '%s' "$out" | grep -q "^ M file.txt"; then
@@ -87,6 +99,15 @@ if [ "$rc" -eq 2 ]; then
     ok "commit-msg-template rejects missing args with exit 2"
 else
     bad "commit-msg-template missing-args rc=$rc"
+fi
+
+echo "== commit-msg-template: V10_OPS_SESSION_URL unset -> hard fail =="
+out="$(env -u V10_OPS_SESSION_URL bash "$OPS_SH" commit-msg-template "docs(v10)" "test" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && ! printf '%s' "$out" | grep -q "^docs(v10):" \
+    && printf '%s' "$out" | grep -qi "V10_OPS_SESSION_URL"; then
+    ok "commit-msg-template hard-fails (exit 2, no message body) when V10_OPS_SESSION_URL is unset"
+else
+    bad "commit-msg-template unset-session-url case: rc=$rc out=$out"
 fi
 
 # --- board-row-status: the core anti-D18 property --------------------------
@@ -193,6 +214,47 @@ if [ "$rc" -eq 2 ]; then
     ok "board-row-status rejects a missing board file"
 else
     bad "board-row-status missing-file rc=$rc out=$out"
+fi
+
+# --- version-check / ci-status: PATH shadowing -----------------------------
+# A minimal PATH containing only the external binaries each subcommand
+# genuinely needs, so `command -v npm` / `command -v gh` reliably fail
+# without depending on the real host's PATH layout.
+
+BASH_BIN="$(command -v bash)"
+NOPATH_DIR="$WORK/nopath-bin"
+mkdir -p "$NOPATH_DIR"
+ln -sf "$(command -v cat)" "$NOPATH_DIR/cat"
+
+echo "== version-check: npm absent from PATH =="
+out="$(PATH="$NOPATH_DIR" "$BASH_BIN" "$OPS_SH" version-check 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "npm not on PATH"; then
+    ok "version-check reports 'npm not on PATH' when npm is absent"
+else
+    bad "version-check npm-absent case: rc=$rc out=$out"
+fi
+
+echo "== ci-status: gh absent from PATH -> exit 2 =="
+out="$(PATH="$NOPATH_DIR" "$BASH_BIN" "$OPS_SH" ci-status 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "gh not on PATH"; then
+    ok "ci-status exits 2 when gh is absent from PATH"
+else
+    bad "ci-status gh-absent case: rc=$rc out=$out"
+fi
+
+echo "== ci-status: a fake gh exiting 4 propagates =="
+FAKEGH_DIR="$WORK/fakegh-bin"
+mkdir -p "$FAKEGH_DIR"
+cat > "$FAKEGH_DIR/gh" <<'EOF'
+#!/bin/sh
+exit 4
+EOF
+chmod +x "$FAKEGH_DIR/gh"
+out="$(PATH="$FAKEGH_DIR" "$BASH_BIN" "$OPS_SH" ci-status 2>&1)"; rc=$?
+if [ "$rc" -eq 4 ]; then
+    ok "ci-status propagates a fake gh's exit 4"
+else
+    bad "ci-status fake-gh-exit4 case: rc=$rc out=$out"
 fi
 
 # --- usage / unknown subcommand --------------------------------------------
