@@ -1116,6 +1116,72 @@ else
     printf '%s\n' "$OUT"
 fi
 
+echo "T22 -- S-75 rework: a malformed BOARD.md building@ timestamp (month/day/hour/min all"
+echo "      out of range, matches STATUS_TOKEN_RE's digit-shape regex but not a real"
+echo "      calendar date) downgrades that row to UNKNOWN instead of crashing the script"
+BOARD_BAD_TS_BUILD="$WORK/BOARD-bad-ts-build.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | LOW | building@2026-99-99T99:99Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_BAD_TS_BUILD"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_BAD_TS_BUILD"; then rc=0; else rc=$?; fi
+if [ "$rc" = "1" ] \
+    && ! printf '%s\n' "$OUT" | grep -q "PULSE ERROR" \
+    && printf '%s\n' "$OUT" | grep -q "^=== v10-pulse status" \
+    && printf '%s\n' "$OUT" | grep -qF "Agent budget: UNKNOWN for S-01 (no parseable Status timestamp on an active row)" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*agent_budget" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET"; then
+    ok "malformed building@ timestamp: no PULSE ERROR, normal violation exit code (1, from LOW_READY), status block renders, row reports UNKNOWN"
+else
+    bad "T22 bad-timestamp building row: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T23 -- S-75 rework: the same malformed timestamp on a review@ row (REVIEW_STALE's"
+echo "      identical pre-existing parse_time_value call) also downgrades to UNKNOWN"
+BOARD_BAD_TS_REVIEW="$WORK/BOARD-bad-ts-review.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | LOW | review@2026-99-99T99:99Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_BAD_TS_REVIEW"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_BAD_TS_REVIEW"; then rc=0; else rc=$?; fi
+if [ "$rc" = "1" ] \
+    && ! printf '%s\n' "$OUT" | grep -q "PULSE ERROR" \
+    && printf '%s\n' "$OUT" | grep -q "^=== v10-pulse status" \
+    && printf '%s\n' "$OUT" | grep -qF "Review-pending age: UNKNOWN for S-01 (no parseable Status timestamp on a review-pending row)" \
+    && printf '%s\n' "$OUT" | grep -q "^UNKNOWN metrics:.*review_pending_age" \
+    && printf '%s\n' "$OUT" | grep -qF "Agent budget: UNKNOWN for S-01 (no parseable Status timestamp on an active row)" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: REVIEW_STALE" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET"; then
+    ok "malformed review@ timestamp: no PULSE ERROR, normal violation exit code (1, from LOW_READY), status block renders, row reports UNKNOWN"
+else
+    bad "T23 bad-timestamp review row: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T24 -- AGENT_OVER_BUDGET: a future building@ timestamp stays 'not over budget'"
+echo "      (pins existing behavior: negative age is never > any budget)"
+BOARD_FUTURE_TS="$WORK/BOARD-future-ts.md"
+{
+    echo "| ID | Owner | File set | Tier | Status | Notes |"
+    echo "|---|---|---|---|---|---|"
+    echo "| S-01 | a | x | LOW | building@2026-09-27T03:00Z | |"
+    for i in 2 3 4 5 6 7 8; do echo "| S-0$i | a | x | LOW | ready@2026-09-27T01:00Z | |"; done
+} > "$BOARD_FUTURE_TS"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_FUTURE_TS"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "PULSE ERROR" \
+    && ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: AGENT_OVER_BUDGET" \
+    && ! printf '%s\n' "$OUT" | grep -q "agent_budget"; then
+    ok "a building@ timestamp one hour in the future: no AGENT_OVER_BUDGET, no UNKNOWN (negative age parses fine, just never exceeds budget)"
+else
+    bad "T24 future-timestamp case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
 echo ""
 echo "=== bash 3.2 syntax + full-suite check (via /bin/sh, real bash 3.2.57 on macOS) ==="
 if command -v /bin/sh >/dev/null 2>&1 && /bin/sh -c 'case "$BASH_VERSION" in 3.2*) exit 0;; *) exit 1;; esac' 2>/dev/null; then

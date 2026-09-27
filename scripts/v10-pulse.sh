@@ -288,7 +288,19 @@ def parse_time_value(raw):
     # time.timezone is always the STANDARD offset, so it is off by an hour
     # under DST (verified: EDT reports time.timezone=18000, the EST value,
     # while the live offset is 14400).
-    return float(calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0)))
+    try:
+        return float(calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0)))
+    except (ValueError, OverflowError):
+        # The regex above only checks digit SHAPE (\d{2} matches "99"), not
+        # calendar range -- calendar.timegm builds a datetime.date() inside
+        # itself, which raises on an out-of-range month/day (e.g. BOARD.md's
+        # "building@2026-99-99T99:99Z"). Every caller already treats None as
+        # "could not parse this value" and either falls back or skips the row
+        # (see now_epoch, parse_npm_releases, REVIEW_STALE, AGENT_OVER_BUDGET
+        # below), so folding a bad-range timestamp into that same None return
+        # downgrades one bad row to UNKNOWN instead of crashing the whole
+        # script through sys.excepthook's exit-2 backstop above.
+        return None
 
 
 def now_epoch():
@@ -624,10 +636,12 @@ else:
     # Every review-pending slice over the 45-minute budget, oldest first.
     stale_reviews = []
     all_reviews = []  # (row_id, age) for every parseable review-pending row
+    ts_unknown_reviews = []  # row_id for a review-pending row with a bad timestamp
     for row_id, token, ts in board_rows:
         if token in ("review", "review-blocked"):
             t = parse_time_value(ts)
             if t is None:
+                ts_unknown_reviews.append(row_id)
                 continue
             age = (NOW - t) / 60.0
             all_reviews.append((row_id, age))
@@ -638,6 +652,12 @@ else:
         emit("Oldest review-pending slice: %s (%.1f min)" % (oldest[0], oldest[1]))
     else:
         emit("Oldest review-pending slice: none")
+    if ts_unknown_reviews:
+        mark_unknown("review_pending_age")
+        emit(
+            "Review-pending age: UNKNOWN for %s (no parseable Status timestamp on a review-pending row)"
+            % ", ".join(sorted(ts_unknown_reviews))
+        )
     if stale_reviews:
         stale_reviews.sort(key=lambda pair: -pair[1])
         ids_desc = ", ".join("%s (%.1f min)" % (rid, age) for rid, age in stale_reviews)
@@ -688,12 +708,14 @@ else:
     board_tiers = board.get("tiers", {})
     over_budget = []
     tier_unknown_active = []
+    ts_unknown_active = []  # row_id for an active row with a bad Status timestamp
     active_checked = 0
     for row_id, token, ts in board_rows:
         if token not in ("building", "review"):
             continue
         t = parse_time_value(ts)
         if t is None:
+            ts_unknown_active.append(row_id)
             continue
         active_checked += 1
         age = (NOW - t) / 60.0
@@ -711,6 +733,12 @@ else:
         "Agent budget: %d active (building/review) row(s) checked, %d over budget"
         % (active_checked, len(over_budget))
     )
+    if ts_unknown_active:
+        mark_unknown("agent_budget")
+        emit(
+            "Agent budget: UNKNOWN for %s (no parseable Status timestamp on an active row)"
+            % ", ".join(sorted(ts_unknown_active))
+        )
     if tier_unknown_active:
         mark_unknown("agent_budget")
         emit(
