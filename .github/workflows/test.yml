@@ -14,8 +14,60 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Runs first on every push and PR. Two jobs in one:
+  #
+  # 1. The version-bump consistency checks, UNCONDITIONALLY. A bump-only diff
+  #    can still corrupt a dependency spec that happens to contain the old
+  #    version ("^29.7.0" -> "^29.8.0" on a 9.7.0 -> 9.8.0 bump is
+  #    byte-identical modulo the version, and took down every job in v9.8.0),
+  #    so these never skip, whatever the gate decides.
+  # 2. The skip decision (S-132). skip=true only when the push is a
+  #    version-bump-only commit by the same rules as release.yml required-ci
+  #    STEP 1 (tests/test-version-bump-only.sh holds the two in parity) AND
+  #    the parent has a completed, successful push-event Tests run. Pending,
+  #    red, absent, or unreadable means skip=false and the full suite runs;
+  #    it never waits. This check matters because a Tests run whose jobs all
+  #    skip concludes success, and required-ci accepts success at the release
+  #    SHA without looking at the parent.
+  #
+  # Every other job has `needs` on this one and `!cancelled()` in its `if`:
+  # if this job fails, skip is empty, the full suite still runs, and the run
+  # is still red. Without `!cancelled()` a failed gate would silently skip
+  # the whole suite.
+  version-bump-gate:
+    name: Version-bump gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+    steps:
+      - name: Checkout (pushed commit plus its parent)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Version-bump consistency (never skipped)
+        run: |
+          python3 tests/test_version_bump_safety.py
+          bash tests/test-server-json-current.sh
+
+      - name: Decide whether the heavy jobs can reuse the parent's Tests verdict
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/ci/version-bump-only.sh gate >> "$GITHUB_OUTPUT"
+
   node-tests:
     name: Node.js ${{ matrix.node-version }}
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -39,6 +91,8 @@ jobs:
 
   python-tests:
     name: Python ${{ matrix.python-version }}
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -78,6 +132,8 @@ jobs:
 
   shell-tests:
     name: Shell tests (shard ${{ matrix.shard }}/8)
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SHARDED because this job WAS the pipeline. Measured 2026-07-30 at 4
@@ -182,6 +238,8 @@ jobs:
   # on both routes (Bun and bash) and the signing checks import cryptography.
   moat-suite:
     name: Moat suite
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -254,6 +312,8 @@ jobs:
 
   helm-lint:
     name: Helm lint
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -302,6 +362,8 @@ jobs:
 
   dashboard-build:
     name: Dashboard build verification
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -335,6 +397,8 @@ jobs:
 
   bun-tests:
     name: Bun tests on ${{ matrix.os }} bun=${{ matrix.bun-version }}
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -441,6 +505,8 @@ jobs:
   # prove the mechanism keyless; this proves a real one-file app builds end to end.
   sdk-loop-e2e:
     name: v8 SDK-loop E2E (gated on ANTHROPIC_API_KEY secret)
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -488,6 +554,8 @@ jobs:
   # + valid JSON, proving the SDK judge path end-to-end from the artifact.
   sdk-tarball-no-binary:
     name: v8.1 SDK judge from packed tarball (no claude binary)
+    needs: [version-bump-gate]
+    if: ${{ !cancelled() && needs.version-bump-gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     # The `secrets` context is NOT available in a step-level `if:` -- referencing
     # it there makes GitHub reject the whole workflow file at parse time, so ZERO
