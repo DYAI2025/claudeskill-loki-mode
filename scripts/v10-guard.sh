@@ -180,10 +180,13 @@ def _read_shell_word(line, start):
     return "".join(out), i
 
 
-def _heredoc_marker_on_line(line):
+def _heredoc_marker_on_line(line, in_squote=False, in_dquote=False):
     """Scan one line for a live (unquoted, uncommented, not a here-string)
-    `<<`/`<<-` heredoc marker. Returns (dash, delim) or None."""
-    in_squote = in_dquote = False
+    `<<`/`<<-` heredoc marker. `in_squote`/`in_dquote` is the quote state
+    carried in from the END of the previous line (a double quote a prior
+    line opened and never closed is still open here -- see strip_heredocs).
+    Returns (marker, out_squote, out_dquote) where marker is (dash, delim)
+    or None."""
     i, n = 0, len(line)
     while i < n:
         ch = line[i]
@@ -211,7 +214,7 @@ def _heredoc_marker_on_line(line):
             i += 2
             continue
         if ch == "#" and (i == 0 or line[i - 1] in " \t"):
-            return None  # rest of the line is a comment
+            return None, in_squote, in_dquote  # rest of the line is a comment
         if ch == "<" and i + 1 < n and line[i + 1] == "<":
             if i > 0 and line[i - 1] == "<":
                 i += 1
@@ -237,30 +240,48 @@ def _heredoc_marker_on_line(line):
                 # `$((1 << 2))` / `$(( n << 1 ))` -- arithmetic, not a heredoc.
                 i = j
                 continue
-            return dash, delim
+            # A live marker is only ever found outside any quote (both
+            # branches above `continue` before reaching here), so the
+            # outgoing state is always unquoted.
+            return (dash, delim), False, False
         i += 1
-    return None
+    return None, in_squote, in_dquote
 
 
 def strip_heredocs(text):
     lines = text.split("\n")
     out_lines = []
     i, n = 0, len(lines)
+    # Quote state carries ACROSS lines (not reset per line): an unterminated
+    # double/single quote opened on an earlier line is still open here, so a
+    # `<<WORD` that only LOOKS like a marker because it sits inside that
+    # still-open quote is correctly skipped instead of being mistaken for a
+    # real heredoc opener -- which would otherwise strip whatever real
+    # commands follow it as if they were the (fake) heredoc's body.
+    in_squote = in_dquote = False
     while i < n:
         line = lines[i]
         out_lines.append(line)
         i += 1
-        marker = _heredoc_marker_on_line(line)
+        marker, in_squote, in_dquote = _heredoc_marker_on_line(line, in_squote, in_dquote)
         if marker is None:
             continue
         dash, delim = marker
         indent = r"[ \t]*" if dash else ""
-        term_re = re.compile(r"^" + indent + re.escape(delim) + r"[ \t]*\r?$")
+        # The terminator line must be EXACTLY the delimiter, with only an
+        # optional trailing \r tolerated (CRLF input) -- no other trailing
+        # whitespace. Real bash requires an exact match too: a line like
+        # "EOF " (trailing space) is not a terminator, so tolerating it here
+        # would let our stripper stop short of the true terminator and
+        # silently drop real commands that are still genuinely part of the
+        # (unterminated, per the stricter match) heredoc's reach.
+        term_re = re.compile(r"^" + indent + re.escape(delim) + r"\r?$")
         j = i
         while j < n and not term_re.match(lines[j]):
             j += 1
         if j < n:
             i = j + 1  # drop the body lines and the terminator line itself
+            in_squote = in_dquote = False  # body content is raw/arbitrary, not part of quote nesting
         # else: no terminator found -- strip NOTHING; the body lines remain
         # in out_lines via the normal loop continuation above.
     return "\n".join(out_lines)
@@ -287,8 +308,76 @@ def basename(value):
     return value.rstrip("/").rsplit("/", 1)[-1]
 
 
+# ---------------------------------------------------------------------
+# A QUOTED redirect-shaped character ("<", ">", "&") must not be mistaken
+# for a live redirect operator once shlex (posix mode) strips its quotes --
+# `rm -rf /tmp/x ">" /Users/x` has ">" as a literal argument in real bash
+# (quoting it defeats the redirect), but after tokenizing, that token is
+# just the bare character ">", indistinguishable from a real unquoted `>`.
+# Mask these characters while they are inside a quote (same quote-tracking
+# style as _heredoc_marker_on_line) BEFORE shlex ever sees the text, so the
+# redirect-detection regexes below correctly skip them, and unmask a
+# token's content back once a rule has decided it is a real argument (not a
+# redirect) it needs the literal value of.
+# ---------------------------------------------------------------------
+_REDIRECT_MASK = {"<": "\x01", ">": "\x02", "&": "\x03"}
+_REDIRECT_UNMASK_TABLE = str.maketrans({v: k for k, v in _REDIRECT_MASK.items()})
+
+
+def unmask_redirect_chars(value):
+    return value.translate(_REDIRECT_UNMASK_TABLE)
+
+
+def _mask_quoted_redirect_chars(text):
+    out = []
+    in_squote = in_dquote = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_squote:
+            if ch == "'":
+                in_squote = False
+                out.append(ch)
+            else:
+                out.append(_REDIRECT_MASK.get(ch, ch))
+            i += 1
+            continue
+        if in_dquote:
+            if ch == '"':
+                in_dquote = False
+                out.append(ch)
+            elif ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            else:
+                out.append(_REDIRECT_MASK.get(ch, ch))
+            i += 1
+            continue
+        if ch == "'":
+            in_squote = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_dquote = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def tokenize(value):
-    lexer = shlex.shlex(value.replace("\n", " ; "), posix=True,
+    masked = _mask_quoted_redirect_chars(value.replace("\n", " ; "))
+    lexer = shlex.shlex(masked, posix=True,
                          punctuation_chars=";&|()")
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -466,7 +555,7 @@ def rule1_process_kill(i, segs, words, name, idx):
                 continue
             if a.startswith("-"):
                 continue
-            pids.append(a)
+            pids.append(unmask_redirect_chars(a))
         if not pids:
             return "RULE1 (process-kill-by-pattern): kill with no literal PID argument (likely fed a pattern via command substitution)"
         for p in pids:
@@ -637,6 +726,7 @@ def git_show(repo_cwd, ref):
 
 
 def _covers_board(arg):
+    arg = unmask_redirect_chars(arg)
     if arg in (".", ":/"):
         return True
     if basename(arg) == "BOARD.md":
@@ -647,6 +737,39 @@ def _covers_board(arg):
 
 def _redirect_target_basenames(text):
     return [basename(m.group(1)) for m in REDIRECT_TARGET_RE.finditer(text)]
+
+
+# ---------------------------------------------------------------------
+# Rule 3 pending-write detection: a tool that rewrites BOARD.md IN PLACE
+# (not via a shell redirect, already caught by _redirect_target_basenames)
+# earlier in the same chained command, before a `git commit` that would
+# otherwise look clean against the CURRENT (pre-execution) index/worktree.
+# Mirrors segment_writes_version's sed/tee/cp/mv/dd/truncate forms below,
+# plus perl -pi and python3 open(), which BOARD.md needs and VERSION does
+# not (VERSION is only ever touched by scripts/release.sh in practice).
+# ---------------------------------------------------------------------
+def segment_writes_board(words, name, idx, raw_segment_text):
+    rest = words[idx + 1:]
+    if name == "sed" and "-i" in " ".join(words) and any(_covers_board(a) for a in rest):
+        return True
+    if name == "tee" and any(_covers_board(a) for a in rest if not a.startswith("-")):
+        return True
+    if name in {"cp", "mv"}:
+        nonflag = [a for a in rest if not a.startswith("-")]
+        if nonflag and _covers_board(nonflag[-1]):
+            return True
+    if name == "dd" and any(a.startswith("of=") and _covers_board(a[3:]) for a in rest):
+        return True
+    if name == "truncate" and any(_covers_board(a) for a in rest if not a.startswith("-")):
+        return True
+    if name == "perl":
+        has_pi = any(a in ("-pi", "-ip") for a in rest) or ("-p" in rest and "-i" in rest)
+        if has_pi and any(_covers_board(a) for a in rest if not a.startswith("-")):
+            return True
+    if name in ("python3", "python") and "open(" in raw_segment_text and \
+            re.search(r"open\([^)]*BOARD\.md[^)]*,\s*[\"'][wax]", raw_segment_text):
+        return True
+    return False
 
 
 def rule3_board_drop(words, name, idx, git_info, board_removal_pending_repos):
@@ -734,7 +857,7 @@ def is_rm_recursive_force(words, idx):
             if "f" in a:
                 has_f = True
             continue
-        targets.append(a)
+        targets.append(unmask_redirect_chars(a))
     return has_r, has_f, targets
 
 
@@ -876,6 +999,11 @@ for i, words in enumerate(segs):
             g_args = [w for w in words[g_args_idx:] if not w.startswith("-")]
             if any(_covers_board(a) for a in g_args):
                 board_removal_pending_repos.add(resolve_repo_root(g_repo_cwd, g_git_dir))
+    elif segment_writes_board(words, name, idx, " ".join(words)):
+        # sed -i / cp / mv / tee / truncate / dd / perl -pi / python3 open()
+        # rewriting BOARD.md in place earlier in the same command -- the
+        # working-tree read below can't see that change yet either.
+        board_removal_pending_repos.add(resolve_repo_root(effective_cwd, None))
     elif "BOARD.md" in _redirect_target_basenames(" ".join(words)):
         # A non-git write (`: > docs/v10/BOARD.md`, `echo x > .../BOARD.md`)
         # earlier in the same command also replaces content the working-tree

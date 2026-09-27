@@ -592,6 +592,53 @@ assert_allowed "R1 allowed: xargs kill < f with no process-search tool anywhere"
     "xargs kill < $LOKI_RUN_TMP/pf" "$SCRIPT_DIR"
 
 echo ""
+echo "--- S-99 follow-ups: quote-carrying, strict terminator, quoted redirect, BOARD.md tool-writes (round 5) ---"
+# (1) A double quote opened on one line and closed on a later line must keep
+# its state across the boundary: a `<<X` that only appears inside that
+# still-open quote must not be mistaken for a real heredoc opener, which
+# would otherwise strip the real `pkill` in between as if it were the
+# (fake) heredoc's body.
+assert_blocked "S-99 R1: quote state carried across lines (fake <<X inside an open quote)" \
+    "echo \"start
+<<X\"
+pkill -f loki
+X" "$SCRIPT_DIR" "RULE1"
+
+# (2) A terminator line must be EXACTLY the delimiter (plus an optional
+# \r) -- a line with trailing whitespace is not a match, so the search
+# must keep looking past it instead of stopping early and letting whatever
+# comes next (here, a bare pkill) fall through as unstripped, unscanned
+# heredoc "leftover".
+assert_blocked "S-99 R2: terminator with trailing whitespace is not recognized (falls through to strip-nothing)" \
+    "cat <<EOF
+pkill -f loki
+EOF " "$SCRIPT_DIR" "RULE1"
+
+# (3) A quoted ">" must not be read as a live redirect operator that
+# swallows the NEXT token as its target -- rm's real target list must keep
+# every argument that was genuinely there.
+assert_blocked "S-99 R4: quoted \">\" must not hide the real rm target after it" \
+    'rm -rf /tmp/x ">" /Users/someone/important' "$SCRIPT_DIR" "RULE4"
+
+# (4) sed -i (and cp/mv/tee/truncate/dd/perl -pi/python3 open()) rewriting
+# BOARD.md in place, earlier in the same chained command, must set the
+# pending flag before the trailing git commit -- the static index/worktree
+# check alone would see the CURRENT (pre-rewrite) BOARD.md and miss it.
+board_reset
+assert_blocked "S-99 R3: sed -i rewriting BOARD.md earlier in the command sets pending before commit" \
+    "sed -i '' '/S-3/d' docs/v10/BOARD.md && git commit -am x" "$REPO3" "RULE3"
+board_reset
+
+echo ""
+echo "--- S-99 follow-ups continued: everyday commands stay allowed ---"
+assert_allowed "S-99 sanity: git status still allowed" "git status" "$SCRIPT_DIR"
+assert_allowed "S-99 sanity: kill of a literal PID still allowed" "kill -9 42123" "$SCRIPT_DIR"
+assert_allowed "S-99 sanity: heredoc commit message with an apostrophe still allowed" \
+    "git commit -F - <<'EOF'
+fix: it's done
+EOF" "$REPO3"
+
+echo ""
 echo "--- Fail-closed on an internal guard crash (PY_EXIT != 0) ---"
 # A staged BOARD.md with invalid UTF-8 bytes makes the (unwrapped) index
 # read inside rule3 raise UnicodeDecodeError -- the python step crashes
