@@ -7421,7 +7421,8 @@ async def github_get_pr(session_id: str, pr_number: int) -> JSONResponse:
             None, lambda: _run_gh([
                 "pr", "view", str(pr_number),
                 "--repo", repo,
-                "--json", "number,title,body,state,author,comments,reviews,files,additions,deletions,commits",
+                "--json", "number,title,body,state,author,comments,reviews,files,additions,deletions,commits,"
+                          "headRefName,baseRefName,changedFiles,reviewDecision,statusCheckRollup",
             ], cwd=str(target))
         )
         if result.returncode != 0:
