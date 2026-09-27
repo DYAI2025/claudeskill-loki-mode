@@ -1162,3 +1162,22 @@ exactly the cost S-84 (verdict reuse) removes.
 
 **Matched:** the release did not wait for any HIGH slice (S-18 is in
 round 4 and did not block, per D25).
+
+## Drift audit, turn 210
+
+**npm propagation, not assumed:** 5 minutes after the publish-npm step
+("npm publish --access public", exit 0 at 14:44:53Z) the registry still
+returns 404 for loki-mode@9.56.0 (curl registry.npmjs.org, bypassing
+the npm client cache; dist-tag latest 9.55.0). npm publish only exits 0
+after the registry accepts the package, so this is CDN or packument
+caching; memory records one prior case where six agreeing probes read a
+stale packument. Not republishing (the version would be rejected as a
+duplicate anyway). Re-checking; if still absent at +15 min, investigate
+with npm support channels, never republish or bump.
+
+**Reviews keep finding real defects in fixes-to-fixes:** S-74 round 3
+fixed two bugs and introduced a third (short rows refused), caught
+because the reviewer measured the real board's row shapes instead of
+trusting a first-row-only test. Rule for slice cards touching BOARD.md
+tooling: test against every row of a copy of the real board, not a
+sample.
