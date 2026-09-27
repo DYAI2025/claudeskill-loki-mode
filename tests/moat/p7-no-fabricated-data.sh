@@ -707,8 +707,11 @@ def literal_rows(arr):
 # call sites S-30 owns) so this arm's own null-ternary handling routes through
 # the SAME predicate instead of growing a second, divergently-named copy of
 # the same exclusion -- see the MODULE_TABLE_FALLBACK ponytail/dedup note
-# above. If S-30 lands first, this definition must be deleted here and the one
-# import kept; the two are written byte-identical to make that merge a no-op.
+# above. Written to match S-30's own helper as of this writing, but S-30 is
+# still in rework and its final shape is not locked yet, so this is NOT an
+# unconditional "delete the duplicate on merge": whichever helper S-30 ships
+# wins if S-30 merges second, and whoever resolves that merge should diff the
+# two definitions rather than assume byte-identity.
 ABSENT = re.compile(r"^(?:null|undefined|''|\"\")$")
 def is_exempting_sibling(v):
     """True when v is a genuine data-shaped literal for the both-branches-
@@ -919,6 +922,189 @@ def whole_file_findings(s):
             continue
         module_tables[name] = (opener, m.end() - 1, j)
 
+    # name_alt/chain_end/TERMINATOR/table_operand_end/resolves_to_table_read
+    # are defined here, unconditionally and BEFORE literal_rows_resolved
+    # (moved up from their original home inside the `if module_tables:`
+    # block much further below, which runs AFTER the FALLBACK_ARR/TERNARY
+    # spread-element loops that call literal_rows_resolved -- at the time
+    # those loops ran, table_operand_end did not exist yet, so
+    # literal_rows_resolved's spread-element check (`p[3:].strip() in
+    # module_tables`) was a bare exact-string match with no chain-walk or
+    # paren-peel at all: `[...BACKUP_ROWS.slice(0)]`, `[...BACKUP_ROWS.filter
+    # (r => r.ok)]` and even a bare `[...(BACKUP_ROWS)]` (no chain, just
+    # parens) all failed to resolve and were silently skipped -- the exact
+    # "spelling of the read defeats detection" class this whole arm exists to
+    # close, just at the spread-element site instead of the bare-operand one.
+    # name_alt is `never matches anything` (an alternation with no branches
+    # is invalid re syntax) when module_tables is empty, so callers below
+    # must still treat "no match" as "not a table read", which they already
+    # do (a None/False return), so this degrades safely to a no-op.
+    name_alt = '|'.join(re.escape(n) for n in sorted(module_tables, key=len, reverse=True)) if module_tables else r'(?!)'
+    # After the name, the REST of the operand must still carry the
+    # table's row data, not merely read a scalar or one element out of it
+    # -- `PERMS.length`, `TABS[0]`, `OPTS.find(o => o.on)` all resolve to
+    # a NUMBER, ONE ROW or ONE ROW-OR-UNDEFINED, never the fabricated
+    # array, and must not read as "the table used as a fallback". A
+    # WALKER (not a single regex) consumes zero or more `.method(...)`/
+    # `?.method(...)` calls whose method name is array-returning
+    # (ARRAY_METHODS), each with its own BALANCED parens via close_of --
+    # a single `[^()]*` class inside one regex cannot express "balanced",
+    # so it silently stopped at the first nested `(` in an arrow-function
+    # argument (`.filter((r) => r.ok)`) or after the first call in a
+    # chain (`.slice(0).reverse()`), UNDER-matching and leaving both
+    # shapes unresolved -- reviewer-class bypass, the same "spelling of
+    # the read defeats detection" this whole arm exists to close.
+    # `[<int>]` deliberately does NOT chain-walk here: a bare index read
+    # (`sel || TABS[0]`) is picking ONE row, honest and common (the same
+    # reasoning FindReadHonest/ElementIndexReadHonest use for `.find()`/
+    # `[i].x`), so `[<int>]` is NOT accepted by this walker at all -- it
+    # only ever exempts as a bounded NARROWING inside
+    # is_narrowing_self_derivation (the ternary-sibling test), never as a
+    # "the operand carries the table's data" read here. A scalar/property
+    # suffix (`.length`, `?.length`, `.find(...)`, a mismatched longer
+    # identifier like `PERMSET`) does not chain-walk either, so text like
+    # `PERMS.length` or `PERMSET` never resolves to a table at all.
+    ARRAY_METHODS = frozenset((
+        'slice', 'concat', 'filter', 'map', 'flat', 'flatMap',
+        'sort', 'reverse', 'toSorted', 'toReversed',
+    ))
+    CHAIN_CALL = re.compile(r'\s*(\??\.)\s*([A-Za-z_$][\w$]*)\s*\(')
+    def chain_end(t, i):
+        """t[i:] follows a resolved table name. Consume zero or more
+        `.method(...)`/`?.method(...)` calls whose method is array-
+        returning, each argument list matched by its own balanced-paren
+        span (close_of), and return the index just past the LAST such
+        call (i itself if there is none). Returns -1 the first time a
+        call name is NOT in ARRAY_METHODS -- that call could return
+        anything (a scalar, one row, undefined), so the walk stops and
+        the caller must treat the whole operand as unresolved, never as
+        "resolves to the table only up to here"."""
+        while True:
+            m = CHAIN_CALL.match(t, i)
+            if not m:
+                return i
+            if m.group(2) not in ARRAY_METHODS:
+                return -1
+            paren = m.end() - 1
+            j = close_of(t, paren)
+            if j < 0:
+                return -1
+            i = j + 1
+    # TERMINATOR: an operand ends at end-of-string, a closing
+    # bracket/brace/paren/comma/semicolon/colon, or another
+    # `||`/`??`/`&&`/`?` (ternary/logical continuation) -- an ALLOWLIST
+    # of terminators, not a blacklist of what must not follow. Defined
+    # here (before table_operand_end) because table_operand_end applies
+    # this SAME boundary test to the text INSIDE a leading paren group,
+    # not only to the top-level operand after it -- so `(BACKUP_ROWS ||
+    # other)` and `(BACKUP_ROWS ?? y)` resolve the inner `BACKUP_ROWS`
+    # exactly as the unparenthesized `rows || BACKUP_ROWS || other` form
+    # already does (hitting `||`/`??` is a valid boundary at any nesting
+    # depth, not just at the outermost one), while `(BACKUP_ROWS).length`
+    # and `(BACKUP_ROWS as Row[]).length` still do NOT resolve, because
+    # `.` is not in TERMINATOR and chain_end returns unchanged there.
+    # [ \t]*, not \s*: \s* also matches a NEWLINE, so it would swallow a
+    # missing-semicolon line break and let `$` match nothing right after
+    # it (there is no re.M flag here) -- `const data = rows || BACKUP_Q`
+    # on its own line, with more code below and no semicolon, would then
+    # resolve as "ends the operand" when it does not. The explicit
+    # `\r?\n(?!\s*(?:\??\.|\[))` alternative treats a newline as a
+    # terminator ONLY when nothing that continues the chain follows it
+    # (a bare newline ends the operand; `\n  .slice(0)` continues it, so
+    # chain_end must get the chance to consume that line first).
+    TERMINATOR = re.compile(r'[ \t]*(?:[)\]},;:]|\|\||\?\?|&&|\?(?![.?])|\bas\b|\r?\n(?!\s*(?:\??\.|\[))|$)')
+    def table_operand_end(t, i):
+        """t[i:] is the start of an operand that may name a table. Returns
+        (name, end) when it resolves to a known table plus a trailing
+        chain of zero or more array-returning calls, or None.
+
+        Handles a LEADING balanced paren group (via close_of, the same
+        walker used everywhere else in this arm) transparently, at any
+        depth -- `(BACKUP_ROWS)`, `(BACKUP_ROWS as Row[])`,
+        `((BACKUP_ROWS))`, `(BACKUP_ROWS as Row[]).slice(1)`,
+        `(BACKUP_ROWS || other)` (see TERMINATOR's docstring note just
+        above) all resolve to BACKUP_ROWS. This replaces two earlier,
+        INCONSISTENT paren checks: unwrap()'s `close_of(t, 0) == len(t) -
+        1` (required the paren to close at the very LAST character of
+        the whole branch, so a trailing chain after the closer --
+        `(BACKUP_ROWS as Row[]).slice(1)` -- left the string still
+        wrapped and unmatched: an undetected bypass of exactly the
+        evasion this arm exists to close) and the ||/?? site's
+        leading-parens prefix capture (consumed leading `(` characters
+        but never confirmed where they closed, so TERMINATOR's bare `)`
+        alternative could match the FIRST `)` it found -- which might
+        close an unrelated outer/sibling paren, not the one the prefix
+        opened -- wrongly treating `(PERMS).length` as "operand ends
+        here" and flagging an honest scalar read). Recursion (rather
+        than one non-recursive peel) handles `((NAME))` and lets an `as
+        Type` sit inside any nesting depth, not just the outermost one.
+
+        The INNER content of a paren group is accepted only when it reaches
+        an INNER_TERM boundary (end-of-string, or another `||`/`??`) --
+        deliberately NARROWER than TERMINATOR, and NOT simply reused: inside
+        parens, `&&`, a bare ternary `?`, and `,` do not mean "the table IS
+        the value" the way they do (as valid boundaries) at the top-level
+        operand position. `(T && x)` evaluates to `x`, not T, whenever T is a
+        non-empty array (always truthy); `(T ? a : b)` uses T only as a
+        CONDITION, never as the value; `(T, x)` (the comma operator)
+        evaluates to `x`. Accepting any of those as "the paren group
+        resolves to T" would be a false positive with T merely mentioned,
+        not read as a fallback value. `e >= 0` is checked explicitly first,
+        since re.match clamps a negative pos to 0 and would otherwise read a
+        chain_end() failure (-1) as "matches at the start"."""
+        if t[i:i + 1] == '(':
+            k = close_of(t, i)
+            if k < 0:
+                return None
+            inner = t[i + 1:k].strip()
+            # Strip a trailing `as Type` INSIDE this paren layer (`(BACKUP_ROWS
+            # as Row[])`'s inner text is `BACKUP_ROWS as Row[]`) before
+            # recursing -- this is separate from resolves_to_table_read's own
+            # top-level strip, which only ever sees a trailing `as Type` with
+            # no enclosing parens at all (`BACKUP_ROWS as Row[]`, no wrapper).
+            # Both are needed: dropping this one breaks every `(NAME as
+            # Type)` paren form, dropping that one breaks the bare-cast form.
+            inner = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', inner).strip()
+            inner_res = table_operand_end(inner, 0)
+            if not inner_res:
+                return None
+            iname, iend = inner_res
+            if iend < 0 or not INNER_TERM.match(inner, iend):
+                return None
+            return iname, chain_end(t, k + 1)
+        m = re.match(r'^(' + name_alt + r')(?![\w$])', t[i:])
+        if not m:
+            return None
+        return m.group(1), chain_end(t, i + m.end())
+    # Only `||`/`??` (or end-of-string) let the INNER content of a paren
+    # group resolve to the table -- see table_operand_end's own docstring for
+    # why this must NOT be the same, broader TERMINATOR used at the top-level
+    # operand position.
+    INNER_TERM = re.compile(r'\s*(?:\|\||\?\?|$)')
+    def resolves_to_table_read(text):
+        """True when text is a known table name -- optionally wrapped in
+        a balanced paren group at any nesting depth -- followed by a chain
+        of zero or more array-returning calls and NOTHING else (the resolved
+        end must land exactly at len(text), after stripping one trailing
+        `as <Type>` first) -- the broad "does this operand carry the
+        table's data" test used at the ||/?? and ternary match sites, and (as
+        of this rework) the spread-element check inside literal_rows_resolved
+        below too. The trailing `as Type` strip happens HERE, once, on the
+        WHOLE input text, rather than inside table_operand_end's paren
+        branch only: `live ? live : BACKUP_ROWS as Row[]` (no parens at all,
+        a bare cast) is valid TypeScript and must resolve the same way
+        `live ? live : (BACKUP_ROWS as Row[])` does -- stripping only inside
+        the paren branch would silently stop catching the unparenthesized
+        cast form, a real regression this rework's own restructuring
+        introduced and caught via matrix testing before it shipped. Returns
+        the matched name or None."""
+        text = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', text.strip()).strip()
+        res = table_operand_end(text, 0)
+        if not res:
+            return None
+        name, end = res
+        return name if end == len(text) else None
+
     def table_is_fabricated_rows(name):
         opener, i, j = module_tables[name]
         return opener == '[' and literal_rows(s[i:j + 1])
@@ -950,14 +1136,26 @@ def whole_file_findings(s):
         distinction is NOT about whether the table is honest -- it is about
         whether the call
         site is itself a fallback/ternary carrying live-vs-static-data
-        semantics, which useState-seeding is not."""
+        semantics, which useState-seeding is not.
+
+        The spread operand (`p[3:]`) is resolved through resolves_to_table_read,
+        never by a bare `name in module_tables` exact-string match: the exact
+        match required the spread element to be JUST the name (`[...TABLE]`)
+        with nothing else, so `[...TABLE.slice(0)]`, `[...TABLE.filter(r =>
+        r.ok)]` and even a bare `[...(TABLE)]` (parens, no chain at all) all
+        failed to resolve and were silently treated as "not a spread of a
+        known table" -- invisible to this whole arm, the same paren/chain
+        bypass class table_operand_end exists to close at the bare-operand
+        ||/?? and ternary sites, just reachable here through a spread element
+        instead. resolves_to_table_read applies the identical paren-peel and
+        array-returning chain-walk to the spread operand's text."""
         parts = split_top(arr[1:-1])
         if not any(p.startswith('{') or p.startswith('...') for p in parts):
             return False
         for p in parts:
             if p.startswith('...'):
-                name = p[3:].strip()
-                if not (name in module_tables and table_is_fabricated_rows(name)):
+                name = resolves_to_table_read(p[3:].strip())
+                if not (name and table_is_fabricated_rows(name)):
                     return False
             elif not is_literal(p):
                 return False
@@ -1140,68 +1338,11 @@ def whole_file_findings(s):
             out.append((line_of(s, where), f"module-level table '{name}' (invented stats) used as a fallback"))
 
     if module_tables:
-        name_alt = '|'.join(re.escape(n) for n in sorted(module_tables, key=len, reverse=True))
-        # After the name, the REST of the operand must still carry the
-        # table's row data, not merely read a scalar or one element out of it
-        # -- `PERMS.length`, `TABS[0]`, `OPTS.find(o => o.on)` all resolve to
-        # a NUMBER, ONE ROW or ONE ROW-OR-UNDEFINED, never the fabricated
-        # array, and must not read as "the table used as a fallback". A
-        # WALKER (not a single regex) consumes zero or more `.method(...)`/
-        # `?.method(...)` calls whose method name is array-returning
-        # (ARRAY_METHODS), each with its own BALANCED parens via close_of --
-        # a single `[^()]*` class inside one regex cannot express "balanced",
-        # so it silently stopped at the first nested `(` in an arrow-function
-        # argument (`.filter((r) => r.ok)`) or after the first call in a
-        # chain (`.slice(0).reverse()`), UNDER-matching and leaving both
-        # shapes unresolved -- reviewer-class bypass, the same "spelling of
-        # the read defeats detection" this whole arm exists to close.
-        # `[<int>]` deliberately does NOT chain-walk here: a bare index read
-        # (`sel || TABS[0]`) is picking ONE row, honest and common (the same
-        # reasoning FindReadHonest/ElementIndexReadHonest use for `.find()`/
-        # `[i].x`), so `[<int>]` is NOT accepted by this walker at all -- it
-        # only ever exempts as a bounded NARROWING inside
-        # is_narrowing_self_derivation (the ternary-sibling test), never as a
-        # "the operand carries the table's data" read here. A scalar/property
-        # suffix (`.length`, `?.length`, `.find(...)`, a mismatched longer
-        # identifier like `PERMSET`) does not chain-walk either, so text like
-        # `PERMS.length` or `PERMSET` never resolves to a table at all.
-        ARRAY_METHODS = frozenset((
-            'slice', 'concat', 'filter', 'map', 'flat', 'flatMap',
-            'sort', 'reverse', 'toSorted', 'toReversed',
-        ))
-        CHAIN_CALL = re.compile(r'\s*(\??\.)\s*([A-Za-z_$][\w$]*)\s*\(')
-        def chain_end(t, i):
-            """t[i:] follows a resolved table name. Consume zero or more
-            `.method(...)`/`?.method(...)` calls whose method is array-
-            returning, each argument list matched by its own balanced-paren
-            span (close_of), and return the index just past the LAST such
-            call (i itself if there is none). Returns -1 the first time a
-            call name is NOT in ARRAY_METHODS -- that call could return
-            anything (a scalar, one row, undefined), so the walk stops and
-            the caller must treat the whole operand as unresolved, never as
-            "resolves to the table only up to here"."""
-            while True:
-                m = CHAIN_CALL.match(t, i)
-                if not m:
-                    return i
-                if m.group(2) not in ARRAY_METHODS:
-                    return -1
-                paren = m.end() - 1
-                j = close_of(t, paren)
-                if j < 0:
-                    return -1
-                i = j + 1
-        def resolves_to_table_read(text):
-            """True when text is a known table name followed by a chain of
-            zero or more array-returning calls and NOTHING else (chain_end
-            must land exactly at len(text)) -- the broad "does this operand
-            carry the table's data" test used at the ||/?? and ternary match
-            sites. Returns the matched name or None."""
-            m = re.match(r'^(' + name_alt + r')(?![\w$])', text)
-            if not m:
-                return None
-            end = chain_end(text, m.end())
-            return m.group(1) if end == len(text) else None
+        # name_alt/ARRAY_METHODS/CHAIN_CALL/chain_end/TERMINATOR/
+        # table_operand_end/resolves_to_table_read now live above,
+        # right after module_tables is built -- see the comment there for why
+        # (literal_rows_resolved's spread-element check needs them too, and
+        # runs before this `if module_tables:` block).
         def unwrap(text):
             """Strip one layer of surrounding parens and a trailing
             `as <Type>`, so `(BACKUP_ROWS)` and `(BACKUP_ROWS as Row[])`
@@ -1209,7 +1350,16 @@ def whole_file_findings(s):
             class bypass: parenthesizing or type-asserting a fallback operand
             must not be a way to dodge detection. Only ONE layer: matches
             is_literal's own `as const` handling in spirit, and a
-            double-wrapped `((NAME))` is already vanishingly unlikely."""
+            double-wrapped `((NAME))` is already vanishingly unlikely. NOTE:
+            resolves_to_table_read/table_operand_end do their OWN, fully
+            recursive paren-peel and are called on the RAW branch text below,
+            NEVER on this function's output (a trailing chain after the
+            paren, e.g. `(BACKUP_X as Row[]).slice(1)`, is exactly the shape
+            unwrap() alone cannot handle -- see table_operand_end's
+            docstring). unwrap()'s own output feeds only resolved_is_literal
+            (is_literal()/is_narrowing_self_derivation) on the OTHER,
+            non-table-resolved ternary branch, which never chain-walks and
+            only needs ONE paren layer stripped."""
             t = text.strip()
             t = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', t).strip()
             if t[:1] == '(' and close_of(t, 0) == len(t) - 1:
@@ -1217,27 +1367,51 @@ def whole_file_findings(s):
                 t = re.sub(r'\s+as\s+[\w$][\w$.\[\]<>, ]*$', '', t).strip()
             return t
         # `||`/`??` operand: find every occurrence of a known table name right
-        # after the operator (optionally parenthesized), reject it outright
-        # via an inline name-boundary lookahead if it is really a longer
-        # identifier, walk its call chain with chain_end, and resolve to the
-        # table ONLY when that chain lands exactly on an operand boundary --
-        # end of string, a closing bracket/brace/paren/comma/semicolon, or
-        # another `||`/`??`/`&&`/`?` (ternary/logical continuation). This is
-        # an ALLOWLIST of terminators, not a blacklist of what must not
-        # follow. Two independent guards, each sufficient alone, reject
+        # after the operator, optionally wrapped in a balanced paren group
+        # and/or `as Type`-asserted at any nesting depth (table_operand_end,
+        # shared with the ternary site below), walk any trailing call chain
+        # with chain_end, and resolve to the table ONLY when that chain lands
+        # exactly on an operand boundary -- end of string, a closing
+        # bracket/brace/paren/comma/semicolon, or another `||`/`??`/`&&`/`?`
+        # (ternary/logical continuation). This is an ALLOWLIST of
+        # terminators, not a blacklist of what must not follow.
+        #
+        # table_operand_end (not a `(\(*)` prefix regex) owns the paren
+        # handling: it calls close_of to find exactly where a leading `(`
+        # closes, so TERMINATOR is only ever asked to match at the position
+        # right after that SAME paren's own closer (or right after the bare
+        # name/chain, when there is no leading paren at all) -- never at some
+        # earlier, unrelated `)` that happens to appear first in the source.
+        # The old `(\(*)` capture consumed leading `(` characters but never
+        # confirmed where they closed, so a bare `)` anywhere later (TERMINATOR's
+        # own `)` alternative) could match the wrong closer: `(PERMS).length`
+        # wrongly resolved as "PERMS, operand ends at the `)`", silently
+        # ignoring the `.length` that follows it -- a false positive on
+        # exactly the honest scalar-read shape ScalarLengthReadHonest already
+        # covers unparenthesized. table_operand_end closes that gap by construction:
+        # a trailing chain after the paren closer, if any, is walked by
+        # chain_end from the true closer position, and if chain_end lands on
+        # `.length`/`[0]` (a scalar/element read, not an array-returning
+        # call), it returns unchanged and TERMINATOR then correctly refuses
+        # to match at that non-boundary position -- the same two-guard
+        # reasoning below, now applied consistently whether or not a paren
+        # wraps the name.
+        #
+        # Two independent guards, each sufficient alone, still reject
         # `PERMS.length`/`PERMS?.length`/`PERMSET`: the inline name-boundary
-        # lookahead `(?![\w$])` right below never lets `PERMS` match as a
-        # prefix of the longer identifier `PERMSET` in the first place; and
-        # even where the name DOES match cleanly (`PERMS.length`,
-        # `PERMS?.length`), chain_end sees `.`/`?.` with no following `(`,
-        # so it returns i UNCHANGED (not -1 -- there is no call to reject,
-        # only nothing to consume), and TERMINATOR then refuses to match at
-        # that position because the character right there is `.`/`?`, not a
-        # boundary. `rows ?? BACKUP_X.filter((r) => r.ok)` and
-        # `rows ?? BACKUP_Y.slice(0).reverse()` both resolve, because
-        # chain_end's balanced-paren walk consumes the whole call (arrow
-        # function body and all) and the chained second call in turn, landing
-        # exactly on the closing `)`/`;` that TERMINATOR accepts.
+        # lookahead `(?![\w$])` inside table_operand_end never lets `PERMS`
+        # match as a prefix of the longer identifier `PERMSET` in the first
+        # place; and even where the name DOES match cleanly (`PERMS.length`,
+        # `PERMS?.length`), chain_end sees `.`/`?.` with no following `(`, so
+        # it returns i UNCHANGED (not -1 -- there is no call to reject, only
+        # nothing to consume), and TERMINATOR then refuses to match at that
+        # position because the character right there is `.`/`?`, not a
+        # boundary. `rows ?? BACKUP_X.filter((r) => r.ok)`,
+        # `rows ?? BACKUP_Y.slice(0).reverse()`, and their parenthesized/cast
+        # forms (`rows ?? (BACKUP_X as Table[]).filter(...)`) all resolve,
+        # because chain_end's balanced-paren walk consumes the whole call
+        # (arrow function body and all) and any chained second call in turn,
+        # landing exactly on the closing `)`/`;` that TERMINATOR accepts.
         # [ \t]*, not \s*: \s* also matches a NEWLINE, so it would swallow a
         # missing-semicolon line break and let `$` match nothing right after
         # it (there is no re.M flag here) -- `const data = rows || BACKUP_Q`
@@ -1246,17 +1420,30 @@ def whole_file_findings(s):
         # `\r?\n(?!\s*(?:\??\.|\[))` alternative treats a newline as a
         # terminator ONLY when nothing that continues the chain follows it
         # (a bare newline ends the operand; `\n  .slice(0)` continues it, so
-        # chain_end must get the chance to consume that line first).
-        TERMINATOR = re.compile(r'[ \t]*(?:[)\]},;:]|\|\||\?\?|&&|\?(?![.?])|\bas\b|\r?\n(?!\s*(?:\??\.|\[))|$)')
-        for m in re.finditer(r'(?:\|\||\?\?)\s*(\(*)(' + name_alt + r')', s):
-            start = m.start(2)
-            name_m = re.match(r'^(' + name_alt + r')(?![\w$])', s[start:])
-            if not name_m:
+        # chain_end must get the chance to consume that line first). Defined
+        # once, above table_operand_end -- see that regex's own docstring
+        # comment there for why table_operand_end needs it too.
+        # The prefilter's leading-paren group is `(?:\(\s*)*`, not a bare
+        # `\(*`: it only has to land ON one of the parens wrapping the name
+        # (table_operand_end does the real resolution from there), but a bare
+        # `\(*` requires the name immediately after the last `(` with no
+        # whitespace, so a Prettier-formatted multi-line cast --
+        # `rows ?? (\n  BACKUP_ROWS\n).slice(1)` -- never matched this regex
+        # at all and was invisible to this site regardless of what
+        # table_operand_end could resolve. `\s*` after each `(` (matches a
+        # newline too, unlike TERMINATOR's `[ \t]*` -- there is no operand
+        # boundary concern here, only "find a position to start resolving
+        # from") fixes that without changing what table_operand_end itself
+        # accepts or rejects.
+        for m in re.finditer(r'(?:\|\||\?\?)\s*((?:\(\s*)*)(' + name_alt + r')', s):
+            start = m.start(1) if m.group(1) else m.start(2)
+            res = table_operand_end(s, start)
+            if not res:
                 continue
-            end = chain_end(s, start + name_m.end())
+            name, end = res
             if end < 0 or not TERMINATOR.match(s, end):
                 continue
-            flag_table_fallback(name_m.group(1), start)
+            flag_table_fallback(name, start)
         for m in re.finditer(r'(?<!\?)\?(?![.?:])', s):
             c = ternary_colon_of(s, m.start())
             if c < 0:
@@ -1271,21 +1458,44 @@ def whole_file_findings(s):
             # Resolve each branch back to a table name even with a trailing
             # array-returning call chain (`live ? live : BACKUP_ROWS2.slice(0)`,
             # `live ? live : BACKUP_X.filter((r) => r.ok)` -- reviewer 1's
-            # bypass of the old `^NAME$`-only match, and the round-3 chain gap)
-            # or parens/`as Type` (unwrap() above) -- but NOT a scalar/element
-            # read (`live ? live : TABS[0]`, `live ? live : TABS.length`),
-            # which resolves_to_table_read rejects because chain_end cannot
+            # bypass of the old `^NAME$`-only match, and the round-3 chain gap),
+            # a leading balanced paren group and/or `as Type` at any nesting
+            # depth (table_operand_end, shared with the ||/?? site above --
+            # `live ? live : (BACKUP_X as Row[]).slice(1)` resolves the same
+            # way `rows ?? (BACKUP_X as Row[]).slice(1)` does) -- but NOT a
+            # scalar/element read (`live ? live : TABS[0]`, `live ? live :
+            # TABS.length`, `live ? live : (TABS).length`), which
+            # resolves_to_table_read rejects because table_operand_end cannot
             # reach the end of the (already extracted, whole) branch text.
+            #
+            # resolves_to_table_read is called on the RAW branch text
+            # (q_branch_raw/colon_branch_raw, only trailing-whitespace
+            # stripped by q_raw/colon_raw's own extraction), NEVER on
+            # unwrap()'s output: unwrap() peels a paren layer only when it
+            # closes at the very LAST character of the branch, so it cannot
+            # by itself handle a trailing chain after the paren -- exactly
+            # the shape table_operand_end's own recursive peel exists to
+            # handle. Routing resolves_to_table_read's input through unwrap()
+            # first would make the ternary site accept fewer paren shapes
+            # than the ||/?? site (a cross-site divergence), since unwrap()
+            # would sometimes leave the string still wrapped and
+            # table_operand_end would then see a REDUNDANT but harmless outer
+            # `(`; routing it around unwrap() entirely keeps both sites
+            # calling table_operand_end on equivalent (paren-including) text.
+            # unwrap()'s output (q_branch/colon_branch) is still used for
+            # resolved_is_literal below, which never chain-walks and only
+            # needs ONE paren layer stripped for its own is_literal()/
+            # is_narrowing_self_derivation checks on the OTHER branch.
             # is_narrowing_self_derivation still decides, inside
             # resolved_is_literal, whether a SUFFIXED form on the OTHER
             # branch is exempt; here we only need to find which table the
             # flagged branch names. q_off/cstart still point at the RAW
             # (unstripped) offsets, since that is where the finding is
             # reported and where flag_table_fallback's span-dedupe operates.
-            q_name = resolves_to_table_read(q_branch)
+            q_name = resolves_to_table_read(q_raw.strip())
             if q_name and not resolved_is_literal(colon_branch, q_name):
                 flag_table_fallback(q_name, q_off)
-            colon_name = resolves_to_table_read(colon_branch)
+            colon_name = resolves_to_table_read(colon_branch_strip[:expr_end(colon_branch_strip)].strip())
             if colon_name and not resolved_is_literal(q_branch, colon_name):
                 flag_table_fallback(colon_name, cstart)
     for m in THIS_ARR.finditer(s):
@@ -2059,6 +2269,173 @@ export function DO({ opts }) {
   return <b>{o.retries}</b>;
 }
 TSX
+    # BACKLOG 125 B-5 REWORK ROUND 4 (S-29 2/2 CONCERN, confirmed finding):
+    # unwrap() (the ternary-branch paren/`as Type` stripper) only peeled a
+    # leading paren when its closer was the LAST character of the whole
+    # branch text (`close_of(t, 0) == len(t) - 1`), so a parenthesized/cast
+    # table reference followed by a chained method call slipped through
+    # completely undetected: the branch stayed wrapped in `(...)`, never
+    # matched as a bare table name, and never got a chance to chain-walk.
+    # Both fixed by table_operand_end, a single recursive paren-peel shared
+    # with the ||/?? site (see its own docstring for the mechanism).
+    cat > "$d/src/components/ParenAsChainSliceFallback.tsx" <<'TSX'
+const BACKUP_ROWS7 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PP1({ live }) {
+  const data = live ? live : (BACKUP_ROWS7 as Row[]).slice(1);
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/ParenChainFilterFallback.tsx" <<'TSX'
+const BACKUP_ROWS8 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PP2({ live }) {
+  const data = live ? live : (BACKUP_ROWS8).filter(r => r.ok);
+  return <b>{data.length}</b>;
+}
+TSX
+    # Companion false positive, same root cause: the ||/?? site's `(\(*)`
+    # prefix capture never confirmed where the leading paren it consumed
+    # actually CLOSED, so TERMINATOR's bare `)` alternative could match the
+    # FIRST `)` anywhere later in the source -- wrongly treating a
+    # parenthesized honest scalar/single-row read as "operand ends at this
+    # `)`" and silently ignoring the `.length`/`[0]` that actually follows.
+    # Unparenthesized siblings (ScalarLengthReadHonest, BareIndexPickHonest
+    # above) were already clean; only wrapping them in parens triggered the
+    # false positive. table_operand_end fixes this by finding the paren's
+    # TRUE closer via close_of first, then handing chain_end the position
+    # right after that closer -- `.length`/`[0]` there is a scalar/element
+    # read, not an array-returning call, so chain_end returns unchanged and
+    # TERMINATOR correctly refuses to match at that non-boundary position.
+    cat > "$d/src/components/ParenScalarLengthReadHonest.tsx" <<'TSX'
+const PERMS2 = [
+  { id: 'project.create', label: 'Create Projects', description: 'Create new projects' },
+];
+
+export function PL2({ count }) {
+  const n = count || (PERMS2).length;
+  return <b>{n}</b>;
+}
+TSX
+    cat > "$d/src/components/ParenBareIndexPickHonest.tsx" <<'TSX'
+const TABS4 = [
+  { id: 'a', label: 'A' },
+  { id: 'b', label: 'B' },
+];
+
+export function IP2({ sel }) {
+  const active = sel || (TABS4)[0];
+  return <b>{active.id}</b>;
+}
+TSX
+    # Same paren/chain gap, reached through a SPREAD element inside a
+    # fallback/ternary array literal instead of a bare operand:
+    # literal_rows_resolved's spread-element check (`[...NAME]`) did a bare
+    # `p[3:].strip() in module_tables` exact-string match, no chain-walk or
+    # paren-peel at all, so `[...TABLE.slice(0)]` and `[...TABLE.filter(...)]`
+    # (and even a bare `[...(TABLE)]`, parens with no chain) all failed to
+    # resolve and were silently skipped -- invisible to this arm. Fixed by
+    # routing the spread operand through resolves_to_table_read, the same
+    # function the ||/?? and ternary bare-operand sites already use.
+    cat > "$d/src/components/SpreadChainSliceFallback.tsx" <<'TSX'
+const BACKUP_ROWS9 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function SC1({ rows }) {
+  const data = rows || [...BACKUP_ROWS9.slice(0)];
+  return <b>{data.length}</b>;
+}
+TSX
+    cat > "$d/src/components/SpreadChainSliceTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS10 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function SC2({ live }) {
+  const data = live ? live : [...BACKUP_ROWS10.slice(0)];
+  return <b>{data.length}</b>;
+}
+TSX
+    # BACKLOG 125 B-5 REWORK ROUND 5: three self-found regressions from
+    # ROUND 4's own restructuring (table_operand_end/resolves_to_table_read
+    # split across two call sites), each isolated to exactly one gap.
+    #   1. The ||/?? site's prefilter regex required the name IMMEDIATELY
+    #      after the last `(` with no whitespace, so a Prettier-formatted
+    #      multi-line cast was never even found by the prefilter, regardless
+    #      of what table_operand_end could resolve once positioned.
+    cat > "$d/src/components/PrettyMultilineCastFallback.tsx" <<'TSX'
+const BACKUP_ROWS11 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PM({ rows }) {
+  const data = rows ?? (
+    BACKUP_ROWS11
+  ).slice(1);
+  return <b>{data.length}</b>;
+}
+TSX
+    #   2. table_operand_end's inner-paren check originally reused the SAME
+    #      TERMINATOR the top-level operand uses, which also treats a bare
+    #      `?`/`&&` as a boundary -- but inside a paren, hitting `||`/`??`
+    #      IS the table becoming the value (`(T || other)` evaluates to T
+    #      when T is a truthy non-empty array), while hitting `&&` or a bare
+    #      ternary `?` inside parens means T is used as a CONDITION, and the
+    #      whole group evaluates to something else entirely. This fixture
+    #      pins the CATCH (nested ||): dropping the narrower INNER_TERM back
+    #      to the broader TERMINATOR does not un-catch this one (both accept
+    #      `||`), so it is paired with the honest-negative-control fixture
+    #      below, which the broader TERMINATOR WOULD wrongly flag.
+    cat > "$d/src/components/ParenNestedOrTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS12 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function PN({ live, other }) {
+  const data = live ? live : (BACKUP_ROWS12 || other);
+  return <b>{data}</b>;
+}
+TSX
+    #   3. resolves_to_table_read's trailing `as Type` strip was moved to
+    #      operate on the WHOLE input text (needed for a bare, unparenthesized
+    #      cast: `live ? live : BACKUP_ROWS as Row[]`), but table_operand_end's
+    #      own paren-inner branch needs ITS OWN separate strip on the inner
+    #      text (`(BACKUP_ROWS as Row[])`'s inner is `BACKUP_ROWS as Row[]`,
+    #      never seen at the top level at all since it is inside the parens);
+    #      losing either one breaks exactly the cast form it alone covers.
+    #      This fixture pins the bare (unparenthesized), no-chain cast form.
+    cat > "$d/src/components/BareCastTernaryFallback.tsx" <<'TSX'
+const BACKUP_ROWS13 = [
+  { id: 'b1', action: 'Deployed', user: 'Admin', timestamp: 'now' },
+];
+
+export function BC({ live }) {
+  const data = live ? live : BACKUP_ROWS13 as Row[];
+  return <b>{data.length}</b>;
+}
+TSX
+    # Honest negative control for round-5 fix 2: `(TABLE && other)` and
+    # `(TABLE ? a : b)` never make TABLE the fallback VALUE -- `&&` and a bare
+    # ternary `?` use TABLE only as a truthiness CONDITION inside the parens,
+    # evaluating to `other`/`a`/`b` instead. Reusing the broader TERMINATOR
+    # (which treats `&&`/bare `?` as boundaries, correctly, at the TOP-LEVEL
+    # operand position) as the INNER-paren acceptance test as well would
+    # wrongly flag this honest, non-fallback shape.
+    cat > "$d/src/components/ParenAndConditionHonest.tsx" <<'TSX'
+const PERMS4 = [
+  { id: 'p1', label: 'A' },
+];
+
+export function PA({ x, other }) {
+  const data = x || (PERMS4 && other);
+  return <b>{data}</b>;
+}
+TSX
     rc=0; out="$(python3 "$MOAT_TMP/sample-panels.py" "$d/src" "$d/dash/components" 2>&1)" || rc=$?
     [ "$rc" = 1 ] || { echo "rules 6-9 scan exited $rc, want 1: $(tr '\n' ' ' <<<"$out" | head -c 200)"; return 1; }
     while IFS='|' read -r f want; do
@@ -2109,6 +2486,13 @@ ArrowFilterChainFallback.tsx:6|module-level table 'BACKUP_X' (fabricated rows) u
 SliceReverseChainFallback.tsx:6|module-level table 'BACKUP_Y' (fabricated rows) used as a fallback
 ArrowFilterChainTernaryFallback.tsx:6|module-level table 'BACKUP_Z' (fabricated rows) used as a fallback
 NewlineNoSemicolonFallback.tsx:6|module-level table 'BACKUP_Q' (fabricated rows) used as a fallback
+ParenAsChainSliceFallback.tsx:6|module-level table 'BACKUP_ROWS7' (fabricated rows) used as a fallback
+ParenChainFilterFallback.tsx:6|module-level table 'BACKUP_ROWS8' (fabricated rows) used as a fallback
+SpreadChainSliceFallback.tsx:6|literal sample rows used as a ||/?? fallback
+SpreadChainSliceTernaryFallback.tsx:6|literal sample rows in a ternary branch
+PrettyMultilineCastFallback.tsx:6|module-level table 'BACKUP_ROWS11' (fabricated rows) used as a fallback
+ParenNestedOrTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS12' (fabricated rows) used as a fallback
+BareCastTernaryFallback.tsx:6|module-level table 'BACKUP_ROWS13' (fabricated rows) used as a fallback
 EOF
     # Exact per-file counts: no extra finding anywhere, none on a look-alike.
     for want in TeamsVerbatim.tsx:3 RbacVerbatim.tsx:1 TemplateStats.tsx:3 ZeroFmt.tsx:4 Named.tsx:5 \
@@ -2124,12 +2508,18 @@ EOF
         SpreadOfTableTernaryFallback.tsx:1 \
         ArrowFilterChainFallback.tsx:1 SliceReverseChainFallback.tsx:1 ArrowFilterChainTernaryFallback.tsx:1 \
         NewlineNoSemicolonFallback.tsx:1 \
+        ParenAsChainSliceFallback.tsx:1 ParenChainFilterFallback.tsx:1 \
+        SpreadChainSliceFallback.tsx:1 SpreadChainSliceTernaryFallback.tsx:1 \
+        PrettyMultilineCastFallback.tsx:1 ParenNestedOrTernaryFallback.tsx:1 \
+        BareCastTernaryFallback.tsx:1 \
         DefaultProvidersSpreadHonest.tsx:0 \
         ScalarLengthReadHonest.tsx:0 ElementIndexReadHonest.tsx:0 FindReadHonest.tsx:0 \
         BareIndexPickHonest.tsx:0 DifferentIdentifierPrefixHonest.tsx:0 OptionalChainLengthHonest.tsx:0 \
         AdvisorOptsHonest.tsx:0 RenderLocalTabsHonest.tsx:0 DefaultProvidersHonest.tsx:0 \
         ModuleTablesHonest.tsx:0 TimerHonest.tsx:0 \
-        ModuleTableSelfDerivedHonest.tsx:0 ModuleTableDefaultOptsHonest.tsx:0; do
+        ModuleTableSelfDerivedHonest.tsx:0 ModuleTableDefaultOptsHonest.tsx:0 \
+        ParenScalarLengthReadHonest.tsx:0 ParenBareIndexPickHonest.tsx:0 \
+        ParenAndConditionHonest.tsx:0; do
         f="${want%%:*}"
         got="$(grep -c "^FINDING [a-z/]*$f:" <<<"$out")"
         [ "$got" = "${want##*:}" ] \
