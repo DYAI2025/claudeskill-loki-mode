@@ -486,4 +486,31 @@ real-fix count directly instead, and only worry about the ratio if
 merge/fix throughput ALSO drops. Continue the CI-health and
 agent-health vigilance from this window (checking actual job status
 and actual transcript timestamps, not just top-level run/task status)
+
+### Drift audit (turn 48, 6-hour window)
+
+**Matched CONTROL.md:** merged-slice throughput held (5 merges this
+window: S-40, S-41, GF-4, S-09, S-27, plus S-43), consistent with the
+turn-42 correction to track merges over the docs-ratio. Review rigor
+held under pressure: S-31 got a genuine CONCERN (undisclosed
+useCallback/nested-call bypasses) despite an unusually thorough
+disclosure from its builder, and rework was dispatched rather than
+waved through on "the builder was honest about most of it."
+
+**Drifted:** "Shell tests (shard 2/4)" has now hung 3 times in this
+session (BACKLOG 143, filed turn 42), always the same shard index --
+strong enough evidence now to treat this as a structural CI issue
+worth a dedicated fix slice, not just a watch-and-cancel pattern.
+NO_RECENT_RELEASE has been the standing top violation for over 4 hours
+(242+ minutes at last check) -- multiple turns correctly recognized
+this and stated intent to release, but each was preempted by a
+review/merge landing first. The stated intent has not yet converted
+to action.
+
+**Correction for the next 6 hours:** cut BACKLOG 143 as a dedicated
+ready slice (per-suite timeout instrumentation inside the shard
+runner) rather than continuing to treat each hang as a one-off. On
+NO_RECENT_RELEASE specifically: the next time CI goes green, cut the
+release BEFORE dispatching or merging anything else that turn, even if
+something else is mid-review -- the queue will still be there after.
 since it just paid off twice.
