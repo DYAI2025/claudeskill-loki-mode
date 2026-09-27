@@ -99,6 +99,16 @@
 #   PULSE_CACHE         "0" disables the network cache below (default: on).
 #   PULSE_CACHE_DIR     cache directory (default: $PULSE_REPO_ROOT/.loki/pulse-cache,
 #                       gitignored via .loki/).
+#   PULSE_LOAD_MAX      HIGH_LOAD threshold override (default: 28, 2x 14 cores).
+#   PULSE_LOADAVG       overrides the 1-minute load average reading (default:
+#                       `sysctl -n vm.loadavg` on macOS, /proc/loadavg on Linux).
+#   PULSE_PS_OUTPUT     overrides `ps -eo pid,ppid,etime,command` for ORPHAN_TEST.
+#   PULSE_DOCKER_PS     overrides the docker container listing for
+#                       STRAY_CONTAINER (see that check's own docstring for
+#                       the tab-separated row shape).
+#   PULSE_RELEASE_TESTS overrides the gh-run-list JSON RELEASE_ON_RED reads
+#                       for the newest VERSION-bump commit's Tests conclusion
+#                       (default: read from S-104's gh_ci cache).
 #
 # Network cache (S-104: this runs as a UserPromptSubmit hook on every prompt,
 # on a machine with ~16 concurrent agents, and a 15s hook timeout was being
@@ -383,8 +393,9 @@ NOW = now_epoch()
 # docs/v10/CONTROL.md's Rule says the first action of every turn addresses
 # the TOP violation -- an accidental ordering-by-discovery would misrank it.
 VIOLATION_PRIORITY = [
-    "CI_RED", "CI_CANCELLED_STREAK", "MOAT_REGRESSION", "UNRELEASED_MERGE",
-    "TRAIN_LATE", "REVIEW_STALE", "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM",
+    "CI_RED", "CI_CANCELLED_STREAK", "RELEASE_ON_RED", "HIGH_LOAD",
+    "MOAT_REGRESSION", "UNRELEASED_MERGE", "TRAIN_LATE", "REVIEW_STALE",
+    "AGENT_OVER_BUDGET", "UNEVIDENCED_CLAIM", "ORPHAN_TEST", "STRAY_CONTAINER",
     "IDLE_BUILDERS", "LOW_READY", "NO_RECENT_RELEASE", "LOW_RELEASE_VOLUME",
     "CONTROL_OVERSIZE",
 ]
@@ -1677,15 +1688,332 @@ else:
         )
 
 
+# --- 10. HIGH_LOAD: 1-min load average over 2x core count (D28 rule 3) ------
+_LOAD_CORES = 14
+_LOAD_DEFAULT_MAX = float(_LOAD_CORES * 2)  # 28
+
+
+def read_loadavg():
+    """1-minute load average as a float, or None. PULSE_LOADAVG overrides
+    with a raw string (a bare number, or a full 'sysctl'/'/proc/loadavg'
+    style line -- only the first number is used) so tests never depend on
+    real machine load. Otherwise: `sysctl -n vm.loadavg` on macOS
+    ('{ 1.20 3.40 5.60 }') or a direct read of /proc/loadavg on Linux
+    ('1.20 3.40 5.60 3/456 789') -- the latter is a plain file, no subprocess
+    needed."""
+    override = os.environ.get("PULSE_LOADAVG", "")
+    if override.strip():
+        text = override
+    elif sys.platform == "darwin":
+        rc, out, _ = run_capped(["sysctl", "-n", "vm.loadavg"])
+        if rc != 0:
+            return None
+        text = out
+    else:
+        try:
+            with open("/proc/loadavg", "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return None
+    m = re.search(r"[\d.]+", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def check_high_load():
+    load = read_loadavg()
+    if load is None:
+        return None
+    max_load = float(os.environ.get("PULSE_LOAD_MAX", "") or _LOAD_DEFAULT_MAX)
+    return {"load": load, "max": max_load}
+
+
+high_load = safe(check_high_load)
+if high_load is None:
+    mark_unknown("high_load")
+    emit("1-min load average: UNKNOWN (could not read vm.loadavg/proc.loadavg)")
+else:
+    emit("1-min load average: %.2f (max %.0f)" % (high_load["load"], high_load["max"]))
+    if high_load["load"] > high_load["max"]:
+        add_violation(
+            "HIGH_LOAD",
+            "1-minute load average %.2f is above the %.0f max (2x core count, D28)"
+            % (high_load["load"], high_load["max"]),
+        )
+
+
+# --- 11. ORPHAN_TEST: an orphaned or long-running tests/* process (D28) -----
+_ORPHAN_TEST_RE = re.compile(r"tests/\S+\.(?:sh|py)\b")
+_ORPHAN_MAX_MIN = 30.0
+
+
+def parse_etime_minutes(etime):
+    """ps etime shapes: 'SS', 'MM:SS', 'HH:MM:SS', 'DD-HH:MM:SS'. Returns
+    minutes, or None if unparseable."""
+    etime = etime.strip()
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", etime)
+    if not m:
+        return None
+    days, hours, minutes, seconds = (int(x) if x else 0 for x in m.groups(default="0"))
+    return days * 1440.0 + hours * 60.0 + minutes + seconds / 60.0
+
+
+def check_orphan_tests():
+    """Returns a list of (pid, etime, command) for a tests/*.sh or
+    tests/*.py process that is either parentless (PPID 1) or has run past
+    the 30-minute budget, or None if the process listing itself could not be
+    read. Never kills anything -- reporting only."""
+    override = os.environ.get("PULSE_PS_OUTPUT")
+    if override is not None:
+        text = override
+    else:
+        rc, out, _ = run_capped(["ps", "-eo", "pid,ppid,etime,command"])
+        if rc != 0:
+            return None
+        text = out
+    orphans = []
+    for line in text.splitlines()[1:]:  # skip the ps header line
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, ppid, etime, command = parts
+        if not _ORPHAN_TEST_RE.search(command):
+            continue
+        age_min = parse_etime_minutes(etime)
+        if ppid == "1" or (age_min is not None and age_min > _ORPHAN_MAX_MIN):
+            orphans.append((pid, etime, command.strip()))
+    return orphans
+
+
+orphan_tests = safe(check_orphan_tests)
+if orphan_tests is None:
+    mark_unknown("orphan_tests")
+    emit("Orphan test processes: UNKNOWN (ps check failed)")
+else:
+    emit("Orphan test processes: %d" % len(orphan_tests))
+    for pid, etime, command in orphan_tests:
+        add_violation(
+            "ORPHAN_TEST",
+            "pid %s etime %s: %s" % (pid, etime, command),
+        )
+
+
+# --- 12. STRAY_CONTAINER: an old or misconfigured swarm container (D28) ----
+_STRAY_NAME_PREFIXES = ("s1", "loki-", "kind-")
+_STRAY_MAX_AGE_MIN = 60.0
+
+
+def _parse_running_for_minutes(text):
+    """docker ps's RunningFor column: '45 minutes ago', '3 hours ago',
+    'About an hour ago', etc. Bucketed by unit -- good enough for a 1-hour
+    threshold, never exact to the second."""
+    text = text.strip().lower()
+    if "about an hour" in text:
+        return 60.0
+    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?", text)
+    if not m:
+        return None
+    mult = {
+        "second": 1 / 60.0, "minute": 1.0, "hour": 60.0, "day": 1440.0,
+        "week": 10080.0, "month": 43200.0, "year": 525600.0,
+    }[m.group(2)]
+    return int(m.group(1)) * mult
+
+
+def check_stray_containers():
+    """Returns a list of (name, id, age_min, restart_policy) for a container
+    that either matches the swarm naming/label convention and is older than
+    1h, or matches it and carries a restart policy other than 'no' (any
+    age) -- or [] with nothing to report. None only on a real check
+    failure; docker simply not installed/not running is a quiet skip (this
+    machine has no swarm containers to protect), never a violation or an
+    UNKNOWN metric.
+
+    PULSE_DOCKER_PS overrides the entire listing as tab-separated rows
+    "id\\tname\\tage_minutes\\tlabel\\trestart_policy" -- one override
+    covers both real subprocess calls below (docker ps for name/age/label,
+    then one batched docker inspect for restart policy, since `docker ps`'s
+    container-list API has no HostConfig field to read a restart policy
+    from at all)."""
+    override = os.environ.get("PULSE_DOCKER_PS")
+    if override is not None:
+        rows = []
+        for line in override.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 5:
+                continue
+            cid, name, age_raw, label, policy = parts
+            try:
+                age = float(age_raw)
+            except ValueError:
+                age = None
+            rows.append((cid, name, age, label, policy or None))
+    else:
+        rc, out, _ = run_capped([
+            "docker", "ps", "-a", "--format",
+            '{{.ID}}\t{{.Names}}\t{{.RunningFor}}\t{{.Label "loki.swarm"}}',
+        ])
+        if rc is None or rc != 0:
+            # Not installed, daemon not running, or timed out: skip quietly.
+            return []
+        rows = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) != 4:
+                continue
+            cid, name, running_for, label = parts
+            rows.append((cid, name, _parse_running_for_minutes(running_for), label, None))
+
+    candidates = [
+        r for r in rows
+        if any(r[1].startswith(p) for p in _STRAY_NAME_PREFIXES) or r[3] == "1"
+    ]
+    if not candidates:
+        return []
+
+    if override is None:
+        ids = [r[0] for r in candidates]
+        rc, out, _ = run_capped(
+            ["docker", "inspect", "--format", "{{.Id}}\t{{.HostConfig.RestartPolicy.Name}}"] + ids
+        )
+        policy_by_id = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) == 2:
+                    policy_by_id[parts[0]] = parts[1]
+        candidates = [
+            (cid, name, age, label, policy_by_id.get(cid, policy))
+            for cid, name, age, label, policy in candidates
+        ]
+
+    fired = [
+        (name, cid, age, policy)
+        for cid, name, age, label, policy in candidates
+        if (age is not None and age > _STRAY_MAX_AGE_MIN) or (policy and policy.lower() != "no")
+    ]
+    return fired
+
+
+stray_containers = safe(check_stray_containers)
+if stray_containers is None:
+    mark_unknown("stray_containers")
+    emit("Stray swarm containers: UNKNOWN (docker ps check failed)")
+else:
+    emit("Stray swarm containers: %d" % len(stray_containers))
+    for name, cid, age, policy in stray_containers:
+        reasons = []
+        if age is not None and age > _STRAY_MAX_AGE_MIN:
+            reasons.append("age %.0f min" % age)
+        if policy and policy.lower() != "no":
+            reasons.append("restart policy %s" % policy)
+        add_violation(
+            "STRAY_CONTAINER",
+            "%s (%s): %s" % (name, cid[:12], ", ".join(reasons)),
+        )
+
+
+# --- 13. RELEASE_ON_RED: the newest VERSION bump on main has red Tests -----
+# (D28 rule 2 / S-108's own release-time guard; this is the pulse-side
+# early-warning companion.) Reuses S-104's gh_ci cache -- keyed by the SHA
+# it was fetched for -- rather than making its own network call: a fresh
+# CI_RED check already paid for that call this pulse (or a recent one), and
+# this only needs it when the VERSION-bump commit happens to be that same
+# SHA. A different SHA (VERSION bumped, then more commits landed) means the
+# cache cannot answer this question, so it reports UNKNOWN rather than a
+# stale or wrong guess -- never a false clean.
+_VERSION_SHA_UNKNOWN = object()  # the git call itself failed, distinct from
+                                  # "it succeeded and VERSION has no history"
+
+
+def resolve_version_bump_sha():
+    rc, out, _ = git(["log", "-1", "--format=%H", MAIN_REF, "--", "VERSION"])
+    if rc != 0:
+        return _VERSION_SHA_UNKNOWN
+    sha = out.strip()
+    return sha or None  # None: no commit ever touched VERSION on this ref -- n/a, not unknown
+
+
+def _tests_conclusion_from_runs(runs_json):
+    """Parse a gh-run-list JSON array (status, conclusion, workflowName) and
+    return the Tests workflow's conclusion for its most recent completed
+    run, or None if no completed Tests run is present in the data."""
+    try:
+        runs = json.loads(runs_json)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if run.get("workflowName") != "Tests" or run.get("status") != "completed":
+            continue
+        return run.get("conclusion")
+    return None
+
+
+def check_release_on_red():
+    version_sha = safe(resolve_version_bump_sha)
+    if version_sha is _VERSION_SHA_UNKNOWN:
+        return None
+    if version_sha is None:
+        return {"sha": None, "conclusion": None, "na": True}
+    override = os.environ.get("PULSE_RELEASE_TESTS")
+    if override is not None:
+        return {"sha": version_sha, "conclusion": _tests_conclusion_from_runs(override)}
+    rec, _age = cache_read("gh_ci")
+    if rec is None or rec.get("sha") != version_sha:
+        return {"sha": version_sha, "conclusion": None}
+    return {"sha": version_sha, "conclusion": _tests_conclusion_from_runs(rec.get("out", ""))}
+
+
+release_on_red = safe(check_release_on_red)
+if release_on_red is None:
+    mark_unknown("release_on_red")
+    emit("Release-on-red (newest VERSION bump on %s): UNKNOWN (could not resolve the VERSION-bump commit)" % MAIN_REF)
+elif release_on_red.get("na"):
+    emit("Release-on-red (newest VERSION bump on %s): n/a (no commit has ever touched VERSION)" % MAIN_REF)
+elif release_on_red["conclusion"] is None:
+    mark_unknown("release_on_red")
+    emit(
+        "Release-on-red (newest VERSION bump on %s, %s): UNKNOWN (no cached/overridden Tests result for that SHA)"
+        % (MAIN_REF, release_on_red["sha"][:8])
+    )
+else:
+    emit(
+        "Release-on-red (newest VERSION bump on %s, %s): Tests %s"
+        % (MAIN_REF, release_on_red["sha"][:8], release_on_red["conclusion"].upper())
+    )
+    if release_on_red["conclusion"] in ("failure", "cancelled"):
+        add_violation(
+            "RELEASE_ON_RED",
+            "the newest VERSION-bump commit on %s (%s) has a %s Tests run"
+            % (MAIN_REF, release_on_red["sha"][:8], release_on_red["conclusion"]),
+        )
+
+
 _NEXT_ACTION_TEXT = {
     "CI_RED": "investigate and fix the red main CI run before anything else",
     "CI_CANCELLED_STREAK": "investigate why Tests keeps getting cancelled on main before anything else",
+    "RELEASE_ON_RED": "do not release from this VERSION-bump commit until its Tests run is green (D28 rule 2)",
+    "HIGH_LOAD": "reduce load now: stop non-essential agents/containers, the machine is over 2x its core count (D28)",
     "MOAT_REGRESSION": "identify which moat property regressed and revert or fix it before any further merge",
     "UNRELEASED_MERGE": "cut a release now, main has been unreleased past the 30-minute budget",
     "TRAIN_LATE": "push a release train now, merged-unreleased commits exist and cadence has slipped past the 25-minute budget",
     "REVIEW_STALE": "escalate or finish review for the named slice(s), they have exceeded the 45-minute budget",
     "AGENT_OVER_BUDGET": "check in on the named agent(s), they have exceeded their role/tier time budget",
     "UNEVIDENCED_CLAIM": "add a command/output citation to the named line(s) or retract the claim (D26 guard 4)",
+    "ORPHAN_TEST": "investigate the named orphaned/long-running test process; stop by exact PID only if confirmed stale, never by name or pattern",
+    "STRAY_CONTAINER": "remove or fix the named swarm container: capped resources, restart policy 'no', removed when done (D28)",
     "IDLE_BUILDERS": "dispatch more builders against the named ready slice(s) in docs/v10/BOARD.md",
     "LOW_READY": "the Product Owner should cut the named number of additional slices onto the ready queue",
     "NO_RECENT_RELEASE": "cut a release now, none has shipped in over 90 minutes",

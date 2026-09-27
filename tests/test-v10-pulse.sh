@@ -189,6 +189,16 @@ COMMON_ARGS=(
     # host state instead of the fixture. Dedicated TRAIN_LATE tests (T29)
     # override this explicitly.
     "PULSE_PUSH_LOG_DIR=$WORK/no-such-push-logs"
+    # S-109: without these, HIGH_LOAD/ORPHAN_TEST/STRAY_CONTAINER would read
+    # THIS machine's real load, process table and docker daemon, making
+    # exact-VIOLATION assertions depend on host state instead of the
+    # fixture (a real stray container or a loaded CI box would fire them
+    # unpredictably). Dedicated tests (T34-T36) override these explicitly.
+    # No PULSE_RELEASE_TESTS default needed: FAKE_REPO never touches VERSION,
+    # so RELEASE_ON_RED reads n/a rather than UNKNOWN (see resolve_version_bump_sha).
+    "PULSE_LOADAVG=1.00 1.00 1.00"
+    "PULSE_PS_OUTPUT=  PID  PPID     ELAPSED COMMAND"
+    "PULSE_DOCKER_PS="
 )
 
 assert_exact_violations() {
@@ -1517,6 +1527,8 @@ T33_ARGS=(
     "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")" "PULSE_MOAT_RESULT="
     "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"
     "PULSE_PUSH_LOG_DIR=$WORK/no-such-push-logs" "PULSE_CACHE_DIR=$CACHE"
+    "PULSE_LOADAVG=1.00 1.00 1.00" "PULSE_PS_OUTPUT=  PID  PPID     ELAPSED COMMAND"
+    "PULSE_DOCKER_PS="
 )
 # wait_refresh: poll (max ~10s) until the background refresher removed its pid file.
 wait_refresh() {
@@ -1577,6 +1589,128 @@ if [ "$rc" = 2 ] \
     ok "missing cache: UNKNOWN (exit 2), no fabricated value, background refresh started"
 else
     bad "T33c missing-cache case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T34 -- D28 rule 3: HIGH_LOAD fires when the 1-min load average is above PULSE_LOAD_MAX (default 28)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_LOADAVG=35.20 10.00 5.00"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: HIGH_LOAD: 1-minute load average 35.20 is above the 28 max"; then
+    ok "1-min load average above the default 28 max fires HIGH_LOAD"
+else
+    bad "T34 HIGH_LOAD-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T34b -- HIGH_LOAD does not fire under a raised PULSE_LOAD_MAX (same load as T34)"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")" "PULSE_LOADAVG=35.20 10.00 5.00" "PULSE_LOAD_MAX=50"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: HIGH_LOAD"; then
+    ok "PULSE_LOAD_MAX override raises the threshold, same load no longer fires"
+else
+    bad "T34b HIGH_LOAD-no-fire case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T35 -- D28 rule 3: ORPHAN_TEST fires on a tests/*.sh|py process with PPID 1, or running past 30 min"
+ORPHAN_PS_FIRE="  PID  PPID     ELAPSED COMMAND
+  100     1      00:02:00 tests/test-a.sh --flag
+  200  6789      00:45:00 tests/test-b.py --slow"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_PS_OUTPUT=$ORPHAN_PS_FIRE"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: ORPHAN_TEST: pid 100 etime 00:02:00: tests/test-a.sh --flag" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: ORPHAN_TEST: pid 200 etime 00:45:00: tests/test-b.py --slow"; then
+    ok "a parentless (PPID 1) tests/ process and a 45-minute-old one both fire ORPHAN_TEST, PID/etime/command reported, never killed"
+else
+    bad "T35 ORPHAN_TEST-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T35b -- ORPHAN_TEST does not fire on a normal tests/ process, or a parentless non-tests process"
+ORPHAN_PS_CLEAN="  PID  PPID     ELAPSED COMMAND
+  300  6789      00:02:00 tests/test-c.sh
+  400     1      00:01:00 some-other-daemon --arg"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")" "PULSE_PS_OUTPUT=$ORPHAN_PS_CLEAN"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: ORPHAN_TEST"; then
+    ok "a short-lived non-parentless tests/ process, and a parentless non-tests process, neither fires ORPHAN_TEST"
+else
+    bad "T35b ORPHAN_TEST-no-fire case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T36 -- D28 rule 3: STRAY_CONTAINER fires on a swarm container over 1h old, or with a non-'no' restart policy"
+DOCKER_PS_FIRE="abc123456789	loki-build-9	90		no
+def456789abc	s1-worker	5		always"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_DOCKER_PS=$DOCKER_PS_FIRE"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: STRAY_CONTAINER: loki-build-9 (abc123456789): age 90 min" \
+    && printf '%s\n' "$OUT" | grep -qF "VIOLATION: STRAY_CONTAINER: s1-worker (def456789abc): restart policy always"; then
+    ok "a container over 1h old, and a container with a non-'no' restart policy, both fire STRAY_CONTAINER"
+else
+    bad "T36 STRAY_CONTAINER-fires case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T36b -- STRAY_CONTAINER does not fire on a recent compliant container, or a non-swarm-named one"
+DOCKER_PS_CLEAN="111122223333	loki-build-1	30		no
+444455556666	unrelated-app	200		no"
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")" "PULSE_DOCKER_PS=$DOCKER_PS_CLEAN"; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: STRAY_CONTAINER"; then
+    ok "a recent compliant swarm container, and an old non-swarm-named container, neither fires STRAY_CONTAINER"
+else
+    bad "T36b STRAY_CONTAINER-no-fire case: rc=$rc output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T37 -- D28 rule 2: RELEASE_ON_RED fires when the newest VERSION-bump commit's cached Tests conclusion is failure/cancelled"
+RELEASE_REPO="$WORK/release-repo"
+mkdir -p "$RELEASE_REPO"
+(
+    cd "$RELEASE_REPO" || exit 1
+    git init -q -b main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    printf '9.0.0\n' > VERSION
+    git add VERSION
+    GIT_AUTHOR_DATE="2026-09-27T00:00:00Z" GIT_COMMITTER_DATE="2026-09-27T00:00:00Z" \
+        git commit -q -m "release: v9.0.0"
+)
+RELEASE_ARGS=(
+    "PULSE_REPO_ROOT=$RELEASE_REPO" "PULSE_MAIN_REF=main"
+    "BOARD_MD=$BOARD_CLEAN" "CONTROL_MD=$CONTROL_OK"
+    "PULSE_NPM_CMD=false" "PULSE_GH_CMD=false" "PULSE_GH_STREAK_CMD=cat $GH_STREAK_OK_JSON"
+    "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$RELEASE_REPO" "${WT_CLEAN[@]}")" "PULSE_MOAT_RESULT="
+    "PULSE_SWARM_START=2026-09-26T23:00Z" "PULSE_NOW=2026-09-27T02:00:00Z"
+    "PULSE_PUSH_LOG_DIR=$WORK/no-such-push-logs"
+    "PULSE_LOADAVG=1.00 1.00 1.00" "PULSE_PS_OUTPUT=  PID  PPID     ELAPSED COMMAND"
+    "PULSE_DOCKER_PS="
+)
+RELEASE_SHA="$(cd "$RELEASE_REPO" && git rev-parse HEAD)"
+if run_pulse "${RELEASE_ARGS[@]}" 'PULSE_RELEASE_TESTS=[{"status":"completed","conclusion":"failure","workflowName":"Tests"}]'; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: RELEASE_ON_RED: the newest VERSION-bump commit on main (${RELEASE_SHA:0:8}) has a failure Tests run"; then
+    ok "a failure Tests conclusion for the VERSION-bump SHA fires RELEASE_ON_RED"
+else
+    bad "T37 RELEASE_ON_RED-failure case: rc=$rc sha=$RELEASE_SHA output follows"
+    printf '%s\n' "$OUT"
+fi
+if run_pulse "${RELEASE_ARGS[@]}" 'PULSE_RELEASE_TESTS=[{"status":"completed","conclusion":"cancelled","workflowName":"Tests"}]'; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "VIOLATION: RELEASE_ON_RED: the newest VERSION-bump commit on main (${RELEASE_SHA:0:8}) has a cancelled Tests run"; then
+    ok "a cancelled Tests conclusion for the VERSION-bump SHA also fires RELEASE_ON_RED"
+else
+    bad "T37 RELEASE_ON_RED-cancelled case: rc=$rc sha=$RELEASE_SHA output follows"
+    printf '%s\n' "$OUT"
+fi
+
+echo "T37b -- RELEASE_ON_RED does not fire on a success Tests conclusion, and reads n/a with no VERSION history"
+if run_pulse "${RELEASE_ARGS[@]}" 'PULSE_RELEASE_TESTS=[{"status":"completed","conclusion":"success","workflowName":"Tests"}]'; then rc=0; else rc=$?; fi
+if ! printf '%s\n' "$OUT" | grep -q "^VIOLATION: RELEASE_ON_RED" \
+    && printf '%s\n' "$OUT" | grep -qF "Release-on-red (newest VERSION bump on main, ${RELEASE_SHA:0:8}): Tests SUCCESS"; then
+    ok "a success Tests conclusion for the VERSION-bump SHA does not fire RELEASE_ON_RED"
+else
+    bad "T37b RELEASE_ON_RED-success case: rc=$rc sha=$RELEASE_SHA output follows"
+    printf '%s\n' "$OUT"
+fi
+if run_pulse "${COMMON_ARGS[@]}" "BOARD_MD=$BOARD_CLEAN" "PULSE_WORKTREE_CMD=$(worktree_cmd_for "$FAKE_REPO" "${WT_CLEAN[@]}")"; then rc=0; else rc=$?; fi
+if printf '%s\n' "$OUT" | grep -qF "Release-on-red (newest VERSION bump on main): n/a (no commit has ever touched VERSION)"; then
+    ok "FAKE_REPO has no VERSION history: RELEASE_ON_RED reads n/a, never UNKNOWN, never a false violation"
+else
+    bad "T37b no-version-history case: rc=$rc output follows"
     printf '%s\n' "$OUT"
 fi
 
