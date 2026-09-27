@@ -331,6 +331,70 @@ class ContentCompareCannotBeHiddenByALineSeparatorSwap(unittest.TestCase):
         self.assertNotEqual(rc, 0, "package.json content drift was not caught")
 
 
+@unittest.skipIf(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                  "git not available")
+class ChangelogIsCheckedAsInsertOnly(unittest.TestCase):
+    """Round 3.1: a plain 'old bytes are a suffix of new' prepend check
+    rejects every real release, because this repo's CHANGELOG.md keeps one
+    shared header above ALL entries rather than repeating it per release. The
+    replacement locates the parent's first '## v' heading and requires
+    everything before and after it to be byte-unchanged, with exactly one
+    new block -- opening with the new version heading -- inserted between
+    them."""
+
+    HEADER = b"# Changelog\n\nKeep a Changelog.\n\n"
+    OLD_ENTRY = b"## v9.55.0\n\nold entry body.\n"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="s84-changelog-")
+        _git(self.repo, "init", "-q", "-b", "main", ".")
+        _write(self.repo, "VERSION", "9.55.0\n")
+        _write(self.repo, "CHANGELOG.md", self.HEADER + self.OLD_ENTRY)
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        self.parent = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                                      capture_output=True, text=True).stdout.strip()
+
+    def _release(self, changelog_bytes):
+        _write(self.repo, "VERSION", "9.56.0\n")
+        _write(self.repo, "CHANGELOG.md", changelog_bytes)
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "release")
+        sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        return _run_eligibility(self.repo, self.parent, sha)
+
+    def test_a_valid_insert_is_eligible(self):
+        new_entry = b"## v9.56.0\n\nnew entry body.\n\n"
+        rc, err = self._release(self.HEADER + new_entry + self.OLD_ENTRY)
+        self.assertEqual(rc, 0, err)
+
+    def test_insert_in_the_wrong_place_is_not_eligible(self):
+        """The new block must sit directly after the header, immediately
+        before the parent's own first heading -- not appended at the end or
+        buried inside the old entry."""
+        new_entry = b"## v9.56.0\n\nnew entry body.\n\n"
+        rc, _ = self._release(self.HEADER + self.OLD_ENTRY + new_entry)
+        self.assertNotEqual(rc, 0, "an append-at-the-end insert was accepted")
+
+    def test_modified_old_entry_is_not_eligible(self):
+        new_entry = b"## v9.56.0\n\nnew entry body.\n\n"
+        tampered_old = self.OLD_ENTRY.replace(b"old entry body.", b"REWRITTEN.")
+        rc, _ = self._release(self.HEADER + new_entry + tampered_old)
+        self.assertNotEqual(rc, 0, "a rewritten old entry was accepted")
+
+    def test_deleted_old_entry_is_not_eligible(self):
+        new_entry = b"## v9.56.0\n\nnew entry body.\n\n"
+        rc, _ = self._release(self.HEADER + new_entry)
+        self.assertNotEqual(rc, 0, "deleting the old entry was accepted")
+
+    def test_header_edit_is_not_eligible(self):
+        new_entry = b"## v9.56.0\n\nnew entry body.\n\n"
+        tampered_header = self.HEADER.replace(b"Keep a Changelog.", b"Keep a Changelog!!")
+        rc, _ = self._release(tampered_header + new_entry + self.OLD_ENTRY)
+        self.assertNotEqual(rc, 0, "an edited header was accepted")
+
+
 @unittest.skipIf(subprocess.run(["bash", "--version"], capture_output=True).returncode != 0,
                   "bash not available")
 class ReleaseShaPriorityOrderIsCorrected(unittest.TestCase):

@@ -116,10 +116,14 @@ jobs:
   # delete, or mode/type change disqualifies even an allowlisted path), AND
   # each changed file's own RAW BYTES normalize to identical once the old and
   # new VERSION literal (each required to match `^\d+\.\d+\.\d+$`, round 3) is
-  # substituted for a placeholder -- CHANGELOG.md instead has to be a
-  # prepend-only edit (its old bytes must be a byte-suffix of the new ones,
-  # round 3, replacing a blanket content exemption that a full-file rewrite
-  # could pass through). A file that fails its check disqualifies reuse for
+  # substituted for a placeholder -- CHANGELOG.md instead has to be an
+  # insert-only edit (round 3.1: exactly one new block, opening with
+  # "## v<NEW_VERSION>", inserted immediately before the parent's own first
+  # "## v<OLD_VERSION>" heading, with the shared header above it and every
+  # existing entry below it byte-for-byte unchanged -- a plain "old bytes are
+  # a suffix of new" check rejected every real release here, because this
+  # repo's CHANGELOG.md keeps one shared header above all entries rather than
+  # repeating it per release). A file that fails its check disqualifies reuse for
   # everything, not just itself. This is a fail-closed eligibility gate, not a
   # substitute for (b): a completed failure at the release SHA always wins
   # over reuse, and reuse never wins over a success or failure already
@@ -251,6 +255,7 @@ jobs:
           # this can match at most once, at the last line, so it can never be
           # used to splice a hidden line in anywhere else in the file.
           DEBUG_ID_TRAILER = re.compile(rb"(?:\r\n|\r|\n)?//# debugId=[0-9A-Fa-f-]+[ \t]*(?:\r\n|\r|\n)?\Z")
+          CHANGELOG_HEADING = re.compile(rb"(?m)^## v")
 
           def fail(msg):
               print("normalizer: " + msg, file=sys.stderr)
@@ -310,11 +315,29 @@ jobs:
                   fail(f"could not read {path} on one side")
 
               if path == "CHANGELOG.md":
-                  # Prepend-only: the new entry goes at the top, so the old
-                  # file's exact bytes must still be present as the tail of
-                  # the new one. A full rewrite (not just a prepend) fails.
-                  if not new_b.endswith(old_b):
-                      fail("CHANGELOG.md is not prepend-only")
+                  # Insert-only: real entries are prepended AFTER a shared
+                  # header (title + Keep-a-Changelog blurb), not at byte 0, so
+                  # a plain "old is a suffix of new" check rejects every real
+                  # release. Instead: locate the parent's FIRST "## v" heading
+                  # (line-anchored) -- everything before it is the header,
+                  # everything from it onward is the old entries, and BOTH
+                  # must appear byte-for-byte unchanged in the new file, with
+                  # exactly one inserted block between them. That block must
+                  # itself open with "## v<NEW_VERSION>", and it is
+                  # immediately followed by the parent's old first heading
+                  # ("## v<OLD_VERSION>") by construction of the slice below.
+                  m = CHANGELOG_HEADING.search(old_b)
+                  if not m:
+                      fail("CHANGELOG.md has no '## v' heading to anchor the insert-only check")
+                  old_header, old_rest = old_b[:m.start()], old_b[m.start():]
+                  if not old_rest.startswith(b"## v" + old_ver):
+                      fail("CHANGELOG.md's first heading does not match VERSION")
+                  if not (new_b.startswith(old_header) and new_b.endswith(old_rest)
+                          and len(new_b) >= len(old_header) + len(old_rest)):
+                      fail("CHANGELOG.md is not insert-only (header or existing entries changed)")
+                  inserted = new_b[len(old_header):len(new_b) - len(old_rest)]
+                  if not inserted.startswith(b"## v" + new_ver):
+                      fail("CHANGELOG.md's inserted block does not open with the new version heading")
                   continue
 
               if path == "loki-ts/dist/loki.js":
