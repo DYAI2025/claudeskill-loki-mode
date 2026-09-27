@@ -16,7 +16,9 @@ Target: 3-5 releases per hour (CEO 2026-09-27 17:05Z), 60 per day.
 5. [done 19:28:09Z] Release 10 = v9.70.0 from green b61045fd (main and tag 6c459dfa by ls-remote).
 6. [done 19:19Z] S-136 landed (b61045fd); S-137 fix-forward 6e48decb.
 7. [running] Batch 5 (wf_38d4e17c-211): reworks S-138, S-146, S-147, S-152; builds S-50, S-153, S-135; Architect cut S-154..S-173.
-8. [pending] Prune each worktree once its slice is merged (count now 7 of 15).
+8. [running] WORKTREE_COUNT 24 of 15 at 19:37Z: my batch 6 dispatch opened 20 isolated worktrees at once (`git worktree list | grep -c claude/worktrees` = 24, every one owned by a live builder). Prune each as its slice merges; from now on a batch opens at most 15 minus the current count.
+10. [done 19:37:24Z] Release 11 = v9.71.0 from green c6ed3882 (main and tag 4972a112 by ls-remote).
+11. [done] Rows released at tag push reverted to merged until publish-npm succeeds (D27).
 9. [pending] Drift audit every 6 turns; guard review every 50 turns.
 
 ## Team members
