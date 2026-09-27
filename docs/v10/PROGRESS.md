@@ -340,3 +340,32 @@ push-storm from CI's point of view. From here: one batched commit per
 turn for hot-file status updates, and no second push to main until
 the previous push's Tests run has actually finished (checked directly,
 not assumed).
+
+### Drift audit (turn 12, 6-hour window)
+
+**Matched CONTROL.md:** the priority order held under real pressure --
+GF-3 was not merged until its dist-staleness gap (a genuine moat/seal-
+accuracy issue two reviewers independently found) was fixed and
+re-verified, even though that delayed a release the velocity targets
+already flagged as overdue. D12's unanimous-APPROVE bar was honored
+throughout (S-09 and S-17 both went through full rework rounds rather
+than merging on a split quorum); D21's bucket-(a)/(b) split correctly
+kept 4 real-but-out-of-scope findings (BACKLOG 138-141) from blocking
+GF-3's merge.
+
+**Drifted:** 1 release in the 6-hour window against a 90-minute target
+(should be ~4); 42 of 68 commits in the window are docs-only BOARD.md
+status updates, several of them small enough that a single rapid-push
+sequence measurably starved CI of a green verdict for over an hour
+(self-caught and corrected earlier this window, see above). Velocity
+targets (8+ ready slices, 6+ active builders) have been in violation
+most of the window, though slices ARE moving through review at a real
+rate, just not fast enough to keep the ready queue full.
+
+**Correction for the next 6 hours:** batch BOARD.md status writes to
+at most one per completed review/merge event (not one per individual
+reviewer verdict as they land), and prioritize dispatching NEW builders
+over writing status prose whenever the ready queue is below 8 -- the
+IDLE_BUILDERS/LOW_READY violations have been sitting un-actioned for
+multiple pulse ticks in a row while review-processing consumed the
+turn instead.
