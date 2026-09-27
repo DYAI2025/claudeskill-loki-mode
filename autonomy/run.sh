@@ -9556,10 +9556,13 @@ _loki_snapshot_verify() {
     if [ "$live" = "$_LOKI_SNAPSHOT_SEAL" ]; then
         return 0
     fi
+    log_warn "Pre-existing-file snapshot or its hash file changed after this session recorded it (possible tampering by an agent process); treating this session as unsnapshotted (nothing will be committed)"
+    # Record both digests (before clearing the seal below) so an operator
+    # reading the audit log can tell a genuine content tamper apart from a
+    # transient hash-tool failure that just produced a different digest.
+    audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked.z or .sha.z changed after being sealed: live=$live,sealed=$_LOKI_SNAPSHOT_SEAL"
     _LOKI_SNAPSHOT_SEAL=""
     _LOKI_SNAPSHOT_THIS_RUN=0
-    log_warn "Pre-existing-file snapshot or its hash file changed after this session recorded it (possible tampering by an agent process); treating this session as unsnapshotted (nothing will be committed)"
-    audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked.z or .sha.z changed after being sealed"
     mkdir -p .loki/state 2>/dev/null
     : > .loki/state/preexisting-untracked.failed 2>/dev/null
     return 1

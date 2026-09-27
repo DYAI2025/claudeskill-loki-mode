@@ -1248,6 +1248,90 @@ fi
 rm -f "$EVILBIN/.awk-ran"
 
 # =============================================================================
+# Test T-snapshot-tampered-audit-digests (BACKLOG 130(a)): the SNAPSHOT_TAMPERED
+# audit line must carry both the sealed digest and the live digest, not just
+# the generic "changed after being sealed" message. Without both values an
+# operator reading the audit log after the fact cannot tell a genuine content
+# tamper apart from a flaky hash-tool failure that happened to produce a
+# different digest. Deterministic, real-looking 64-hex-char fixture digests
+# (all "1" for sealed, all "2" for live) are used so the assertion checks
+# actual content, not merely "some hex string appears".
+# =============================================================================
+echo "Test T-snapshot-tampered-audit-digests (BACKLOG 130(a)): SNAPSHOT_TAMPERED audit line carries both digest values"
+SEALED_FIXTURE="1111111111111111111111111111111111111111111111111111111111111111"
+SEALED_FIXTURE="${SEALED_FIXTURE:0:64}"
+LIVE_FIXTURE="2222222222222222222222222222222222222222222222222222222222222222"
+LIVE_FIXTURE="${LIVE_FIXTURE:0:64}"
+RTD="$(make_repo tsnaptamperaudit)"
+outtd="$(
+    cd "$RTD" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$BRANCH_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _LOKI_SNAPSHOT_SEAL="$SEALED_FIXTURE"
+    _LOKI_SNAPSHOT_THIS_RUN=1
+    _loki_snapshot_digest() { printf '%s' "$LIVE_FIXTURE"; }
+    result=0
+    _loki_snapshot_verify >/dev/null 2>&1 || result=1
+    seal_cleared="$( [ -z "$_LOKI_SNAPSHOT_SEAL" ] && echo yes || echo no )"
+    run_cleared="$( [ "$_LOKI_SNAPSHOT_THIS_RUN" = 0 ] && echo yes || echo no )"
+    marker="$( [ -f .loki/state/preexisting-untracked.failed ] && echo yes || echo no )"
+    has_sealed="$(printf '%s' "$AUDIT_CAPTURE" | grep -qF "$SEALED_FIXTURE" && echo yes || echo no)"
+    has_live="$(printf '%s' "$AUDIT_CAPTURE" | grep -qF "$LIVE_FIXTURE" && echo yes || echo no)"
+    printf 'RESULT=%s SEALCLEARED=%s RUNCLEARED=%s MARKER=%s HASSEALED=%s HASLIVE=%s' \
+        "$result" "$seal_cleared" "$run_cleared" "$marker" "$has_sealed" "$has_live"
+)"
+if [ "$outtd" = "RESULT=1 SEALCLEARED=yes RUNCLEARED=yes MARKER=yes HASSEALED=yes HASLIVE=yes" ]; then
+    pass "SNAPSHOT_TAMPERED audit line includes both the sealed and live digest values; fail-closed behavior (return 1, seal cleared, marker written) unchanged"
+else
+    fail "SNAPSHOT_TAMPERED audit line is missing one or both digest values, or fail-closed behavior regressed" "got: $outtd"
+fi
+
+# RED proof: the pre-fix audit line (generic message only, no digest values)
+# must NOT contain either fixture digest -- proving the assertion above is
+# non-vacuous and actually depends on the new digest text, not on some other
+# coincidental match.
+RED_NODIGEST_LIB="$WORKROOT/red-nodigest-lib.sh"
+sed 's/audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked\.z or \.sha\.z changed after being sealed: live=\$live,sealed=\$_LOKI_SNAPSHOT_SEAL"/audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked.z or .sha.z changed after being sealed"/' \
+    "$BRANCH_LIB" > "$RED_NODIGEST_LIB"
+red_nodigest_reverted="$(grep -c 'audit_log "SNAPSHOT_TAMPERED" "preexisting-untracked\.z or \.sha\.z changed after being sealed"$' "$RED_NODIGEST_LIB")"
+RTDR="$(make_repo tsnaptamperauditred)"
+outtdr="$(
+    cd "$RTDR" || exit 1
+    AUDIT_CAPTURE=""
+    log_info()  { echo "INFO: $*"; }
+    log_warn()  { echo "WARN: $*"; }
+    log_error() { echo "ERROR: $*"; }
+    audit_log() { AUDIT_CAPTURE="$1 $2"; }
+    audit_agent_action() { return 0; }
+    # shellcheck disable=SC1090
+    source "$ADVISORY_LIB"
+    # shellcheck disable=SC1090
+    source "$RED_NODIGEST_LIB"
+    SCRIPT_DIR="$PROJECT_DIR/autonomy"
+    _LOKI_SNAPSHOT_SEAL="$SEALED_FIXTURE"
+    _LOKI_SNAPSHOT_THIS_RUN=1
+    _loki_snapshot_digest() { printf '%s' "$LIVE_FIXTURE"; }
+    _loki_snapshot_verify >/dev/null 2>&1 || true
+    has_sealed="$(printf '%s' "$AUDIT_CAPTURE" | grep -qF "$SEALED_FIXTURE" && echo yes || echo no)"
+    has_live="$(printf '%s' "$AUDIT_CAPTURE" | grep -qF "$LIVE_FIXTURE" && echo yes || echo no)"
+    printf 'HASSEALED=%s HASLIVE=%s' "$has_sealed" "$has_live"
+)"
+if [ "$red_nodigest_reverted" -ge 1 ] && [ "$outtdr" = "HASSEALED=no HASLIVE=no" ]; then
+    pass "RED confirmed: reverting to the generic audit message drops both digest values (non-vacuous)"
+else
+    fail "RED reproduction did not show the pre-fix generic-message-only behavior" "red_nodigest_reverted=$red_nodigest_reverted got: $outtdr"
+fi
+
+# =============================================================================
 # Test T-snapshot-seal-fails-closed (BACKLOG-70 rework): a hash tool that
 # resolves and exits 0 but prints a GARBAGE, non-hex-or-wrong-length result
 # (a real BusyBox/coreutils variant's `SHA256 (x) = ...` format, or any other
