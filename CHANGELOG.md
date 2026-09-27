@@ -5,6 +5,17 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.58.0
+
+**Release train 3: the release-speed fixes from CEO Part C.** Shell tests run in 8 duration-balanced shards with a 10-minute job cap, the argmax suite drops from about 22 minutes to seconds, Homebrew no longer waits on Docker, and Docker builds arm64 natively.
+
+**CI and release:**
+- `loki ci` no longer forks `echo | cut` once per finding. The full ARG_MAX-scale argmax fixture now finishes in 4 to 9 seconds (it took 326s on the pre-fix code, which also still crashes with "Argument list too long"), so the 2400s per-suite override is gone (S-79, Part C item 1).
+- Shell tests shard 8 ways by measured duration (greedy longest-first over `tests/shard-durations.tsv`) instead of `index % 4`; a coverage test proves every suite runs exactly once (S-81, item 4).
+- Shell, Python, Node and Bun test jobs get `timeout-minutes: 10` (S-82, item 6).
+- `update-homebrew` depends only on `release`, not on the Docker publish (S-83, item 7).
+- Docker images build natively on amd64 and arm64 runners and merge by digest; QEMU and the publish-time cache restore are removed (S-85, item 8).
+
 ## v9.57.0
 
 **Release train 2: the D26 guardrails go live, CI stops cancelling itself, and the Python suite runs in parallel.** 21 code commits since v9.56.0.
