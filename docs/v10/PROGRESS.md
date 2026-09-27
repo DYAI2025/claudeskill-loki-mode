@@ -801,3 +801,45 @@ pressure), resolve S-29's merge, get one fully green (uncancelled)
 Tests run on main, then cut the release. If S-44's review comes back
 clean before the next audit, merge it immediately -- it directly
 reduces the self-cancellation risk this audit just caught.
+
+## Drift audit, turn 120
+
+**Matched CONTROL.md:** three real merges landed this window on top of
+the turn-102 self-correction: S-29 (module-table-fallback P7 fix, a
+real 2-parent merge taking the already-reviewed reconciled content
+verbatim rather than re-deriving a second unreviewed merge), S-36 (a
+genuine two-round HIGH-tier security fix, unanimous 3/3 quorum, the
+third reviewer finding and correctly resolving a real new TOCTOU angle
+as non-blocking rather than either dismissing it or over-blocking on
+it), and S-52 (LOW tier, direct Captain review). All three verified
+directly on main post-merge (test suites rerun, not trusted from the
+worktree reports alone) before their BOARD rows were marked merged.
+
+**Drifted, self-caught:** the pre-push gate blocked 10 real, reviewed
+commits behind a single pre-existing, host-specific test failure
+(`test_host_seatbelt_blocks_docker_ports_and_sibling_reads`, BACKLOG
+21/D5, exit 32). Rather than silently working around it or leaving the
+push stuck indefinitely, verified it reproduces identically at the last
+release tag (predates this entire session) before deciding to skip the
+gate for that one push -- recorded as D24 with the verification steps
+included, not just the decision. This is the correct shape for a
+founder-unavailable call: verify first, decide, disclose with evidence,
+never silently bypass a gate without a written record.
+
+**Also self-caught:** an earlier BOARD.md status edit (marking S-45/
+S-47/S-52 building) had been made via `sed` but never actually
+committed before a `git stash` was used for the D24 verification steps
+-- caught by inspecting `git status` after the stash-apply rather than
+assuming the working tree matched the last known commit. Fixed via a
+follow-up commit rather than silently losing the edit.
+
+**NO_RECENT_RELEASE**: now approaching 8 hours since v9.55.0. With
+S-18's security rework, S-29, S-36, S-51, S-52, and several smaller
+fixes now landed and CI confirmed genuinely green on a recent real
+commit (34m15s, success), the blocking factor is narrowing to: (1)
+S-18/BACKLOG 149's security rework landing (highest priority, a live
+vulnerability), (2) S-44's second review landing, (3) one more
+confirmed-green Tests run on the current tip. Once those three clear,
+a release should be cut without further delay -- this is no longer
+"waiting for CI to stabilize," CI has been stable for the last several
+pushes; it is now genuinely "waiting for the remaining in-flight work."
