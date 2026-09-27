@@ -5,6 +5,14 @@ All notable changes to Loki Mode will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v9.64.0
+
+**Pulse machine protection and a 10x faster pulse.** Released from green tree c2b84c36 (Tests run 36336659599 and Bun Parity run 36336659592 both success before the bump).
+
+- `scripts/v10-pulse.sh` serves npm and gh results from a 90s on-disk cache refreshed in the background, so the per-prompt hook runs in about 0.2-0.5s instead of 2s or more (and never blocks on the network). Stale values are labeled with their age; missing values stay UNKNOWN (S-104).
+- New pulse violations for D28: HIGH_LOAD (load above 2x cores), ORPHAN_TEST (a tests/* process reparented to PID 1 or running over 30 minutes), STRAY_CONTAINER (a swarm container older than 1 hour or with a restart policy) and RELEASE_ON_RED (the newest version bump sits on a red Tests run) (S-109).
+- Fixed a ShellCheck SC2155 warning in the pulse script that had turned CI red.
+
 ## v9.63.0
 
 **First release under the verified-tree rule (D28): this tree passed Tests, Bun Parity and Security Audit on commit 1bc02bce before the version was bumped.** It carries trains 5 to 7 plus the P0 fixes.
